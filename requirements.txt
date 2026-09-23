@@ -1,0 +1,20 @@
+# Phase 0 collector + Phase 1 alerting (rules.py, alerts.py add NO dependencies).
+# Versions pinned to what was verified working on Windows 3.13.1 / Linux 3.12.3.
+# Nothing is added here until the corpus shows we need it.
+
+httpx==0.28.1
+feedparser==6.0.14
+trafilatura==2.2.0
+beautifulsoup4==4.15.0
+lxml==6.1.3
+googlenewsdecoder==0.1.7
+
+# googlenewsdecoder pulls in requests, selectolax, urllib3 and pysocks.
+# That is expected -- it uses requests internally for the batchexecute call.
+
+# DELIBERATELY ABSENT until the corpus proves they are needed:
+#   playwright            -- only when a real publisher defeats trafilatura
+#   yt-dlp                -- feed descriptions look complete (1500-2800 chars)
+#   rapidfuzz             -- dedup comes after we can measure duplicate rates
+#   sentence-transformers -- only if cross-language clusters show up
+#   pytesseract           -- only if official PDFs turn out to be scans
