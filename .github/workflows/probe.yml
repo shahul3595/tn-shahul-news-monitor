@@ -11,7 +11,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20a
+    timeout-minutes: 20
     steps:
       - name: Get the files
         uses: actions/checkout@v5
