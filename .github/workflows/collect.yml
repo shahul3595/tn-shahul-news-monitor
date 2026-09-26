@@ -1,0 +1,104 @@
+# Step 2 -- the collector, every 30 minutes.
+#
+# Each run: restore the saved database, poll all sources, convert links, download
+# articles, score them, forget items older than 21 days, save the database again.
+# Nothing is sent to Telegram from here (instant alerts are switched off:
+# TELEGRAM_DRY_RUN=1). The twice-daily digest is a separate workflow (step 3).
+#
+# Secrets used (Settings -> Secrets and variables -> Actions):
+#   STATE_PASSPHRASE   required -- encrypts the saved database
+#   KEYWORDS_CSV_URL   required -- the published Google Sheet, as CSV
+#   YOUTUBE_API_KEY    optional -- channels via the Data API instead of the flaky feed
+#   GEMINI_API_KEY     optional -- only decides the AI band for now (used in step 3)
+name: "2 - Collect news"
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"        # UTC; GitHub often starts these 5-30 min late
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write                  # list/download the saved database; keep the schedule enabled
+
+concurrency:
+  group: collector                # never two runs on the same database at once
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 27
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATE_PASSPHRASE: ${{ secrets.STATE_PASSPHRASE }}
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Get the files
+        uses: actions/checkout@v5
+
+      - name: Check the secrets are set
+        env:
+          KEYWORDS_CSV_URL: ${{ secrets.KEYWORDS_CSV_URL }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          ok=1
+          [ -n "$STATE_PASSPHRASE" ] || { echo "::error::Secret STATE_PASSPHRASE is missing (Settings -> Secrets and variables -> Actions)"; ok=0; }
+          [ -n "$KEYWORDS_CSV_URL" ] || { echo "::error::Secret KEYWORDS_CSV_URL is missing -- publish the keyword sheet as CSV and save its link"; ok=0; }
+          [ -n "$YOUTUBE_API_KEY" ] || echo "::warning::YOUTUBE_API_KEY not set -- YouTube channels use the RSS feed, which often fails from cloud servers"
+          [ "$ok" = 1 ]
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install the libraries
+        run: pip install -r requirements.txt
+
+      - name: Restore the saved database
+        run: bash state.sh restore
+
+      - name: Collect, resolve, extract and score
+        env:
+          KEYWORDS_CSV_URL: ${{ secrets.KEYWORDS_CSV_URL }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_DRY_RUN: "1"     # instant alerts stay off; the digest is step 3
+          KEEP_FAILED_HTML: "0"
+          NODE_NAME: github
+        run: |
+          python collect.py --init
+          python collect.py --once --minutes 17
+          python collect.py --prune 21
+          { echo '```'; python collect.py --health || true; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Encrypt the database
+        run: bash state.sh pack
+
+      - name: Save the database for the next run
+        uses: actions/upload-artifact@v6
+        with:
+          name: state
+          path: state/state.enc
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Is a daily backup due?
+        id: backup
+        run: echo "due=$(bash state.sh backup-due)" >> "$GITHUB_OUTPUT"
+
+      - name: Daily backup (kept 30 days)
+        if: steps.backup.outputs.due == 'yes'
+        uses: actions/upload-artifact@v6
+        with:
+          name: state-backup
+          path: state/state.enc
+          retention-days: 30
+
+      - name: Keep the schedule enabled
+        # GitHub switches off scheduled workflows after 60 days without commits;
+        # re-enabling once a day resets that clock.
+        if: steps.backup.outputs.due == 'yes'
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/collect.yml/enable" || true
