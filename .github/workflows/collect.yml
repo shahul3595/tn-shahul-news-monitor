@@ -13,8 +13,8 @@
 name: "2 - Collect news"
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"        # UTC; GitHub often starts these 5-30 min late
+#  schedule:
+#    - cron: "*/30 * * * *"        # UTC; GitHub often starts these 5-30 min late
   workflow_dispatch:
 
 permissions:
