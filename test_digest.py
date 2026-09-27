@@ -297,7 +297,26 @@ def same_headline_and_same_story_collapse_to_one_candidate():
 
 
 @test
-def the_web_page_is_written_with_cards_images_and_escaping():
+def the_web_page_is_a_rolling_edition_not_the_telegram_delta():
+    con = make_db("edition.db")
+    old = add(con, "Con story: covered by the morning brief", hours_ago=5)
+    con.execute("UPDATE items SET digested_at=?, ai_category='constituency', ai_priority=2, ai_processed_at=? WHERE id=?",
+                (alerts.iso(T0 - timedelta(hours=1)), alerts.iso(T0 - timedelta(hours=1)), old))
+    add(con, "Con story: too old for the page", hours_ago=40)
+    add(con, "Dis story: brand new", hours_ago=0, tags=["district"])
+    con.commit()
+    cands, *_ = digest.candidates(con, T0)
+    check([c["title"] for c in cands] == ["Dis story: brand new"], "Telegram sees only the new item")
+    ed = digest.build_edition(con, {}, T0)
+    titles = sorted(c["title"] for c in ed["chosen"])
+    check(titles == ["Con story: covered by the morning brief", "Dis story: brand new"], f"the page keeps both: {titles}")
+    byt = {c["title"]: c for c in ed["cands"]}
+    check(byt["Con story: covered by the morning brief"]["by"] == "gemini (cached)", "stored verdict reused, no calls")
+    check(byt["Dis story: brand new"]["by"] == "rules", "unranked item ranked by the rules on the page")
+
+
+@test
+def the_web_page_has_cards_search_data_feedback_and_editions():
     import shutil
     con = make_db("page.db")
     a = add(con, "Con! <Flood> & drains in Velachery", body="வேளச்சேரியில் மழைநீர் தேங்கியது. " * 20)
@@ -311,19 +330,28 @@ def the_web_page_is_written_with_cards_images_and_escaping():
     saved = digest.Gemini
     digest.Gemini = lambda *a, **k: FakeGemini()
     try:
-        b = digest.run(con, {"GEMINI_API_KEY": "x"}, now=T0, slot="morning", dry_run=True)
-        digest.write_pages(b, "morning", T0, docs)
-        digest.write_pages(b, "evening", T0 + timedelta(hours=11), docs)
+        digest.run(con, {"GEMINI_API_KEY": "x"}, now=T0, slot="morning", dry_run=True)     # ranks + caches
     finally:
         digest.Gemini = saved
+    ed = digest.build_edition(con, {}, T0)
+    digest.write_pages(ed, "morning", T0, docs, feedback_url="https://script.google.com/macros/s/X/exec")
+    digest.write_pages(ed, "evening", T0 + timedelta(hours=11), docs, feedback_url="https://script.google.com/macros/s/X/exec")
     html = (docs / "index.html").read_text(encoding="utf-8")
     check("&lt;Flood&gt; &amp; drains" in html and "<Flood>" not in html, "escaped headline")
     check('src="https://img.example.com/flood.jpg?a=1&amp;b=2"' in html, "og:image thumbnail")
     check("i.ytimg.com" in html, "youtube thumbnail from the API payload")
     check('class="chip u">URGENT' in html, "urgent chip")
-    check("2026-10-15-morning.html" in html and "2026-10-15-evening.html" in html, "archive links")
-    check((docs / ".nojekyll").exists() and (docs / "briefs" / "2026-10-15-morning.html").exists())
-    check("<script" not in html, "no scripts")
+    check('data-text="' in html and 'data-cat="constituency"' in html, "search data on the cards")
+    check('class="fb" data-id=' in html and 'data-r="unrelated"' in html, "feedback buttons with reasons")
+    check('id="missing"' in html and 'data-feedback="https://script.google.com/macros/s/X/exec"' in html, "missing-news form + endpoint")
+    check('<select id="edition"' in html and "briefs/2026-10-15-evening.html" in html, "edition selector")
+    check("2026-10-15-morning.html" not in html, "one entry per day: the later edition of the day")
+    check('maximum-scale=1.0' in html and "min-height:44px" in html, "mobile viewport and touch targets")
+    arch = (docs / "briefs" / "2026-10-15-evening.html").read_text(encoding="utf-8")
+    check('value="../index.html"' in arch and 'value="../briefs/2026-10-15-evening.html" selected' in arch, "archive pages link back")
+    check((docs / ".nojekyll").exists())
+    plain = digest.write_pages(ed, "morning", T0, docs)                     # no endpoint set
+    check('data-feedback=""' in plain.read_text(encoding="utf-8"), "without an endpoint the page carries none")
 
 
 @test

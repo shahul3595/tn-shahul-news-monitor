@@ -14,7 +14,11 @@ twice a day.
 
 ## The web page
 
-Each brief is also written to `docs/index.html` (latest) and `docs/briefs/<date>-<slot>.html`
+The Telegram brief carries only what is new since the last brief. The web page is different:
+a rolling edition of everything kept in the last 36 hours (up to 60 stories), rebuilt on each
+run, with search, a card/list toggle, an edition selector for the last 7 days, and reader
+feedback (👍/👎 and "Submit missing news") when `FEEDBACK_URL` is set — see `feedback.gs`.
+It is written to `docs/index.html` (latest) and `docs/briefs/<date>-<slot>.html`
 (last 30) and committed to `main`. Turn on GitHub Pages once: Settings → Pages → Source
 "Deploy from a branch", branch `main`, folder `/docs`. The page is public to anyone with
 the address (it carries `noindex`, so search engines are asked not to list it). A custom
@@ -35,7 +39,7 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `GEMINI_API_KEY` | recommended | Gemini free tier; ranks the brief. Without it the keyword rules rank |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | yes, for the brief | the bot and the private channel. Without them the brief is only printed on the run page |
 
-Optional *variables* (Settings → Secrets and variables → Actions → Variables): `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`).
+Optional *variables* (Settings → Secrets and variables → Actions → Variables): `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (36), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
 
 ## Keeping the keyword list
 

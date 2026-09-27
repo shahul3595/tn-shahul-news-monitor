@@ -723,14 +723,19 @@ def score(kw, title, desc="", body="", has_ai=False, body_chars=SCORE_BODY_CHARS
 
     col = h.get("collision", [])
     if col:
-        if not strong:
+        named = bool(TARGET_EN.search(text) or TARGET_TA.search(text))
+        # Another Kumar costs points -- unless the story is anchored in the constituency
+        # (a rival attacking him over Velachery is still his news) or our R. Kumar is
+        # named himself (a joint event). Portfolio co-occurrence does NOT cancel it:
+        # measured, C.T.R. Nirmal Kumar (TVK IT wing) contaminates the portfolio queries.
+        if not strong and not named:
             s -= max(abs(t.weight) for t, _ in col)
         terms += ["!" + t.term for t, _ in col[:2]]
         # The known weakness: "Avadi MLA Ramesh Kumar visits Velachery" got through because
         # the Velachery anchor cancelled the penalty. Named next to a title, it is a
         # different office-holder -- unless our own R. Kumar is named as well.
         titles = _title_word_spans(text)
-        if titles and not (TARGET_EN.search(text) or TARGET_TA.search(text)):
+        if titles and not named:
             for t, spans in col:
                 if any(_gap(a, b) <= COLLISION_WINDOW for a in spans for b in titles):
                     veto = f"collision:{t.term}"
