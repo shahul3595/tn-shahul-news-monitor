@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Digest tests. Synthetic data in a temp folder; no network; nothing is sent.
+
+    python test_digest.py
+"""
+
+import json
+import logging
+import re
+import sqlite3
+import sys
+import tempfile
+import traceback
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+import rules     # noqa: E402
+import alerts    # noqa: E402
+import digest    # noqa: E402
+
+TMP = Path(tempfile.mkdtemp(prefix="tndigest_"))
+T0 = datetime(2026, 10, 15, 1, 30, tzinfo=timezone.utc)      # 07:00 IST
+LOGS = []
+
+
+class _Capture(logging.Handler):
+    def emit(self, record):
+        LOGS.append(record.getMessage())
+
+
+_root = logging.getLogger("collect")
+_root.setLevel(logging.INFO)
+_root.addHandler(_Capture())
+_root.propagate = False
+
+TESTS = []
+
+
+def test(fn):
+    TESTS.append(fn)
+    return fn
+
+
+def check(cond, msg="check failed"):
+    if not cond:
+        raise AssertionError(msg)
+
+
+def collect_schema():
+    src = (HERE / "collect.py").read_text(encoding="utf-8")
+    return re.search(r'SCHEMA = """(.*?)"""', src, re.S).group(1)
+
+
+def make_db(name):
+    path = TMP / name
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+    con = sqlite3.connect(path, timeout=15)
+    con.row_factory = sqlite3.Row
+    con.executescript(collect_schema())
+    con.execute("INSERT INTO sources (source_id, name, kind) VALUES ('gn', 'Google News', 'google_news')")
+    con.commit()
+    alerts.reset_caches()
+    alerts.migrate(con)
+    digest.migrate(con)
+    return con
+
+
+_n = [0]
+
+
+def add(con, title, tags=(), score=5, band="KEYWORD_KEEP", urgent=0, hours_ago=2, host="dinamalar.com",
+        event=None, body="", ai=None):
+    _n[0] += 1
+    n = _n[0]
+    t = alerts.iso(T0 - timedelta(hours=hours_ago))
+    cur = con.execute("""INSERT INTO items (item_key, source_id, link, title, publisher, published_at, discovered_at,
+                   rules_at, resolve_status, resolved_url, extract_status, extract_host, extract_text,
+                   score, band, urgent, target_tags, event_id, ai_category, ai_priority, ai_processed_at)
+                   VALUES (?, 'gn', ?, ?, ?, ?, ?, ?, 'RESOLVED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (f"k{n}", f"https://news.google.com/rss/articles/T{n}", title, host.split(".")[0].title(),
+                 t, t, t, f"https://www.{host}/news/{n}", "OK" if body else "FAILED", host, body or None,
+                 score, band, urgent, json.dumps(list(tags)), event,
+                 ai[0] if ai else None, ai[1] if ai else None, t if ai else None))
+    con.commit()
+    return cur.lastrowid
+
+
+class FakeGemini:
+    """Answers by looking at the title: 'X:' prefix sets the category, '!' sets priority 1."""
+
+    def __init__(self, fail=False):
+        self.calls, self.fail, self.model = 0, fail, "fake"
+        self.dead = None
+
+    def rank(self, batch):
+        self.calls += 1
+        if self.fail:
+            self.dead = "simulated failure"
+            return None
+        out = {}
+        for c in batch:
+            t = c["title"]
+            cat = "none"
+            for k in digest.CATEGORIES:
+                if t.lower().startswith(k[:3]):
+                    cat = k
+            pri = 1 if "!" in t else (3 if "~" in t else 2)
+            out[c["id"]] = (cat, pri, "fake reason")
+        return out
+
+
+def build(con, gemini, now=None, per=5, total=30):
+    now = now or T0
+    cands, all_ids, since = digest.candidates(con, now)
+    st = digest.rank_all(con, cands, gemini, now)
+    urgent, sections, left = digest.select(cands, per, total)
+    chosen = urgent + [c for cat in digest.CATEGORIES for c in sections[cat]]
+    return cands, chosen, urgent, sections, left, st
+
+
+# --------------------------------------------------------------------------
+
+@test
+def five_per_category_then_the_balance_goes_elsewhere():
+    con = make_db("select.db")
+    for i in range(9):
+        add(con, f"Con story {i}")            # constituency: 9 candidates
+    for i in range(2):
+        add(con, f"Dis story {i}")            # district: 2
+    for i in range(12):
+        add(con, f"Por story {i}")            # portfolio: 12
+    for i in range(3):
+        add(con, f"Non story {i}")            # none: never shown
+    cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), total=15)
+    counts = {k: len(v) for k, v in sections.items() if v}
+    check(len(chosen) == 15, f"total capped at 15, got {len(chosen)}")
+    check(counts["district"] == 2, "district has only 2 -- its spare places move")
+    check(counts["constituency"] + counts["portfolio"] == 13, f"the balance filled from the others: {counts}")
+    check(counts["constituency"] >= 5 and counts["portfolio"] >= 5, "each got its 5 first")
+    check(all(c["category"] != "none" for c in chosen), "no 'none' items")
+    # with the full 30 cap everything but 'none' fits
+    cands, chosen, *_ = build(con, FakeGemini(), total=30)
+    check(len(chosen) == 23, f"all 23 real stories fit under 30, got {len(chosen)}")
+
+
+@test
+def urgent_civic_items_go_on_top_and_priority_3_only_fills_gaps():
+    con = make_db("urgent.db")
+    a = add(con, "Con! Velachery flooded", urgent=1, tags=["constituency"])
+    add(con, "Con story calm")
+    add(con, "Por~ background piece")
+    for i in range(6):
+        add(con, f"Dis story {i}")
+    cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), per=5, total=9)
+    check([c["id"] for c in urgent] == [a], "the flood is the urgent block")
+    check(a not in [c["id"] for c in sections["constituency"]], "and not repeated in its section")
+    ids = [c["id"] for c in chosen]
+    check(len(ids) == 9, f"9 chosen: {len(ids)}")
+    check(len(sections["district"]) == 6, "the 6th district story took the first spare place (priority 2)")
+    check(any("background" in c["title"] for c in chosen), "the priority-3 item filled the last place")
+    _, chosen8, *_ = build(con, FakeGemini(), per=5, total=8)
+    check(not any("background" in c["title"] for c in chosen8), "with one place fewer, priority 3 loses it")
+    # priority 3 never takes a place in the first pass
+    con2 = make_db("p3.db")
+    add(con2, "Por~ old background")
+    add(con2, "Por fresh news")
+    _, chosen, *_ = build(con2, FakeGemini(), per=1, total=1)
+    check(chosen[0]["title"] == "Por fresh news", "priority 2 beats priority 3 for the one place")
+
+
+@test
+def nothing_repeats_across_sends_and_unchosen_items_are_not_carried_over():
+    con = make_db("repeat.db")
+    for i in range(8):
+        add(con, f"Con story {i}")
+    rec = alerts.Recorder()
+    env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+    saved = digest.Gemini
+    digest.Gemini = lambda *a, **k: FakeGemini()
+    try:
+        b1 = digest.run(con, dict(env, GEMINI_API_KEY="x", DIGEST_MAX="3", DIGEST_PER_CATEGORY="3"),
+                        now=T0, slot="morning", transport=rec)
+        check(len(b1["chosen"]) == 3 and len(rec.sent) == 1, "first brief: 3 items, one message")
+        check(con.execute("SELECT count(*) FROM items WHERE digested_at IS NOT NULL").fetchone()[0] == 8,
+              "all 8 candidates marked, chosen or not")
+        add(con, "Con story new", hours_ago=0)
+        b2 = digest.run(con, dict(env, GEMINI_API_KEY="x"), now=T0 + timedelta(hours=11), slot="evening",
+                        transport=rec)
+        titles = [c["title"] for c in b2["chosen"]]
+        check(titles == ["Con story new"], f"only the new story: {titles}")
+    finally:
+        digest.Gemini = saved
+
+
+@test
+def without_gemini_the_rules_rank_and_on_failure_they_take_over():
+    con = make_db("fallback.db")
+    add(con, "வேளச்சேரியில் வெள்ளம்", tags=["constituency"], urgent=1)
+    add(con, "Thiruvallur collector meeting", tags=["district"], band="AUTO_KEEP")
+    add(con, "TN AI mission", tags=["portfolio"])
+    add(con, "TVK vs DMK spat", tags=["party"])
+    cands, chosen, urgent, sections, left, st = build(con, None)
+    cats = {c["title"]: (c["category"], c["priority"]) for c in cands}
+    check(cats["வேளச்சேரியில் வெள்ளம்"] == ("constituency", 1), cats)
+    check(cats["Thiruvallur collector meeting"] == ("district", 2), cats)
+    check(cats["TVK vs DMK spat"] == ("political", 3), cats)
+    check(len(urgent) == 1, "rule-urgent item is on top")
+    check(st["rules"] == 4 and not st.get("gemini"), st)
+    cands, chosen, *_ , st = build(con, FakeGemini(fail=True))
+    check(st["rules"] == 4, "gemini failed -> every item ranked by the rules")
+    check(any("stopped" in m for m in LOGS), "and the log says so")
+
+
+@test
+def gemini_verdicts_are_cached_and_reused():
+    con = make_db("cache.db")
+    add(con, "Con story fresh")
+    add(con, "Ignored title", ai=("district", 1))
+    g = FakeGemini()
+    cands, chosen, *_ , st = build(con, g)
+    check(g.calls == 1 and st["gemini"] == 1, "one call for the one un-ranked item")
+    byt = {c["title"]: c for c in cands}
+    check(byt["Ignored title"]["category"] == "district" and byt["Ignored title"]["by"] == "gemini (cached)")
+    check(con.execute("SELECT ai_category FROM items WHERE title='Con story fresh'").fetchone()[0] == "constituency",
+          "the verdict is stored on the item")
+
+
+@test
+def one_story_per_event_with_a_source_count():
+    con = make_db("event.db")
+    con.execute("INSERT INTO events (event_id, status) VALUES (7, 'OPEN')")
+    add(con, "Con story A", event=7, score=4, host="dinamalar.com")
+    add(con, "Con story B", event=7, score=6, host="dailythanthi.com")
+    add(con, "Con story C", event=7, score=5, host="maalaimalar.com")
+    cands, chosen, *_ = build(con, FakeGemini())
+    check(len(cands) == 1 and cands[0]["title"] == "Con story B", "the best-scored report represents the event")
+    check(len(cands[0]["sources"]) == 3, "three outlets counted")
+    line = digest._line(cands[0])
+    check("+2" in line, f"shown as +2: {line}")
+
+
+@test
+def rendering_escapes_html_and_stays_under_the_limit():
+    con = make_db("render.db")
+    for i in range(30):
+        add(con, f"Con story {i}: " + "வேளச்சேரியில் <கனமழை> & \"மழைநீர்\" தேங்கியது " * 3,
+            body="x" * 500)
+    cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), per=30, total=30)
+    msgs = digest.render("morning", T0, urgent, sections, len(chosen), len(cands), True)
+    check(len(msgs) >= 2, f"30 long Tamil lines need more than one message: {len(msgs)}")
+    for m in msgs:
+        check(rules.utf16_len(m) <= 4096, "under Telegram's limit")
+        check("<கனமழை>" not in m and "&lt;கனமழை&gt;" in m, "angle brackets escaped")
+        check("&amp;" in m, "ampersand escaped")
+        check(re.search(r"\(\d/\d\)", m), "numbered parts")
+        check(m.count("<a href=") == m.count("</a>"), "links balanced")
+    joined = "\n".join(msgs)
+    check(joined.count("<a href=") == 30, "every item has its link")
+    check("Morning brief · 15 Oct · 30 items" in msgs[0], "heading")
+    empty = digest.render("evening", T0, [], {c: [] for c in digest.CATEGORIES}, 0, 0, False)
+    check(len(empty) == 1 and "Nothing worth reporting" in empty[0], "empty brief says so")
+
+
+@test
+def dry_run_and_missing_telegram_mark_nothing_and_send_nothing():
+    con = make_db("dry.db")
+    add(con, "Con story")
+    rec = alerts.Recorder()
+    saved = digest.Gemini
+    digest.Gemini = lambda *a, **k: FakeGemini()
+    try:
+        digest.run(con, {"GEMINI_API_KEY": "x"}, now=T0, dry_run=True, transport=rec)
+        check(not rec.sent, "dry run sends nothing")
+        digest.run(con, {}, now=T0)                      # no token: auto transport is None
+    finally:
+        digest.Gemini = saved
+    check(con.execute("SELECT count(*) FROM items WHERE digested_at IS NOT NULL").fetchone()[0] == 0,
+          "nothing marked")
+    check(any("not configured" in m for m in LOGS), "the log explains")
+
+
+@test
+def a_failed_send_marks_nothing_so_the_next_run_retries():
+    con = make_db("fail.db")
+    add(con, "Con story")
+
+    class Broken:
+        def send(self, text, plain=False):
+            return alerts.Result(False, error="boom", kind="server")
+    saved = digest.Gemini
+    digest.Gemini = lambda *a, **k: FakeGemini()
+    try:
+        digest.run(con, {"GEMINI_API_KEY": "x", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"},
+                   now=T0, transport=Broken())
+    finally:
+        digest.Gemini = saved
+    check(con.execute("SELECT count(*) FROM items WHERE digested_at IS NOT NULL").fetchone()[0] == 0)
+    check(con.execute("SELECT status FROM digests").fetchone()[0] == "FAILED")
+    check(alerts.rt_get(con, "last_digest_at") is None, "window not advanced")
+
+
+@test
+def old_stories_and_dropped_items_are_not_candidates():
+    con = make_db("window.db")
+    add(con, "Con story old", hours_ago=40)                 # published 40 h ago
+    add(con, "Con story dropped", band="DROP")
+    add(con, "Con story dropped but urgent", band="DROP", urgent=1)
+    add(con, "Con story fine")
+    cands, *_ = digest.candidates(con, T0)
+    titles = sorted(c["title"] for c in cands)
+    check(titles == ["Con story dropped but urgent", "Con story fine"], titles)
+
+
+@test
+def slot_and_budget():
+    check(digest.slot_for(T0) == "morning" and digest.slot_for(T0 + timedelta(hours=11)) == "evening")
+    con = make_db("budget.db")
+    g = digest.Gemini("key", "m", con, max_calls=1)
+    con.execute("INSERT INTO ai_budget (day, calls, tokens) VALUES (?, 1, 0)", (digest.utcnow().strftime("%Y-%m-%d"),))
+    con.commit()
+    check(g.rank([{"id": 1}]) is None and "budget" in g.dead, "daily cap respected")
+
+
+def main():
+    only = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
+    passed = failed = 0
+    for fn in TESTS:
+        if only and only not in fn.__name__:
+            continue
+        try:
+            fn()
+            passed += 1
+            print(f"PASS  {fn.__name__}")
+        except Exception:
+            failed += 1
+            print(f"FAIL  {fn.__name__}")
+            traceback.print_exc()
+    print(f"\n{passed}/{passed + failed} passed")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

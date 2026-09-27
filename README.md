@@ -10,10 +10,11 @@ twice a day.
 |---|---|---|
 | 1 - GitHub test run | by hand | checks that GitHub's servers can reach the feeds and sites; stores nothing |
 | 2 - Collect news | every 30 min | restores the database, collects and scores, saves the database again |
+| 3 - Telegram brief | ~07:00 and ~18:00 IST | ranks what was collected since the last brief (Gemini, or the keyword rules as fallback), posts up to 30 items to Telegram |
 
 The database travels between runs as an encrypted run artifact (`state`, kept 3
 days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
-(`TELEGRAM_DRY_RUN=1`); nothing reaches Telegram until the digest is built.
+(`TELEGRAM_DRY_RUN=1`); Telegram only receives the twice-daily brief.
 
 ## Secrets (Settings → Secrets and variables → Actions)
 
@@ -23,8 +24,10 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `KEYWORDS_CSV_URL` | yes | the keyword Google Sheet, published to the web as CSV |
 | `YOUTUBE_API_KEY` | recommended | YouTube Data API v3 key; the RSS feed often fails from cloud servers |
 | `YOUTUBE_SHEET_CSV_URL` | optional | the sheet's *YouTube channels* tab, published as CSV (columns `name`, `channel_id`, `enabled`). When set, the channel list comes from there instead of `sources.json` |
-| `GEMINI_API_KEY` | step 3 | Gemini free tier, for the digest |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | step 3 | the bot and the private channel |
+| `GEMINI_API_KEY` | recommended | Gemini free tier; ranks the brief. Without it the keyword rules rank |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | yes, for the brief | the bot and the private channel. Without them the brief is only printed on the run page |
+
+Optional *variables* (Settings → Secrets and variables → Actions → Variables): `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`).
 
 ## Keeping the keyword list
 
