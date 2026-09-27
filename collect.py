@@ -23,6 +23,10 @@ restores the database, runs --init, --once --minutes N and --prune, then saves
 the database again. Settings read from the environment there:
     YOUTUBE_API_KEY    poll channels through the YouTube Data API (the RSS
                        feed endpoint is unreliable from cloud servers)
+    YOUTUBE_SHEET_CSV_URL  the 'YouTube channels' tab of the keyword sheet,
+                       published as CSV: columns name, channel_id, enabled.
+                       When set, --init takes the channel list from there
+                       instead of sources.json
     KEEP_FAILED_HTML=0 do not store the html of failed extractions
     NODE_NAME          a label for this machine in the runtime table
 """
@@ -63,6 +67,22 @@ LOGFILE = HERE / "collect.log"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 HTTP_TIMEOUT = 25.0
+
+# What a desktop Chrome sends with a page request. Some anti-bot fronts answer 403
+# to a bare User-Agent; the extra headers cost nothing.
+BROWSER_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9,ta;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 
 # Resolver pacing. Starts slow and speeds up while clean, backs off hard on 429.
 # The point of the ramp is to find Google's threshold, so do not pin these.
@@ -105,7 +125,7 @@ def env():
             out = rules.load_env()
         except Exception:
             out = {}
-    for k in ("YOUTUBE_API_KEY", "KEEP_FAILED_HTML", "NODE_NAME"):
+    for k in ("YOUTUBE_API_KEY", "YOUTUBE_SHEET_CSV_URL", "KEEP_FAILED_HTML", "NODE_NAME"):
         if k not in out and os.environ.get(k):
             out[k] = os.environ[k]
     return out
@@ -341,6 +361,65 @@ def feed_url_for(s):
     return s.get("url", "")
 
 
+def _slug(name):
+    s = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+    return s[:24] or "channel"
+
+
+def youtube_sources_from_sheet(url, existing):
+    """The 'YouTube channels' tab: columns name, channel_id, enabled (poll_interval_s
+    optional). Returns a list of source dicts in sources.json shape, or None when the
+    tab is unusable -- the caller then keeps whatever it already has."""
+    import csv
+    import io
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": UA}) as c:
+            r = c.get(url)
+        if r.status_code != 200:
+            log.warning(f"youtube sheet: HTTP {r.status_code} -- keeping the current channel list")
+            return None
+        text = r.content.decode("utf-8-sig", errors="replace")
+        if "<html" in text[:500].lower():
+            log.warning("youtube sheet: the link returns a web page, not CSV -- keeping the current channel list")
+            return None
+        reader = csv.DictReader(io.StringIO(text))
+        fields = {(f or "").strip().lower().replace(" ", "_"): f for f in (reader.fieldnames or [])}
+        if "channel_id" not in fields:
+            log.warning(f"youtube sheet: no channel_id column (got {reader.fieldnames}) -- keeping the current list")
+            return None
+        by_channel = {s.get("channel_id"): s for s in existing if s.get("kind") == "youtube"}
+        out, seen = [], set()
+        for n, row in enumerate(reader, start=2):
+            get = lambda k: (row.get(fields.get(k, ""), "") or "").strip()      # noqa: E731
+            cid, name = get("channel_id"), get("name")
+            if not cid and not name:
+                continue
+            if not re.fullmatch(r"UC[\w-]{22}", cid):
+                log.warning(f"youtube sheet row {n}: '{cid}' is not a channel id (UC + 22 characters) -- skipped")
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            known = by_channel.get(cid)
+            sid = known["source_id"] if known else "yt_" + _slug(name or cid)
+            enabled = get("enabled").lower() not in ("false", "no", "n", "0", "off")
+            try:
+                every = int(float(get("poll_interval_s") or (known or {}).get("poll_interval_s") or 180))
+            except ValueError:
+                every = 180
+            out.append({"source_id": sid, "name": name or (known or {}).get("name") or cid, "kind": "youtube",
+                        "tier": "VIDEO", "language": (known or {}).get("language") or "ta", "channel_id": cid,
+                        "requires_residential_ip": True, "poll_interval_s": every, "enabled": enabled})
+        if not out:
+            log.warning("youtube sheet: no valid rows -- keeping the current channel list")
+            return None
+        log.info(f"youtube sheet: {len(out)} channels, {sum(s['enabled'] for s in out)} enabled")
+        return out
+    except Exception as ex:
+        log.warning(f"youtube sheet: {type(ex).__name__}: {str(ex)[:80]} -- keeping the current channel list")
+        return None
+
+
 def cmd_init():
     con = connect()
     con.executescript(SCHEMA)
@@ -349,6 +428,20 @@ def cmd_init():
         log.error("sources.json not found next to this script")
         return
     cfg = json.loads(SOURCES_JSON.read_text(encoding="utf-8"))
+
+    # YouTube channels may come from the sheet's second tab instead of sources.json
+    yt_url = (env().get("YOUTUBE_SHEET_CSV_URL") or "").strip()
+    if yt_url:
+        from_sheet = youtube_sources_from_sheet(yt_url, cfg["sources"])
+        if from_sheet is not None:
+            cfg["sources"] = [s for s in cfg["sources"] if s.get("kind") != "youtube"] + from_sheet
+        else:
+            # keep the channels already in the database exactly as they are
+            keep = [dict(r) for r in con.execute("SELECT * FROM sources WHERE kind='youtube'")]
+            cfg["sources"] = [s for s in cfg["sources"] if s.get("kind") != "youtube"] + [
+                {"source_id": k["source_id"], "name": k["name"], "kind": "youtube", "tier": k["tier"],
+                 "language": k["language"], "channel_id": youtube_channel_id(k["feed_url"]),
+                 "poll_interval_s": k["poll_interval_s"], "enabled": bool(k["enabled"])} for k in keep]
 
     n_on = 0
     for s in cfg["sources"]:
@@ -367,6 +460,19 @@ def cmd_init():
         """, (s["source_id"], s["name"], s["kind"], s["tier"], s.get("language"),
               url, int(s.get("requires_residential_ip", True)),
               int(s.get("poll_interval_s", 300)), enabled))
+
+    # Pages that answered 403/404/5xx used to count as OK when the error page had
+    # enough text. Re-mark the ones not yet scored so the real article is not
+    # replaced by "Access Denied" in the scoring.
+    try:
+        fixed = con.execute("""UPDATE items SET extract_status='FAILED', extract_text=NULL, extract_chars=0
+                               WHERE extract_status IN ('OK','THIN') AND extract_http >= 400
+                                 AND (band IS NULL)""").rowcount
+    except sqlite3.OperationalError:            # no band column yet on a fresh Phase 0 db
+        fixed = con.execute("""UPDATE items SET extract_status='FAILED', extract_text=NULL, extract_chars=0
+                               WHERE extract_status IN ('OK','THIN') AND extract_http >= 400""").rowcount
+    if fixed:
+        log.info(f"{fixed} error pages that had been stored as articles re-marked FAILED")
 
     # A source deleted from sources.json used to keep polling forever: the upsert
     # never switched it off. Its items stay; only the polling stops.
@@ -507,8 +613,13 @@ def poll_youtube_api(con, client, src, key, ts):
         if r.status_code == 403 and "quota" in reason.lower():
             log.error("  YouTube API daily quota is used up; channels fall back to the RSS feed until tomorrow")
         return None
+    try:
+        data = r.json()
+    except ValueError:
+        log.warning(f"  {src['source_id']:<22} YouTube API answered with something that is not JSON -- trying the feed")
+        return None
     entries = []
-    for it in r.json().get("items", []):
+    for it in data.get("items", []):
         sn = it.get("snippet") or {}
         vid = ((sn.get("resourceId") or {}).get("videoId")) or ""
         if not vid:
@@ -760,13 +871,19 @@ def drain_extractor(con, client, budget_s, tick=None):
         err_type = err_text = None
         html = ""
         try:
-            r = client.get(url, headers={"User-Agent": UA})
+            r = client.get(url, headers=BROWSER_HEADERS)
             http_status = r.status_code
             html = r.text
-            text = trafilatura.extract(html, include_comments=False,
-                                       include_tables=False) or ""
-            chars = len(text)
-            status = "OK" if chars >= THIN_TEXT_CHARS else ("THIN" if chars else "FAILED")
+            if http_status >= 400:
+                # an "Access Denied" or "enable JavaScript" page is not the article,
+                # however many characters it has
+                err_type, err_text = "HTTPError", f"HTTP {http_status}"
+                text, chars = "", 0
+            else:
+                text = trafilatura.extract(html, include_comments=False,
+                                           include_tables=False) or ""
+                chars = len(text)
+                status = "OK" if chars >= THIN_TEXT_CHARS else ("THIN" if chars else "FAILED")
         except Exception as ex:
             err_type, err_text = type(ex).__name__, str(ex)
         ms = int((time.time() - t0) * 1000)
@@ -953,6 +1070,50 @@ def cmd_stats():
 
 # --------------------------------------------------------------------------
 
+def cmd_check_keywords():
+    """Fetch the keyword sheet now and say plainly what the scorer will use.
+    Exit 1 only when there is no usable vocabulary at all (no sheet, no cache, no seed)."""
+    if alerts is None:
+        log.error(f"phase 1 not loaded: {PHASE1_ERROR}")
+        return 1
+    url = (env().get("KEYWORDS_CSV_URL") or "").strip()
+    con = connect()
+    alerts.migrate(con)
+    client = httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": UA})
+    try:
+        if url:
+            try:
+                r = client.get(url)
+                body = r.content.decode("utf-8-sig", errors="replace")
+                rows, problems = rules.parse_keywords_csv(body) if r.status_code == 200 else ([], [f"HTTP {r.status_code}"])
+                why = rules.sanity_problem(rows) if rows else (problems[0] if problems else "no rows")
+                if why:
+                    log.error(f"keyword sheet: NOT USABLE -- {why}")
+                    if "<html" in body[:500].lower():
+                        log.error("  the link returns a web page, not CSV. In the sheet use File > Share > "
+                                  "Publish to web, pick the keywords tab and 'Comma-separated values', "
+                                  "and copy THAT link (it ends in output=csv)")
+                else:
+                    log.info(f"keyword sheet: OK -- {len(rows)} usable rows"
+                             f"{', ' + str(len(problems)) + ' rows skipped' if problems else ''}")
+                    for p in problems[:5]:
+                        log.info(f"    {p}")
+            except Exception as ex:
+                log.error(f"keyword sheet: could not fetch it ({type(ex).__name__}: {str(ex)[:80]})")
+        else:
+            log.warning("KEYWORDS_CSV_URL is not set")
+        rules._memo.update(kw=None, checked=0.0)
+        kw = rules.get_keywords(con, client, url, force=True)
+    finally:
+        client.close()
+        con.close()
+    if kw is None:
+        log.error("no usable keyword vocabulary: items will be collected but NOT scored")
+        return 1
+    log.info(f"scoring will use {len(kw.rows)} terms from {kw.origin}")
+    return 0
+
+
 def cmd_prune(days):
     """Forget items older than `days` and shrink the file. Google News re-delivers
     items up to 14 days old (when:14d), so keep at least that much memory or old
@@ -1024,7 +1185,12 @@ def main():
                     help="with --once: size the resolve/extract budgets to finish in about this long")
     ap.add_argument("--prune", type=int, metavar="DAYS",
                     help="forget items older than DAYS (minimum 15) and shrink the database")
+    ap.add_argument("--check-keywords", action="store_true",
+                    help="fetch the keyword sheet and report whether scoring can work; exit 1 if not")
     a = ap.parse_args()
+
+    if a.check_keywords:
+        sys.exit(cmd_check_keywords())
 
     if a.init:
         return cmd_init()

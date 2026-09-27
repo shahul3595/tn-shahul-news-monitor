@@ -22,6 +22,7 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `STATE_PASSPHRASE` | yes | any long passphrase; encrypts the saved database. Changing it orphans the saved copy |
 | `KEYWORDS_CSV_URL` | yes | the keyword Google Sheet, published to the web as CSV |
 | `YOUTUBE_API_KEY` | recommended | YouTube Data API v3 key; the RSS feed often fails from cloud servers |
+| `YOUTUBE_SHEET_CSV_URL` | optional | the sheet's *YouTube channels* tab, published as CSV (columns `name`, `channel_id`, `enabled`). When set, the channel list comes from there instead of `sources.json` |
 | `GEMINI_API_KEY` | step 3 | Gemini free tier, for the digest |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | step 3 | the bot and the private channel |
 
@@ -30,7 +31,8 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 `keywords_seed.csv` is deliberately **not** in this public repository. The live
 list is the Google Sheet; the collector caches a copy inside the database, so a
 sheet outage does not stop scoring. Edit terms in the sheet; changes reach the
-collector within about 10 minutes.
+collector within about 10 minutes. Every run starts with `collect.py --check-keywords`,
+which stops the run with a plain message if the sheet link does not return CSV.
 
 ## Never upload these files
 

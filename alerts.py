@@ -987,14 +987,25 @@ def status_lines(con, env=None, now=None):
     if rt_get(con, "schema_phase1") is None:
         return ["ALERTS  not set up yet -- run 'python collect.py --init' (or start the collector)"]
     cutoff = rt_get(con, "alert_cutoff_at")
-    kwo = rt_get(con, "keywords_origin") or ("sheet" if env.get("KEYWORDS_CSV_URL") else "seed file")
     tg = "LIVE" if make_transport(env) else "DRY RUN (no TELEGRAM_BOT_TOKEN/CHAT_ID, or TELEGRAM_DRY_RUN=1)"
     hold = parse_ts(rt_get(con, "tg_hold_until"))
     if hold and hold > now:
         tg += f", paused until {fmt_ist(iso(hold))}"
     out.append(f"ALERTS  telegram {tg}")
-    out.append(f"  cutoff {fmt_ist(cutoff) if cutoff else 'not set'} · last tick {_ago(rt_get(con, 'last_tick_at'), now)}"
-               f" · keywords from {kwo}")
+    out.append(f"  cutoff {fmt_ist(cutoff) if cutoff else 'not set'} · last tick {_ago(rt_get(con, 'last_tick_at'), now)}")
+    # say what vocabulary the scorer can actually use, not what was configured
+    try:
+        cached = con.execute("SELECT count(*) FROM keywords").fetchone()[0]
+    except sqlite3.OperationalError:
+        cached = 0
+    fetched = rt_get(con, "keywords_fetched_at")
+    if cached:
+        out.append(f"  keywords: {cached} terms cached from the sheet, last fetched {_ago(fetched, now)}")
+    elif rules.SEED_CSV.exists():
+        out.append(f"  keywords: no sheet copy cached; scoring uses {rules.SEED_CSV.name}")
+    else:
+        out.append("  keywords: NONE -- the sheet has never been read and there is no seed file here. "
+                   "NOTHING IS SCORED. Check KEYWORDS_CSV_URL (must be the 'Publish to web' CSV link)")
     r = con.execute("""SELECT
         sum(CASE WHEN band IS NULL AND (extract_status <> 'PENDING' OR resolve_status IN ('FAILED','BLOCKED')) THEN 1 ELSE 0 END) ready,
         sum(CASE WHEN band IS NULL AND NOT (extract_status <> 'PENDING' OR resolve_status IN ('FAILED','BLOCKED')) THEN 1 ELSE 0 END) waiting,
