@@ -151,6 +151,7 @@ def _summary(con, gemini, key, urgent, sections, row, now):
 def _story(c, urgent):
     return {"id": c["id"], "title": digest._title(c), "url": alerts.display_url(c),
             "outlet": alerts.outlet_name(c), "sources": len(c.get("sources") or []),
+            "reports": [r for r in (c.get("reports") or []) if r["url"] != alerts.display_url(c)],
             "cat": c["category"], "urgent": bool(urgent), "sentiment": c.get("sentiment") or "neutral",
             "priority": c["priority"], "impact": c.get("impact") or 5,
             "snippet": digest._snippet(c), "image": digest._image_for(c) or "",
@@ -187,6 +188,18 @@ def _index(data_dir, now):
     entries = [{"key": "latest", "file": "data/latest.json", "label": "Latest"}]
     entries += [{"key": f"{d:%Y-%m-%d}", "file": f"data/{d:%Y-%m-%d}.json", "label": d.strftime("%a %d %b")}
                 for d in days[:PICKER_DAYS]]
+    for e in entries:                     # category x sentiment counts, for the 7-day matrix
+        try:
+            payload = json.loads((data_dir / Path(e["file"]).name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        counts = {}
+        for st in payload.get("stories", []):
+            cat = "urgent" if st.get("urgent") else st.get("cat")
+            counts.setdefault(cat, {"positive": 0, "neutral": 0, "critical": 0})
+            counts[cat][st.get("sentiment") or "neutral"] += 1
+        e["counts"] = counts
+        e["total"] = len(payload.get("stories", []))
     (data_dir / "index.json").write_text(json.dumps({"generated": iso(now), "editions": entries}, ensure_ascii=False),
                                          encoding="utf-8")
     return entries
@@ -287,6 +300,16 @@ header h1{font-size:19px;margin:0;line-height:1.2}header .sub{color:var(--dim);f
 .dash button{min-height:36px;min-width:44px;border:0;background:transparent;font:inherit;color:var(--ink);border-radius:8px;cursor:pointer;padding:4px 8px}
 .dash button:hover,.dash button.on{background:var(--chip)}.dash td.zero button{color:var(--dim);opacity:.5}
 .dash .cat{font-weight:600}.dash tfoot td{font-weight:600}
+.dash .hint{margin:6px 0 0;font-size:12px;color:var(--dim)}.dash .seg{display:flex;gap:4px}.btn.sm{min-height:34px;padding:4px 10px;font-size:13px}
+.mwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}.matrix{min-width:560px}.matrix th{font-size:12px;color:var(--dim);font-weight:500;white-space:nowrap}
+.matrix td{padding:4px 4px;vertical-align:middle}.matrix td.day{font-weight:600;white-space:nowrap;text-align:left}.matrix td.day.on{color:var(--accent)}
+.cell{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:64px;min-height:44px;justify-content:center;border-radius:8px;cursor:pointer;border:0;background:transparent;font:inherit;color:var(--ink);padding:3px 4px}
+.cell:hover{background:var(--chip)}.cell .n{font-weight:600;font-size:14px}.cell.zero{opacity:.35;cursor:default}
+.bar{display:flex;width:56px;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}.bar i{display:block;height:100%}.bar .p{background:var(--pos)}.bar .u{background:#98a2b3}.bar .c{background:var(--crit)}
+.badges{display:flex;gap:2px}.badges b{font-weight:500;font-size:11px;padding:0 4px;border-radius:999px;background:var(--chip);min-width:18px;text-align:center;cursor:pointer}
+.badges b.p{color:var(--pos)}.badges b.c{color:var(--crit)}.badges b.u{color:var(--dim)}
+.outlets{margin:0;padding:6px 14px 8px;list-style:none;border-top:1px dashed var(--line);font-size:14px}.outlets li{padding:4px 0}.outlets a{color:var(--accent);text-decoration:none;min-height:32px;display:inline-flex;align-items:center}
+.outlets small{color:var(--dim);margin-left:4px}button.more{border:1px solid var(--line);background:var(--chip);border-radius:999px;padding:2px 8px;font:inherit;font-size:12px;color:var(--ink);cursor:pointer;min-height:28px}
 .filterbar{display:none;gap:8px;align-items:center;margin:8px 0;font-size:14px;color:var(--dim)}.filterbar.on{display:flex}
 nav.chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 14px}
 nav.chips a{font-size:13px;min-height:36px;display:inline-flex;align-items:center;padding:4px 12px;border:1px solid var(--line);border-radius:999px;color:var(--ink);text-decoration:none;background:var(--card)}
@@ -327,7 +350,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 #top{position:fixed;right:16px;bottom:16px;display:none;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.2)}#top.on{display:inline-flex}
 .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30}
 .empty{color:var(--dim);padding:20px 0}footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
-@media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:17px}.dash td,.dash th{padding:5px 4px}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:17px}.dash td,.dash th{padding:5px 4px}.mlab{display:none}.matrix{min-width:460px}}
 """
 
 JS = r"""
@@ -348,7 +371,8 @@ function card(s){var g=group(s),wa='https://wa.me/?text='+encodeURIComponent((s.
  return '<article class="card" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+s.outlet+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
  (s.image?'<a href="'+esc(s.url)+'" target="_blank" rel="noopener"><img src="'+esc(s.image)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>':'')+
  '<div class="body"><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3>'+(s.snippet?'<p>'+esc(s.snippet)+'</p>':'')+
- '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.sources>1?'<span>+'+(s.sources-1)+' more outlets</span>':'')+'</div></div>'+
+ '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
+ (s.reports&&s.reports.length?'<ul class="outlets" hidden>'+s.reports.map(function(r){return '<li><a href="'+esc(r.url)+'" target="_blank" rel="noopener" title="'+esc(r.title)+'">'+esc(r.outlet)+' <small>('+esc(r.lang)+')</small> ↗</a></li>'}).join('')+'</ul>':'')+'</div>'+
  '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span><a class="wa" href="'+wa+'" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
 function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=by[group(s)]||[]).push(s)});
  $('#title').textContent=d.label+(d.key==='latest'?' · '+d.stories.length+' stories':'');
@@ -364,16 +388,17 @@ function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=b
  $('#chips').innerHTML=CATS.filter(function(c){return by[c[0]]}).map(function(c){return '<a href="#sec-'+c[0]+'">'+c[1]+' '+esc(c[2])+'<b>'+by[c[0]].length+'</b></a>'}).join('');
  $('#drawer-cats').innerHTML=CATS.filter(function(c){return by[c[0]]}).map(function(c){return '<a href="#sec-'+c[0]+'">'+c[1]+' '+esc(c[2])+' ('+by[c[0]].length+')</a>'}).join('');
  $('#content').innerHTML=CATS.filter(function(c){return by[c[0]]}).map(function(c){return '<section id="sec-'+c[0]+'" data-cat="'+c[0]+'"'+(c[0]==='urgent'?' class="urgent"':'')+'><h2>'+c[1]+' '+esc(c[2])+'</h2><div class="grid'+(state.view==='list'?' list':'')+'">'+by[c[0]].map(card).join('')+'</div></section>'}).join('')||'<p class="empty">Nothing kept for this edition.</p>';
- $$('.dash button').forEach(function(b){b.onclick=function(){var c=b.getAttribute('data-cat'),s=b.getAttribute('data-sent');if(state.cat===c&&state.sent===s){state.cat='';state.sent=''}else{state.cat=c;state.sent=s}apply();
+ $$('#dash-today button').forEach(function(b){b.onclick=function(){var c=b.getAttribute('data-cat'),s=b.getAttribute('data-sent');if(state.cat===c&&state.sent===s){state.cat='';state.sent=''}else{state.cat=c;state.sent=s}apply();
   var t=$(c?'#sec-'+c:'#content');if(t)t.scrollIntoView({behavior:'smooth',block:'start'})}});
  wire();apply()}
 function apply(){var q=state.q.toLowerCase().normalize('NFC').trim(),n=0;
  $$('.card').forEach(function(c){var ok=(!q||c.getAttribute('data-text').indexOf(q)>-1)&&(!state.cat||c.getAttribute('data-cat')===state.cat)&&(!state.sent||c.getAttribute('data-sent')===state.sent);c.hidden=!ok;if(ok)n++});
  $$('section[data-cat]').forEach(function(s){s.hidden=!$$('.card',s).some(function(c){return !c.hidden})});
- $('#nohit').hidden=n>0;$$('.dash button').forEach(function(b){b.classList.toggle('on',state.cat===b.getAttribute('data-cat')&&state.sent===b.getAttribute('data-sent')&&(state.cat||state.sent))});
+ $('#nohit').hidden=n>0;$$('#dash-today button').forEach(function(b){b.classList.toggle('on',state.cat===b.getAttribute('data-cat')&&state.sent===b.getAttribute('data-sent')&&(state.cat||state.sent))});
  var fb=$('#filterbar');fb.classList.toggle('on',!!(state.cat||state.sent));$('#filterlabel').textContent=(state.cat?NAME[state.cat]:'All')+(state.sent?' · '+SENT[state.sent]:'')+' · '+n+' shown'}
 function send(p){if(!FB)return;p.page=DATA.key;p.ua=navigator.userAgent.slice(0,120);fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){})}
-function wire(){$$('.acts').forEach(function(f){var c=f.closest('.card'),id=c.getAttribute('data-id');function item(){var s=DATA.stories.filter(function(x){return String(x.id)===id})[0]||{};return {id:id,title:s.title,url:s.url,category:s.cat,outlet:s.outlet}}
+function wire(){$$('.more').forEach(function(b){b.onclick=function(){var u=b.closest('.card').querySelector('.outlets'),o=u.hidden;u.hidden=!o;b.setAttribute('aria-expanded',o);b.textContent=b.textContent.replace(o?'▾':'▴',o?'▴':'▾')}});
+ $$('.acts').forEach(function(f){var c=f.closest('.card'),id=c.getAttribute('data-id');function item(){var s=DATA.stories.filter(function(x){return String(x.id)===id})[0]||{};return {id:id,title:s.title,url:s.url,category:s.cat,outlet:s.outlet}}
  function done(m){$$('button,.why',f).forEach(function(e){e.remove()});f.insertAdjacentHTML('afterbegin','<span class="done">'+m+'</span>');state.voted[id]=1;try{localStorage.setItem('voted',JSON.stringify(state.voted))}catch(e){}}
  var up=$('.up',f),dn=$('.down',f);if(up)up.onclick=function(){var p=item();p.type='up';send(p);done('Thanks 👍')};if(dn)dn.onclick=function(){f.classList.add('open')};
  $$('.why button',f).forEach(function(b){b.onclick=function(){var p=item();p.type='down';p.reason=b.getAttribute('data-r');send(p);done('Noted 👎')}})})}
@@ -382,10 +407,19 @@ $$('[data-view]').forEach(function(b){b.onclick=function(){setView(b.getAttribut
 $('#q').addEventListener('input',function(){state.q=this.value;apply()});
 $('#clear').onclick=function(){state.cat='';state.sent='';apply()};
 function fillPickers(){var o=EDS.map(function(e){return '<option value="'+esc(e.file)+'"'+(e.key===DATA.key?' selected':'')+'>'+esc(e.label)+'</option>'}).join('');$$('select.pick').forEach(function(s){s.innerHTML=o})}
-function load(file){if(!file)return;var e=EDS.filter(function(x){return x.file===file})[0];if(e&&e.key===DATA.key)return;
- fetch(file,{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){DATA=d;state.cat='';state.sent='';render();fillPickers();try{history.replaceState(null,'','?e='+encodeURIComponent(d.key))}catch(x){};window.scrollTo({top:0,behavior:'smooth'})}).catch(function(){toast('Could not load that edition')})}
+function load(file,after){if(!file)return;var e=EDS.filter(function(x){return x.file===file})[0];if(e&&e.key===DATA.key){if(after)after();return}
+ fetch(file,{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){DATA=d;state.cat='';state.sent='';render();fillPickers();matrix();try{history.replaceState(null,'','?e='+encodeURIComponent(d.key))}catch(x){};if(after)after();else window.scrollTo({top:0,behavior:'smooth'})}).catch(function(){toast('Could not load that edition')})}
+function drill(file,cat,sent){load(file,function(){state.cat=cat||'';state.sent=sent||'';apply();var t=$(cat?'#sec-'+cat:'#content');if(t)t.scrollIntoView({behavior:'smooth',block:'start'})})}
+function matrix(){var days=EDS.filter(function(e){return e.key!=='latest'&&e.counts});var cats=CATS.filter(function(c){return days.some(function(d){return d.counts[c[0]]})});
+ $('#mhead').innerHTML='<tr><th>Day</th>'+cats.map(function(c){return '<th title="'+esc(c[2])+'">'+c[1]+'<span class="mlab"> '+esc(c[2].split(' ')[0])+'</span></th>'}).join('')+'<th>All</th></tr>';
+ $('#mbody').innerHTML=days.map(function(d){return '<tr><td class="day'+(d.key===DATA.key?' on':'')+'"><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="" data-sent="" style="min-width:0;align-items:flex-start">'+esc(d.label)+'</button></td>'+cats.map(function(c){var n=d.counts[c[0]]||{positive:0,neutral:0,critical:0},t=n.positive+n.neutral+n.critical;
+  if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
+  return '<td><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="'+c[0]+'" data-sent=""><span class="n">'+t+'</span><span class="bar"><i class="p" style="width:'+(100*n.positive/t)+'%"></i><i class="u" style="width:'+(100*n.neutral/t)+'%"></i><i class="c" style="width:'+(100*n.critical/t)+'%"></i></span><span class="badges">'+(n.positive?'<b class="p" data-sent="positive">'+n.positive+'</b>':'')+(n.neutral?'<b class="u" data-sent="neutral">'+n.neutral+'</b>':'')+(n.critical?'<b class="c" data-sent="critical">'+n.critical+'</b>':'')+'</span></button></td>'}).join('')+'<td><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="" data-sent=""><span class="n">'+(d.total||0)+'</span></button></td></tr>'}).join('')||'<tr><td colspan="9" class="empty">No past editions yet — run the backfill.</td></tr>';
+ $$('#mbody .cell').forEach(function(b){b.onclick=function(ev){var s=ev.target.closest('b[data-sent]');drill(b.getAttribute('data-file'),b.getAttribute('data-cat'),s?s.getAttribute('data-sent'):'')}})}
+$$('[data-dash]').forEach(function(b){b.onclick=function(){var w=b.getAttribute('data-dash')==='week';$('#dash-today').hidden=w;$('#dash-week').hidden=!w;$('#dashtitle').textContent=w?'Last 7 days':'Today at a glance';$$('[data-dash]').forEach(function(x){x.setAttribute('aria-pressed',x===b)});if(w)matrix();try{localStorage.setItem('dash',w?'week':'today')}catch(e){}}});
+try{if(localStorage.getItem('dash')==='week')$('[data-dash=week]').click()}catch(e){}
 $$('select.pick').forEach(function(s){s.onchange=function(){load(this.value)}});
-fetch('data/index.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){EDS=j.editions;fillPickers();var m=location.search.match(/[?&]e=([\w-]+)/);if(m&&m[1]!==DATA.key){var e=EDS.filter(function(x){return x.key===m[1]})[0];if(e)load(e.file)}}).catch(function(){});
+fetch('data/index.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){EDS=j.editions;fillPickers();matrix();var m=location.search.match(/[?&]e=([\w-]+)/);if(m&&m[1]!==DATA.key){var e=EDS.filter(function(x){return x.key===m[1]})[0];if(e)load(e.file)}}).catch(function(){});
 var drawer=$('#drawer'),scrim=$('#scrim');function openD(o){drawer.classList.toggle('open',o);scrim.classList.toggle('on',o)}
 $('#menu').onclick=function(){openD(true)};$('#closed').onclick=function(){openD(false)};scrim.onclick=function(){openD(false)};
 drawer.addEventListener('click',function(ev){if(ev.target.closest('a'))openD(false)});
@@ -394,7 +428,7 @@ var dlg=$('#missing');$('#open-missing').onclick=function(){openD(false);dlg.sho
 $('#send-missing').onclick=function(ev){ev.preventDefault();var u=$('#m-url').value.trim(),n=$('#m-notes').value.trim();if(!u&&!n)return;send({type:'missing',url:u,notes:n.slice(0,500)});dlg.close();$('#m-url').value='';$('#m-notes').value='';toast('Thank you — sent for review.')};
 function toast(m){var t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.remove()},3500)}
 if(!FB){$('#open-missing').hidden=true}
-fillPickers();render();setView(state.view);
+fillPickers();render();matrix();setView(state.view);
 })();
 """
 
@@ -413,8 +447,9 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <div class="tools"><input type="search" id="q" placeholder="Search headlines, outlets, categories" aria-label="Search">
 <select class="pick" aria-label="Edition"></select><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button></div>
 <div class="callout" id="summary" hidden><h2>60-second briefing · tap a section to jump to its stories</h2><div class="sgs"></div></div>
-<div class="dash" id="dashboard"><h2><span>Today at a glance</span><span style="font-weight:400;text-transform:none;letter-spacing:0">tap a number to filter</span></h2>
-<table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table></div>
+<div class="dash" id="dashboard"><h2><span id="dashtitle">Today at a glance</span><span class="seg"><button type="button" class="btn sm" data-dash="today" aria-pressed="true">Today</button><button type="button" class="btn sm" data-dash="week" aria-pressed="false">7 days</button></span></h2>
+<div id="dash-today"><table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table><p class="hint">Tap a number to filter the stories below.</p></div>
+<div id="dash-week" hidden><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. Tap a cell to open that day filtered to that section; tap a badge for one sentiment.</p></div></div>
 <div class="filterbar" id="filterbar"><span id="filterlabel"></span><button type="button" class="btn" id="clear">Show all</button></div>
 <nav class="chips" id="chips"></nav>
 <div id="content"></div><p class="empty" id="nohit" hidden>No stories match.</p>

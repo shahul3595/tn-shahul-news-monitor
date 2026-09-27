@@ -18,7 +18,9 @@ The Telegram brief carries only what is new since the last brief. The web page i
 `docs/index.html` is a small app that renders editions from `docs/data/`: `latest.json`
 (everything kept in the last 36 hours, up to 60 stories) and one file per IST day by
 publication date (kept 30 days; the picker offers 7). Each edition has a 60-second briefing with 2-3
-takeaways per section (tap a section to jump to its cards), a category × sentiment dashboard that filters the cards when tapped,
+takeaways per section (tap a section to jump to its cards), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
+matrix (days × sections, sentiment bars; tap a cell to open that day filtered), expandable
+"+N more outlets" links on merged stories,
 search, cards/list, a slide-out menu, back-to-top, WhatsApp share per card, and reader
 feedback (👍/👎 and "Submit missing news") when `FEEDBACK_URL` is set — see `feedback.gs`.
 Every run rebuilds `latest`, today and yesterday. `python digest.py --backfill 7` (or the

@@ -359,6 +359,10 @@ def cluster_call_merges_tamil_and_english_reports_and_is_not_repeated():
     check(len(lat["chosen"]) == 2, f"two stories, not three: {[c['title'][:30] for c in lat['chosen']]}")
     drain = next(c for c in lat["chosen"] if "@drain" in c["title"])
     check(len(drain["sources"]) == 2, "the Tamil and English reports pooled")
+    check(len(drain["reports"]) == 2 and {r["lang"] for r in drain["reports"]} == {"Tamil", "English"}, drain["reports"])
+    data = json.loads((TMP / "docs-cl" / "data" / "latest.json").read_text(encoding="utf-8"))
+    st = next(x for x in data["stories"] if "@drain" in x["title"])
+    check(len(st["reports"]) == 1 and st["reports"][0]["url"] != st["url"] and st["reports"][0]["outlet"], "the other outlet, with its own link")
     check(lat["stats"].get("clusters") == 1, lat["stats"])
     keys = con.execute("SELECT story_key FROM items WHERE title LIKE '%@drain%'").fetchall()
     check(keys[0][0] and keys[0][0] == keys[1][0], "story keys stored on both items")
@@ -418,6 +422,8 @@ def backfill_writes_dated_editions_and_the_index():
     keys = [e["key"] for e in idx["editions"]]
     check(keys[0] == "latest" and len(keys) == 8 and keys[1] == "2026-10-15", keys)
     check((docs / "data" / "2026-10-08.json").exists(), "the 7th day back exists")
+    day = next(e for e in idx["editions"] if e["key"] == "2026-10-14")
+    check(day["counts"] == {"constituency": {"positive": 0, "neutral": 1, "critical": 0}} and day["total"] == 1, day)
 
 
 @test
@@ -441,6 +447,7 @@ def the_page_embeds_the_latest_edition_and_the_app_markup():
     check(data_sum[0]["cat"] == "urgent" and len(data_sum[0]["bullets"]) == 2, data_sum)
     check("</script>" not in html.split('<script id="data" type="application/json">')[1].split("</script>")[0], "safe embedding")
     check("wa.me" in web.JS and "maximum-scale=1.0" in html and "min-height:44px" in html, "share, viewport, touch targets")
+    check('id="dash-week"' in html and "function matrix" in web.JS and 'class="more"' in web.JS, "7-day matrix and outlet expander")
 
 
 @test

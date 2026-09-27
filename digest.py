@@ -192,6 +192,14 @@ def _merge(cands, links):
                                            c.get("published_at") or ""))
         rep["sources"] = list(dict.fromkeys(s for m in members for s in m.get("sources") or []))
         rep["merged"] = [m["id"] for m in members]
+        # every report of the story, the representative first, one per url
+        seen, reports = set(), []
+        for m in [rep] + [m for m in members if m is not rep]:
+            for r in m.get("reports") or []:
+                if r["url"] not in seen:
+                    seen.add(r["url"])
+                    reports.append(r)
+        rep["reports"] = reports
         out.append(rep)
     return out
 
@@ -202,6 +210,9 @@ def _load(con, scope, since, pub_since):
     for r in rows:
         d = dict(r)
         d["sources"] = [alerts.outlet_name(r)]
+        d["reports"] = [{"outlet": alerts.outlet_name(r), "url": alerts.display_url(r),
+                         "title": rules.clean_title(r["title"] or "", r["publisher"] or ""),
+                         "lang": "Tamil" if re.search(r"[\u0B80-\u0BFF]", r["title"] or "") else "English"}]
         d["tags"] = alerts._j(r["target_tags"], [])
         d["ntitle"] = norm_title(r["title"], r["publisher"])
         d["tgrams"] = frozenset(rules.sim_grams(d["ntitle"])) if len(d["ntitle"]) >= 12 else frozenset()
