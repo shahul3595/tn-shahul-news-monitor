@@ -1,0 +1,83 @@
+# Step 3 -- the Telegram brief, twice a day.
+#
+# Scheduled a little early because GitHub starts scheduled runs late (often by
+# 10-30 minutes): 01:15 UTC = 06:45 IST, 12:15 UTC = 17:45 IST. The brief itself
+# says "Morning" before 12:00 IST and "Evening" after.
+#
+# Secrets: GEMINI_API_KEY (ranking; without it the keyword rules rank),
+#          TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (delivery; without them the brief
+#          is only printed and nothing is marked as sent), plus STATE_PASSPHRASE.
+name: "3 - Telegram brief"
+
+on:
+  schedule:
+    - cron: "15 1 * * *"
+    - cron: "15 12 * * *"
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "Heading to use"
+        type: choice
+        options: [auto, morning, evening]
+        default: auto
+      dry_run:
+        description: "Only print the brief on the run page; send nothing, mark nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: collector                # shares the database with the collector; never at the same time
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATE_PASSPHRASE: ${{ secrets.STATE_PASSPHRASE }}
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Get the files
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install the libraries
+        run: pip install -r requirements.txt
+
+      - name: Restore the saved database
+        run: bash state.sh restore
+
+      - name: Build and send the brief
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KEYWORDS_CSV_URL: ${{ secrets.KEYWORDS_CSV_URL }}
+          DIGEST_MAX: ${{ vars.DIGEST_MAX }}
+          DIGEST_PER_CATEGORY: ${{ vars.DIGEST_PER_CATEGORY }}
+        run: |
+          python collect.py --init
+          python digest.py --slot "${{ github.event.inputs.slot || 'auto' }}" \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Encrypt the database
+        run: bash state.sh pack
+
+      - name: Save the database for the next run
+        uses: actions/upload-artifact@v6
+        with:
+          name: state
+          path: state/state.enc
+          retention-days: 3
+          if-no-files-found: error
