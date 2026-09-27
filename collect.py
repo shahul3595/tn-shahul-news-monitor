@@ -476,6 +476,20 @@ def cmd_init():
     if fixed:
         log.info(f"{fixed} error pages that had been stored as articles re-marked FAILED")
 
+    # Videos collected through the API carry their thumbnail in the stored payload;
+    # fill image_url from it for the ones that predate the column.
+    try:
+        n_yt = con.execute("""UPDATE items SET image_url = coalesce(
+                                json_extract(raw_payload, '$.snippet.thumbnails.medium.url'),
+                                json_extract(raw_payload, '$.snippet.thumbnails.high.url'),
+                                json_extract(raw_payload, '$.snippet.thumbnails.default.url'))
+                              WHERE image_url IS NULL AND raw_payload LIKE '%youtube_api%'
+                                AND json_valid(raw_payload)""").rowcount
+        if n_yt:
+            log.info(f"{n_yt} video thumbnails filled in from stored payloads")
+    except sqlite3.OperationalError as ex:
+        log.warning(f"thumbnail backfill skipped: {ex}")
+
     # A source deleted from sources.json used to keep polling forever: the upsert
     # never switched it off. Its items stay; only the polling stops.
     ids = [s["source_id"] for s in cfg["sources"]]
@@ -1180,6 +1194,51 @@ def queue_depth(con):
     return r["rp"], r["ep"]
 
 
+IMAGE_BACKFILL_PER_CYCLE = 40
+IMAGE_BACKFILL_DAYS = 3
+
+
+def backfill_images(con, client, limit=IMAGE_BACKFILL_PER_CYCLE, tick=None):
+    """Kept articles extracted before image capture existed get their lead image now,
+    a few per cycle. One short fetch each; failures are marked so they are not retried."""
+    try:
+        rows = con.execute("""SELECT id, resolved_url FROM items
+                              WHERE image_url IS NULL AND extract_status IN ('OK', 'THIN')
+                                AND band IN ('AUTO_KEEP', 'AI', 'KEYWORD_KEEP')
+                                AND discovered_at >= ? AND resolved_url LIKE 'http%'
+                              ORDER BY id DESC LIMIT ?""",
+                           ((datetime.now(timezone.utc) - timedelta(days=IMAGE_BACKFILL_DAYS)).isoformat(timespec="seconds"),
+                            limit)).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    if not rows:
+        return 0
+    log.info(f"  {len(rows)} kept articles without a lead image -- fetching")
+    found = 0
+    for r in rows:
+        if STOP:
+            break
+        if tick:
+            tick()
+        host = (urlparse(r["resolved_url"]).hostname or "").replace("www.", "")
+        if host_in(host, VIDEO_HOSTS + SOCIAL_HOSTS):
+            con.execute("UPDATE items SET image_url='' WHERE id=?", (r["id"],))
+            continue
+        image = ""
+        try:
+            resp = client.get(r["resolved_url"], headers=BROWSER_HEADERS)
+            if resp.status_code == 200:
+                image = og_image(resp.text) or ""
+        except Exception:
+            pass
+        con.execute("UPDATE items SET image_url=? WHERE id=?", (image, r["id"]))   # '' = looked, none
+        found += bool(image)
+        con.commit()
+        time.sleep(FETCH_DELAY_S)
+    log.info(f"  images: {found} of {len(rows)} found")
+    return found
+
+
 def cycle(con, client, rb=RESOLVE_BUDGET_S, eb=EXTRACT_BUDGET_S, poll=True):
     # Alerts are checked between items, not once per cycle: a cycle with a backlog
     # runs ~11 minutes, and a flood alert should not wait for it to finish.
@@ -1195,6 +1254,8 @@ def cycle(con, client, rb=RESOLVE_BUDGET_S, eb=EXTRACT_BUDGET_S, poll=True):
         return
     log.info("--- extract ---")
     drain_extractor(con, client, eb, tick=tick)
+    if not STOP:
+        backfill_images(con, client, tick=tick)
     tick()
 
 

@@ -583,7 +583,7 @@ footer ul{columns:2;padding-left:18px;margin:6px 0 0}footer a{color:var(--accent
 
 
 def _image_for(c):
-    if c.get("image_url"):
+    if c.get("image_url"):                     # '' means the page was checked and has none
         return c["image_url"]
     if c.get("yt_payload"):
         try:
