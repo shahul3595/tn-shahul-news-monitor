@@ -9,12 +9,13 @@
 #   STATE_PASSPHRASE   required -- encrypts the saved database
 #   KEYWORDS_CSV_URL   required -- the published Google Sheet, as CSV
 #   YOUTUBE_API_KEY    optional -- channels via the Data API instead of the flaky feed
+#   YOUTUBE_SHEET_CSV_URL  optional -- the sheet's 'YouTube channels' tab as CSV
 #   GEMINI_API_KEY     optional -- only decides the AI band for now (used in step 3)
 name: "2 - Collect news"
 
 on:
-#  schedule:
-#    - cron: "*/30 * * * *"        # UTC; GitHub often starts these 5-30 min late
+  schedule:
+    - cron: "*/30 * * * *"        # UTC; GitHub often starts these 5-30 min late
   workflow_dispatch:
 
 permissions:
@@ -63,6 +64,7 @@ jobs:
       - name: Collect, resolve, extract and score
         env:
           KEYWORDS_CSV_URL: ${{ secrets.KEYWORDS_CSV_URL }}
+          YOUTUBE_SHEET_CSV_URL: ${{ secrets.YOUTUBE_SHEET_CSV_URL }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_DRY_RUN: "1"     # instant alerts stay off; the digest is step 3
@@ -70,6 +72,8 @@ jobs:
           NODE_NAME: github
         run: |
           python collect.py --init
+          # stop here, loudly, if nothing can be scored -- collecting unscored items is pointless
+          python collect.py --check-keywords
           python collect.py --once --minutes 17
           python collect.py --prune 21
           { echo '```'; python collect.py --health || true; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
