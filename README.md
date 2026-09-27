@@ -19,9 +19,9 @@ The Telegram brief carries only what is new since the last brief. The web page i
 (everything kept in the last 36 hours, up to 60 stories) and one file per IST day by
 publication date (kept 30 days; the picker offers 7). Each edition has a 60-second briefing with 2-3
 takeaways per section (tap a takeaway to jump to its card, which lights up; tap a section heading for the whole section), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
-matrix (days × sections, sentiment bars, and the whole day stacked in the *All* column; tap a cell to open that day filtered), expandable
+matrix (days × sections with sentiment bars and 🟢 ⚪ 🔴 counts, the whole day in the *All* column; tap a count for that day and section, a badge for one sentiment of it, the day for all of it), expandable
 "+N more outlets" links on merged stories,
-search, cards/list, a slide-out menu, back-to-top, WhatsApp share per card, and reader
+search (headlines, summaries, outlets), cards/list, a slide-out menu, back-to-top, WhatsApp share per card, and reader
 feedback (👍/👎 and "Submit missing news") when `FEEDBACK_URL` is set — see `feedback.gs`.
 Every run rebuilds `latest`, today and yesterday. `python digest.py --backfill 7` (or the
 workflow's *backfill_days* input) writes the past days from what the database holds.

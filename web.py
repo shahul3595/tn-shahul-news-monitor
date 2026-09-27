@@ -314,11 +314,13 @@ header h1{font-size:19px;margin:0;line-height:1.2}header .sub{color:var(--dim);f
 .dash .cat{font-weight:600}.dash tfoot td{font-weight:600}
 .dash .hint{margin:6px 0 0;font-size:12px;color:var(--dim)}.dash .seg{display:flex;gap:4px}.btn.sm{min-height:34px;padding:4px 10px;font-size:13px}
 .mwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}.matrix{min-width:560px}.matrix th{font-size:12px;color:var(--dim);font-weight:500;white-space:nowrap}
-.matrix td{padding:4px 4px;vertical-align:middle}.matrix td.day{font-weight:600;white-space:nowrap;text-align:left}.matrix td.day.on{color:var(--accent)}
-.cell{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:64px;min-height:44px;justify-content:center;border-radius:8px;cursor:pointer;border:0;background:transparent;font:inherit;color:var(--ink);padding:3px 4px}
-.cell:hover{background:var(--chip)}.cell .n{font-weight:600;font-size:14px}.cell.zero{opacity:.35;cursor:default}
-.cell.all{min-width:80px;border-left:1px solid var(--line);border-radius:0 8px 8px 0}.cell.all .bar{width:72px}.bar{display:flex;width:56px;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}.bar i{display:block;height:100%}.bar .p{background:var(--pos)}.bar .u{background:#98a2b3}.bar .c{background:var(--crit)}
-.badges{display:flex;gap:2px}.badges b{font-weight:500;font-size:11px;padding:0 4px;border-radius:999px;background:var(--chip);min-width:18px;text-align:center;cursor:pointer}
+.matrix td{padding:4px 4px;vertical-align:middle}.matrix td.day{white-space:nowrap;text-align:left}.matrix td.day.on{color:var(--accent)}
+.cell{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:72px;padding:2px 0}.cell.zero{opacity:.35;min-height:44px;justify-content:center}.cell.zero .n{color:var(--dim)}
+.matrix button.n{display:flex;flex-direction:column;align-items:center;gap:3px;min-height:40px;min-width:64px;padding:4px 6px;border:0;border-radius:8px;background:transparent;font:inherit;font-weight:600;font-size:14px;color:var(--ink);cursor:pointer}
+.matrix button.n:hover{background:var(--chip)}.matrix button.n.day{font-weight:600;white-space:nowrap;min-width:0;align-items:flex-start;padding:4px 6px 4px 0}
+.badges button.bd{min-width:36px;min-height:36px;padding:0;border:0;background:transparent;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:8px}.badges button.bd:hover{background:var(--chip)}
+.cell.all{border-left:1px solid var(--line)}.cell.all .bar{width:64px}.bar{display:flex;width:56px;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}.bar i{display:block;height:100%}.bar .p{background:var(--pos)}.bar .u{background:#98a2b3}.bar .c{background:var(--crit)}
+.badges{display:flex;gap:0}.badges b{font-weight:500;font-size:11px;padding:2px 5px;border-radius:999px;background:var(--chip);min-width:22px;text-align:center;white-space:nowrap;line-height:1.3}
 .badges b.p{color:var(--pos)}.badges b.c{color:var(--crit)}.badges b.u{color:var(--dim)}
 .outlets{margin:0;padding:6px 14px 8px;list-style:none;border-top:1px dashed var(--line);font-size:14px}.outlets li{padding:4px 0}.outlets a{color:var(--accent);text-decoration:none;min-height:32px;display:inline-flex;align-items:center}
 .outlets small{color:var(--dim);margin-left:4px}button.more{border:1px solid var(--line);background:var(--chip);border-radius:999px;padding:2px 8px;font:inherit;font-size:12px;color:var(--ink);cursor:pointer;min-height:28px}
@@ -362,7 +364,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 #top{position:fixed;right:16px;bottom:16px;display:none;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.2)}#top.on{display:inline-flex}
 .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30}
 .empty{color:var(--dim);padding:20px 0}footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
-@media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:17px}.dash td,.dash th{padding:5px 4px}.mlab{display:none}.matrix{min-width:460px}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:17px}.dash td,.dash th{padding:5px 4px}.mlab{display:none}.matrix{min-width:520px}}
 """
 
 JS = r"""
@@ -380,7 +382,7 @@ function group(s){return s.urgent?'urgent':s.cat}
 function card(s){var g=group(s),wa='https://wa.me/?text='+encodeURIComponent((s.urgent?'🚨 ':'')+s.title+'\n'+NAME[s.cat]+' · '+s.outlet+' · '+s.time+'\n'+s.url);
  var why=REASONS.map(function(r){return '<button type="button" data-r="'+r[0]+'">'+esc(r[1])+'</button>'}).join('');
  var acts=state.voted[s.id]?'<span class="done">Thanks for the feedback</span>':'<button type="button" class="up" aria-label="Useful">👍</button><button type="button" class="down" aria-label="Not useful">👎</button><div class="why">'+why+'</div>';
- return '<article class="card" id="story-'+s.id+'" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+s.outlet+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
+ return '<article class="card" id="story-'+s.id+'" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+(s.snippet||'')+' '+s.outlet+' '+(s.reports||[]).map(function(r){return r.outlet}).join(' ')+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
  (s.image?'<a href="'+esc(s.url)+'" target="_blank" rel="noopener"><img src="'+esc(s.image)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>':'')+
  '<div class="body"><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3>'+(s.snippet?'<p>'+esc(s.snippet)+'</p>':'')+
  '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
@@ -427,12 +429,12 @@ function load(file,after){if(!file)return;var e=EDS.filter(function(x){return x.
 function drill(file,cat,sent){load(file,function(){state.cat=cat||'';state.sent=sent||'';apply();var t=$(cat?'#sec-'+cat:'#content');if(t)t.scrollIntoView({behavior:'smooth',block:'start'})})}
 function matrix(){var days=EDS.filter(function(e){return e.key!=='latest'&&e.counts});var cats=CATS.filter(function(c){return days.some(function(d){return d.counts[c[0]]})});
  $('#mhead').innerHTML='<tr><th>Day</th>'+cats.map(function(c){return '<th title="'+esc(c[2])+'">'+c[1]+'<span class="mlab"> '+esc(c[2].split(' ')[0])+'</span></th>'}).join('')+'<th>All</th></tr>';
- $('#mbody').innerHTML=days.map(function(d){return '<tr><td class="day'+(d.key===DATA.key?' on':'')+'"><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="" data-sent="" style="min-width:0;align-items:flex-start">'+esc(d.label)+'</button></td>'+cats.map(function(c){var n=d.counts[c[0]]||{positive:0,neutral:0,critical:0},t=n.positive+n.neutral+n.critical;
-  if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
-  return '<td><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="'+c[0]+'" data-sent=""><span class="n">'+t+'</span><span class="bar"><i class="p" style="width:'+(100*n.positive/t)+'%"></i><i class="u" style="width:'+(100*n.neutral/t)+'%"></i><i class="c" style="width:'+(100*n.critical/t)+'%"></i></span><span class="badges">'+(n.positive?'<b class="p" data-sent="positive">'+n.positive+'</b>':'')+(n.neutral?'<b class="u" data-sent="neutral">'+n.neutral+'</b>':'')+(n.critical?'<b class="c" data-sent="critical">'+n.critical+'</b>':'')+'</span></button></td>'}).join('')+(function(){var a={positive:0,neutral:0,critical:0};cats.forEach(function(c){var n=d.counts[c[0]];if(n){a.positive+=n.positive||0;a.neutral+=n.neutral||0;a.critical+=n.critical||0}});var t=a.positive+a.neutral+a.critical,pc=function(k){return Math.round(100*a[k]/t)};
-  if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
-  return '<td><button type="button" class="cell all" data-file="'+esc(d.file)+'" data-cat="" data-sent="" title="'+esc(d.label)+': '+pc('positive')+'% positive · '+pc('neutral')+'% neutral · '+pc('critical')+'% critical"><span class="n">'+t+'</span><span class="bar"><i class="p" style="width:'+(100*a.positive/t)+'%"></i><i class="u" style="width:'+(100*a.neutral/t)+'%"></i><i class="c" style="width:'+(100*a.critical/t)+'%"></i></span><span class="badges">'+(a.positive?'<b class="p" data-sent="positive">'+pc('positive')+'%</b>':'')+(a.neutral?'<b class="u" data-sent="neutral">'+pc('neutral')+'%</b>':'')+(a.critical?'<b class="c" data-sent="critical">'+pc('critical')+'%</b>':'')+'</span></button></td>'})()+'</tr>'}).join('')||'<tr><td colspan="9" class="empty">No past editions yet — run the backfill.</td></tr>';
- $$('#mbody .cell').forEach(function(b){b.onclick=function(ev){var s=ev.target.closest('b[data-sent]');drill(b.getAttribute('data-file'),b.getAttribute('data-cat'),s?s.getAttribute('data-sent'):'')}})}
+ function cell(file,cat,n,cls){var t=n.positive+n.neutral+n.critical;if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
+  var w=function(k){return (100*n[k]/t)+'%'},badge=function(k,c,ic){return n[k]?'<button type="button" class="bd" data-file="'+esc(file)+'" data-cat="'+cat+'" data-sent="'+k+'" aria-label="'+n[k]+' '+k+'"><b class="'+c+'">'+ic+' '+n[k]+'</b></button>':''};
+  return '<td><div class="cell'+(cls||'')+'"><button type="button" class="n" data-file="'+esc(file)+'" data-cat="'+cat+'" data-sent="" aria-label="'+t+' stories, all sentiments">'+t+'<span class="bar"><i class="p" style="width:'+w('positive')+'"></i><i class="u" style="width:'+w('neutral')+'"></i><i class="c" style="width:'+w('critical')+'"></i></span></button><span class="badges">'+badge('positive','p','🟢')+badge('neutral','u','⚪')+badge('critical','c','🔴')+'</span></div></td>'}
+ $('#mbody').innerHTML=days.map(function(d){var a={positive:0,neutral:0,critical:0};cats.forEach(function(c){var n=d.counts[c[0]];if(n){a.positive+=n.positive||0;a.neutral+=n.neutral||0;a.critical+=n.critical||0}});
+  return '<tr><td class="day'+(d.key===DATA.key?' on':'')+'"><button type="button" class="n day" data-file="'+esc(d.file)+'" data-cat="" data-sent="" aria-label="Open '+esc(d.label)+'">'+esc(d.label)+'</button></td>'+cats.map(function(c){return cell(d.file,c[0],d.counts[c[0]]||{positive:0,neutral:0,critical:0},'')}).join('')+cell(d.file,'',a,' all')+'</tr>'}).join('')||'<tr><td colspan="9" class="empty">No past editions yet — run the backfill.</td></tr>';
+ $$('#mbody button[data-file]').forEach(function(b){b.onclick=function(){drill(b.getAttribute('data-file'),b.getAttribute('data-cat'),b.getAttribute('data-sent'))}})}
 $$('[data-dash]').forEach(function(b){b.onclick=function(){var w=b.getAttribute('data-dash')==='week';$('#dash-today').hidden=w;$('#dash-week').hidden=!w;$('#dashtitle').textContent=w?'Last 7 days':'Today at a glance';$$('[data-dash]').forEach(function(x){x.setAttribute('aria-pressed',x===b)});if(w)matrix();try{localStorage.setItem('dash',w?'week':'today')}catch(e){}}});
 try{if(localStorage.getItem('dash')==='week')$('[data-dash=week]').click()}catch(e){}
 $$('select.pick').forEach(function(s){s.onchange=function(){load(this.value)}});
@@ -462,12 +464,12 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <h2>More</h2><button type="button" class="link" id="open-missing">＋ Submit missing news</button></aside>
 <div class="wrap">
 <header><button type="button" class="icon" id="menu" aria-label="Menu">☰</button><div style="flex:1;min-width:0"><h1 id="title"></h1><div class="sub" id="sub"></div></div></header>
-<div class="tools"><input type="search" id="q" placeholder="Search headlines, outlets, categories" aria-label="Search">
+<div class="tools"><input type="search" id="q" placeholder="Search headlines, summaries, outlets, categories" aria-label="Search">
 <select class="pick" aria-label="Edition"></select><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button></div>
 <div class="callout" id="summary" hidden><h2>60-second briefing · tap a section to jump to its stories</h2><div class="sgs"></div></div>
 <div class="dash" id="dashboard"><h2><span id="dashtitle">Today at a glance</span><span class="seg"><button type="button" class="btn sm" data-dash="today" aria-pressed="true">Today</button><button type="button" class="btn sm" data-dash="week" aria-pressed="false">7 days</button></span></h2>
 <div id="dash-today"><table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table><p class="hint">Tap a number to filter the stories below.</p></div>
-<div id="dash-week" hidden><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. The All column stacks the whole day. Tap a cell to open that day filtered to that section; tap a badge for one sentiment.</p></div></div>
+<div id="dash-week" hidden><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. Tap a count to open that day and section; tap 🟢 ⚪ 🔴 for one sentiment only; tap the day to open all of it.</p></div></div>
 <div class="filterbar" id="filterbar"><span id="filterlabel"></span><button type="button" class="btn" id="clear">Show all</button></div>
 <nav class="chips" id="chips"></nav>
 <div id="content"></div><p class="empty" id="nohit" hidden>No stories match.</p>
