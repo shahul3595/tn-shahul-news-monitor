@@ -64,7 +64,7 @@ PUBLISHED_WITHIN_H = 36       # a 14-day query can surface old stories; the brie
 WEB_WINDOW_H = 36             # the web page is a rolling edition of everything kept this recently
 WEB_PER_CATEGORY = 10         # web page: 10 per category first, then fill to WEB_MAX (60)
 WINDOW_CAP_H = 48             # never look further back than this, even on the first send
-AI_MAX_CALLS_PER_DAY = 40
+AI_MAX_CALLS_PER_DAY = 80     # a normal day uses ~10-15: ranking, one cluster and one summary per edition
 AI_BATCH = 60                 # items per Gemini call (~25k tokens with Tamil)
 AI_PAUSE_S = 4.0              # free tier is per-minute limited
 AI_TIME_BUDGET_S = 420        # after this, the rest is ranked by the rules
@@ -78,7 +78,9 @@ SCHEMA = [
     "CREATE TABLE IF NOT EXISTS digests (id INTEGER PRIMARY KEY, slot TEXT, created_at TEXT, sent_at TEXT, "
     "status TEXT, candidates INTEGER, chosen INTEGER, ai_calls INTEGER, message_ids TEXT, body TEXT)",
 ]
-ITEM_COLUMNS = [("digested_at", "TEXT"), ("digest_id", "INTEGER")]
+ITEM_COLUMNS = [("digested_at", "TEXT"), ("digest_id", "INTEGER"), ("ai_sentiment", "TEXT"),
+                ("ai_impact", "INTEGER"), ("story_key", "TEXT")]
+SENTIMENTS = ("positive", "neutral", "critical")
 
 
 def settings(env):
@@ -132,6 +134,7 @@ SELECT i.id, i.title, i.description, i.publisher, i.published_at, i.discovered_a
        i.resolve_status, i.resolved_url, i.link, i.extract_host, i.extract_status, i.extract_text,
        i.score, i.band, i.urgent, i.target_tags, i.matched_terms, i.event_id,
        i.ai_category, i.ai_priority, i.ai_reason, i.ai_processed_at, i.image_url,
+       i.ai_sentiment, i.ai_impact, i.story_key,
        CASE WHEN i.raw_payload LIKE '%youtube_api%' THEN i.raw_payload END AS yt_payload,
        s.name AS source_name
 FROM items i LEFT JOIN sources s ON s.source_id = i.source_id
@@ -225,11 +228,67 @@ def edition(con, now, hours=WEB_WINDOW_H):
     return reps, ids
 
 
+_STOP = {"chennai", "tamil", "nadu", "tamilnadu", "india", "news", "ias", "ips", "minister", "govt", "government",
+         "the", "and", "for", "with", "over", "after", "from", "sept", "sep", "oct", "nov", "dec", "jan", "police", "collector"}
+_NUM = re.compile(r"\d[\d,.]*")
+_LATIN = re.compile(r"[A-Za-z][A-Za-z.\-]{2,}")
+_MONTHS = {"jan": "1", "feb": "2", "mar": "3", "apr": "4", "may": "5", "jun": "6", "jul": "7", "aug": "8",
+           "sep": "9", "sept": "9", "oct": "10", "nov": "11", "dec": "12",
+           "ஜனவரி": "1", "பிப்ரவரி": "2", "மார்ச்": "3", "ஏப்ரல்": "4", "மே": "5", "ஜூன்": "6", "ஜூலை": "7",
+           "ஆகஸ்ட்": "8", "செப்டம்பர்": "9", "அக்டோபர்": "10", "நவம்பர்": "11", "டிசம்பர்": "12"}
+
+
+def entity_tokens(c):
+    """Language-independent handles of a story: amounts and counts, dates, and Latin-script
+    proper names that Tamil outlets keep in Latin (CMRL, Alstom, acronyms). Returns
+    (strong_numbers, dates, names)."""
+    text = f"{_title(c)} {_snippet(c)}"
+    strong, dates, names = set(), set(), set()
+    for m in _NUM.finditer(text):
+        n = m.group(0).replace(",", "").rstrip(".")
+        if n.isdigit() and 1 <= int(n) <= 31 and len(n) <= 2:
+            dates.add("d" + n)                        # a day of the month, or a small count
+        elif len(n) >= 2:
+            strong.add(n)                             # 450, 2500, 33305, 2026, 10.5
+    low = text.lower()
+    for w, mnum in _MONTHS.items():
+        if w in low:
+            dates.add("m" + mnum)
+    for m in re.finditer(r"\b[A-Z][A-Za-z.\-]{3,}\b", text):
+        w = m.group(0).lower().strip(".-")
+        if w not in _STOP:
+            names.add(w)
+    return strong, dates, names
+
+
+def cross_lingual_link(a, b):
+    """A Tamil and an English report within a day, same category, sharing an amount plus a
+    date or a name, or two names, or two amounts. Sharing only 'October' and '10' is not
+    enough: every story with a deadline that day would merge."""
+    sa, da, na = a["etoks"]
+    sb, db, nb = b["etoks"]
+    strong, dates, names = sa & sb, da & db, na & nb
+    return bool(len(strong) >= 2 or (len(strong) >= 1 and (dates or names)) or len(names) >= 2)
+
+
+def _is_tamil(c):
+    return bool(re.search(r"[\u0B80-\u0BFF]", c["title"] or ""))
+
+
 def merge_stories(cands):
-    """After ranking: Gemini's story numbers and near-identical headlines finish the job, so
-    one event framed three ways by three outlets is one candidate with one category."""
+    """After ranking: Gemini's story numbers, near-identical headlines, and -- for a Tamil and
+    an English report -- shared dates, amounts and Latin-script names finish the job, so one
+    event framed three ways by three outlets is one candidate with one category."""
+    for c in cands:
+        if "etoks" not in c:
+            c["etoks"] = entity_tokens(c)
+
     def same(a, b):
         if a.get("story") and a.get("story") == b.get("story"):
+            return True
+        pa, pb = parse_ts(a["published_at"]), parse_ts(b["published_at"])
+        close = not (pa and pb) or abs((pa - pb).total_seconds()) <= 24 * 3600
+        if close and _is_tamil(a) != _is_tamil(b) and a["category"] == b["category"] and cross_lingual_link(a, b):
             return True
         if a["tgrams"] and b["tgrams"] and len(a["ntitle"]) >= 25 and len(b["ntitle"]) >= 25:
             pa, pb = parse_ts(a["published_at"]), parse_ts(b["published_at"])
@@ -269,6 +328,12 @@ none         - irrelevant, a DIFFERENT person named Kumar (R.B. Udhayakumar, C.T
 
 Priority: 1 immediate (flooding now, a death, a major protest, an urgent official statement in
 his areas), 2 standard news worth reading today, 3 background.
+Impact, 1-10: how much this matters to his office today. 9-10 a crisis or a decision he must act
+on; 6-8 something he will be asked about; 3-5 worth knowing; 1-2 trivia.
+Sentiment for his office: "positive" (schemes, achievements, new infrastructure, IT investment,
+praise), "neutral" (routine civic updates, notices, court orders, general reporting),
+"critical" (protests, civic failures, accidents, deaths, opposition attacks, power cuts,
+waterlogging, criticism of him or the government).
 
 Rules: a story about another district's collector or another state's IT minister is "none".
 Local murders, fatal accidents, chain-snatching, sewage overflows, road cave-ins, tree falls and
@@ -295,8 +360,10 @@ RESPONSE_SCHEMA = {
         "category": {"type": "STRING", "enum": CATEGORIES + ["none"]},
         "priority": {"type": "INTEGER"},
         "reason": {"type": "STRING"},
-        "story": {"type": "INTEGER"}},
-        "required": ["n", "category", "priority", "reason", "story"]},
+        "story": {"type": "INTEGER"},
+        "impact": {"type": "INTEGER"},
+        "sentiment": {"type": "STRING", "enum": list(SENTIMENTS)}},
+        "required": ["n", "category", "priority", "reason", "story", "impact", "sentiment"]},
 }
 
 
@@ -338,21 +405,18 @@ class Gemini:
         self.con.commit()
         self.calls += 1
 
-    def rank(self, batch):
-        """batch: list of candidate dicts. Returns {id: (category, priority, reason)} or None."""
+    def call(self, prompt, schema, label="call"):
+        """One JSON call. Returns the parsed JSON, or None (and sets self.dead when it is
+        pointless to keep trying this run)."""
         if self.dead:
             return None
         day, used = self._today_calls()
         if used >= self.max_calls:
             self.dead = f"daily budget of {self.max_calls} Gemini calls used"
             return None
-        if time.monotonic() - self.t0 > AI_TIME_BUDGET_S:
-            self.dead = "Gemini time budget spent"
-            return None
-        lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(batch, 1)]
-        body = {"contents": [{"role": "user", "parts": [{"text": PROMPT.format(payload='\n'.join(lines))}]}],
+        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
-                                     "responseSchema": RESPONSE_SCHEMA}}
+                                     "responseSchema": schema}}
         delay = AI_PAUSE_S
         for attempt in range(4):
             if time.monotonic() - self.t0 > AI_TIME_BUDGET_S:
@@ -362,38 +426,95 @@ class Gemini:
                 self._count(day)
                 r = self.client.post(ENDPOINT.format(m=self.model), headers={"x-goog-api-key": self.key}, json=body)
                 if r.status_code == 429:
-                    log.warning(f"gemini: rate limited, waiting {delay:.0f}s")
+                    log.warning(f"gemini {label}: rate limited, waiting {delay:.0f}s")
                     time.sleep(delay)
                     delay = min(delay * 2, 60)
                     continue
                 if r.status_code in (400, 401, 403, 404):
                     self.dead = f"HTTP {r.status_code}: {r.text[:120].replace(chr(10), ' ')}"
-                    log.error(f"gemini: {self.dead} -- check GEMINI_API_KEY / GEMINI_MODEL")
+                    log.error(f"gemini {label}: {self.dead} -- check GEMINI_API_KEY / GEMINI_MODEL")
                     return None
                 r.raise_for_status()
-                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                out = {}
-                for it in json.loads(text):
-                    i = int(it.get("n", 0)) - 1
-                    if 0 <= i < len(batch):
-                        cat = it.get("category") if it.get("category") in CATEGORIES + ["none"] else "none"
-                        try:
-                            pri = min(3, max(1, int(it.get("priority", 2))))
-                        except (TypeError, ValueError):
-                            pri = 2
-                        try:
-                            story = int(it.get("story") or 0)
-                        except (TypeError, ValueError):
-                            story = 0
-                        out[batch[i]["id"]] = (cat, pri, str(it.get("reason", ""))[:200],
-                                               f"{self.calls}:{story}" if story else None)
-                return out
+                return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
             except Exception as ex:
-                log.warning(f"gemini: attempt {attempt + 1}: {type(ex).__name__}: {str(ex)[:100]}")
+                log.warning(f"gemini {label}: attempt {attempt + 1}: {type(ex).__name__}: {str(ex)[:100]}")
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
         self.dead = "Gemini kept failing"
         return None
+
+    def rank(self, batch):
+        """batch: candidate dicts. Returns {id: verdict dict} or None."""
+        lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(batch, 1)]
+        data = self.call(PROMPT.format(payload="\n".join(lines)), RESPONSE_SCHEMA, "rank")
+        if data is None:
+            return None
+        out = {}
+        for it in data if isinstance(data, list) else []:
+            try:
+                i = int(it.get("n", 0)) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= i < len(batch):
+                out[batch[i]["id"]] = _verdict(it, f"{self.calls}:")
+        return out
+
+
+CLUSTER_PROMPT = """Below are news items from Tamil Nadu in Tamil and English, collected over about a day.
+Group the items that report the SAME real-world event: the same announcement, press
+conference, order, inauguration, incident or statement -- even when one is in Tamil and one
+in English, and however differently they are headlined. Look at names, places, dates,
+amounts and what actually happened. Different events on the same topic (two separate
+floods, two statements on different days, a recurring daily column) are NOT the same.
+When torn, keep them apart: merging two events hides news.
+
+Return one object per item with a "story" number: the same number for every item in a
+group (use the lowest item number of the group); an item on its own gets its own number.
+
+ITEMS:
+{payload}"""
+
+CLUSTER_SCHEMA = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+    "n": {"type": "INTEGER"}, "story": {"type": "INTEGER"}}, "required": ["n", "story"]}}
+
+
+def cluster(gemini, con, cands, key_prefix):
+    """One call over a whole edition: {id: story_key}. Stores the keys on the items so a
+    later run links the same reports again without asking."""
+    if gemini is None or not cands or len(cands) < 2:
+        return 0
+    lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(cands, 1)]
+    data = gemini.call(CLUSTER_PROMPT.format(payload="\n".join(lines)), CLUSTER_SCHEMA, "cluster")
+    if not isinstance(data, list):
+        return 0
+    groups = Counter()
+    for it in data:
+        i, g = _int(it.get("n"), 1, len(cands), 0) - 1, _int(it.get("story"), 1, len(cands), 0)
+        if i >= 0 and g:
+            groups[g] += 1
+            cands[i]["story"] = f"{key_prefix}:{g}"
+    for c in cands:
+        if c.get("story", "").startswith(key_prefix):
+            con.execute("UPDATE items SET story_key=? WHERE id=?", (c["story"], c["id"]))
+    con.commit()
+    return sum(1 for g, n in groups.items() if n > 1)
+
+
+def _int(v, lo, hi, default):
+    try:
+        return min(hi, max(lo, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _verdict(it, story_prefix):
+    cat = it.get("category") if it.get("category") in CATEGORIES + ["none"] else "none"
+    story = _int(it.get("story"), 0, 10 ** 6, 0)
+    return {"category": cat, "priority": _int(it.get("priority"), 1, 3, 2),
+            "reason": str(it.get("reason", ""))[:200],
+            "story": f"{story_prefix}{story}" if story else None,
+            "impact": _int(it.get("impact"), 1, 10, 5),
+            "sentiment": it.get("sentiment") if it.get("sentiment") in SENTIMENTS else "neutral"}
 
 
 def rule_rank(c):
@@ -408,22 +529,31 @@ def rule_rank(c):
     if cat == "none" and c.get("urgent"):
         cat = "constituency"
     if c.get("urgent"):
-        pri = 1
+        pri, impact, sent = 1, 8, "critical"
     elif c.get("band") == "AUTO_KEEP":
-        pri = 2
+        pri, impact, sent = 2, 6, "neutral"
     else:
-        pri = 3
-    return cat, pri, "keyword rules"
+        pri, impact, sent = 3, 4, "neutral"
+    return {"category": cat, "priority": pri, "reason": "keyword rules", "story": None,
+            "impact": impact, "sentiment": sent}
+
+
+def _apply(c, v, by):
+    c["category"], c["priority"], c["reason"], c["by"] = v["category"], v["priority"], v["reason"], by
+    c["impact"], c["sentiment"] = v.get("impact") or 5, v.get("sentiment") or "neutral"
+    if v.get("story"):
+        c["story"] = v["story"]
 
 
 def rank_all(con, cands, gemini, now):
-    """Fills c['category'], c['priority'], c['reason'], c['by']. Reuses Gemini's earlier
-    verdict on an item when one is stored (a re-run costs nothing)."""
+    """Fills category, priority, reason, impact, sentiment, by. Reuses Gemini's stored verdict
+    on an item when there is one (a re-run costs nothing)."""
     todo = []
     for c in cands:
         if c["ai_processed_at"] and c["ai_category"]:
-            c["category"], c["priority"], c["reason"], c["by"] = (c["ai_category"], c["ai_priority"] or 2,
-                                                                  c["ai_reason"] or "", "gemini (cached)")
+            _apply(c, {"category": c["ai_category"], "priority": c["ai_priority"] or 2, "reason": c["ai_reason"] or "",
+                       "impact": c.get("ai_impact") or 5, "sentiment": c.get("ai_sentiment") or "neutral",
+                       "story": c.get("story_key")}, "gemini (cached)")
         else:
             todo.append(c)
     st = Counter(cached=len(cands) - len(todo)) if len(cands) > len(todo) else Counter()
@@ -435,19 +565,19 @@ def rank_all(con, cands, gemini, now):
                 break
             for c in batch:
                 if c["id"] in res:
-                    c["category"], c["priority"], c["reason"], c["story"] = res[c["id"]]
-                    c["by"] = "gemini"
+                    _apply(c, res[c["id"]], "gemini")
                     con.execute("""UPDATE items SET ai_category=?, ai_priority=?, ai_reason=?, ai_model=?,
-                                   ai_processed_at=? WHERE id=?""",
-                                (c["category"], c["priority"], c["reason"], gemini.model, iso(now), c["id"]))
+                                   ai_processed_at=?, ai_impact=?, ai_sentiment=?,
+                                   story_key=coalesce(story_key, ?) WHERE id=?""",
+                                (c["category"], c["priority"], c["reason"], gemini.model, iso(now),
+                                 c["impact"], c["sentiment"], c.get("story"), c["id"]))
                     st["gemini"] += 1
             con.commit()
             if k + AI_BATCH < len(todo):
                 time.sleep(AI_PAUSE_S)
     for c in cands:
         if "category" not in c:
-            c["category"], c["priority"], c["reason"] = rule_rank(c)
-            c["by"] = "rules"
+            _apply(c, rule_rank(c), "rules")
             st["rules"] += 1
     if gemini is not None and gemini.dead:
         log.warning(f"gemini: stopped -- {gemini.dead}; {st['rules']} items ranked by the rules")
@@ -459,7 +589,8 @@ def rank_all(con, cands, gemini, now):
 # --------------------------------------------------------------------------
 
 def _order(c):
-    return (c["priority"], -(c.get("urgent") or 0), -(c.get("score") or 0), c["published_at"] or "")
+    return (c["priority"], -(c.get("urgent") or 0), -(c.get("impact") or 0), -(c.get("score") or 0),
+            c["published_at"] or "")
 
 
 def select(cands, per=PER_CATEGORY, total=MAX_TOTAL):
@@ -567,7 +698,7 @@ def build(con, env, now, slot, transport_client=None):
     chosen = urgent + [c for cat in CATEGORIES for c in sections[cat]]
     messages = render(slot, now, urgent, sections, len(chosen), len(cands), bool(st.get("gemini")))
     return {"cands": cands, "all_ids": all_ids, "since": since, "chosen": chosen, "leftovers": leftovers,
-            "urgent": urgent, "sections": sections,
+            "urgent": urgent, "sections": sections, "gemini": gemini,
             "messages": messages, "stats": st, "ai_calls": gemini.calls if gemini else 0,
             "ai_note": gemini.dead if gemini else ("no GEMINI_API_KEY" if not key else None)}
 
@@ -577,101 +708,6 @@ def build(con, env, now, slot, transport_client=None):
 # --------------------------------------------------------------------------
 
 DOCS = HERE / "docs"
-ARCHIVE_KEEP = 30
-EDITION_DAYS = 7              # the edition selector offers this many days
-
-PAGE_CSS = """
-:root{--bg:#f4f5f7;--card:#fff;--ink:#17191c;--dim:#667085;--line:#e4e7ec;--accent:#1d4e89;--urgent:#b42318;
---chip:#eef2f7;--ok:#0e6e63;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Tamil","Noto Sans",sans-serif}
-@media(prefers-color-scheme:dark){:root{--bg:#111417;--card:#1a1f24;--ink:#e8ecef;--dim:#98a2b3;--line:#2a323b;--chip:#232a32}}
-*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;font-size:16px}
-.wrap{max-width:1080px;margin:0 auto;padding:16px 16px 60px}
-header{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;justify-content:space-between}
-header h1{font-size:21px;margin:0}header .sub{color:var(--dim);font-size:13px;margin:2px 0 0}
-.tools{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 10px;align-items:center}
-.tools input[type=search]{flex:1 1 220px;min-height:44px;padding:8px 12px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
-.tools select,.tools button,.btn{min-height:44px;padding:8px 14px;font:inherit;font-size:15px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);cursor:pointer}
-.tools button[aria-pressed=true]{background:var(--accent);color:#fff;border-color:var(--accent)}
-.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}
-nav a{font-size:13px;min-height:36px;display:inline-flex;align-items:center;padding:4px 12px;border:1px solid var(--line);border-radius:999px;color:var(--ink);text-decoration:none;background:var(--card)}
-nav a b{color:var(--dim);font-weight:500;margin-left:5px}
-section{margin:0 0 26px}section h2{font-size:14px;letter-spacing:.05em;text-transform:uppercase;margin:0 0 10px;color:var(--dim)}
-section.urgent h2{color:var(--urgent)}section[hidden]{display:none}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
-.card[hidden]{display:none}
-.card img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;background:var(--chip)}
-.card .body{padding:12px 14px 10px;display:flex;flex-direction:column;gap:6px;flex:1}
-.card h3{font-size:16px;margin:0;line-height:1.35;font-weight:600}.card h3 a{color:var(--ink);text-decoration:none}.card h3 a:hover{text-decoration:underline}
-.card p{margin:0;color:var(--dim);font-size:14px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:auto;padding-top:6px;font-size:12px;color:var(--dim)}
-.chip{background:var(--chip);border-radius:999px;padding:2px 8px;color:var(--ink)}
-.chip.u{background:var(--urgent);color:#fff}.chip.src{border:1px solid var(--line);background:transparent}
-.fb{display:flex;gap:6px;align-items:center;border-top:1px solid var(--line);padding:6px 8px}
-.fb button{min-width:44px;min-height:44px;border:0;background:transparent;font-size:18px;border-radius:10px;cursor:pointer;color:var(--ink)}
-.fb button:hover{background:var(--chip)}.fb button[disabled]{opacity:.45;cursor:default}
-.fb .why{display:none;flex-wrap:wrap;gap:6px}.fb.open .why{display:flex}.fb.open>button{display:none}
-.fb .why button{font-size:13px;border:1px solid var(--line);padding:6px 10px;min-height:44px}
-.fb .done{font-size:13px;color:var(--ok);padding:0 6px}
-.grid.list{display:block}.grid.list .card{flex-direction:row;align-items:center;border-radius:0;border-width:0 0 1px;background:transparent;padding:0}
-.grid.list .card img,.grid.list .card p{display:none}.grid.list .card .body{padding:8px 4px;gap:2px}
-.grid.list .card h3{font-size:15px;font-weight:500}.grid.list .meta{padding-top:0}.grid.list .fb{border:0;padding:0 0 0 6px}
-.grid.list .fb .why{position:absolute;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px;z-index:2}
-.grid.list .card{position:relative}
-dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);color:var(--ink);max-width:520px;width:calc(100% - 32px);padding:18px}
-dialog::backdrop{background:rgba(0,0,0,.45)}dialog label{display:block;font-size:14px;color:var(--dim);margin:10px 0 4px}
-dialog input,dialog textarea{width:100%;min-height:44px;padding:8px 10px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink)}
-dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
-.empty{color:var(--dim);padding:20px 0}
-footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
-footer a{color:var(--accent)}
-@media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:19px}.tools{gap:6px}}
-"""
-
-PAGE_JS = r"""
-(function(){
-var FB=document.documentElement.getAttribute('data-feedback')||'';
-var q=document.getElementById('q'),cards=[].slice.call(document.querySelectorAll('.card')),
-    secs=[].slice.call(document.querySelectorAll('section[data-cat]'));
-function norm(s){return (s||'').toLowerCase().normalize('NFC')}
-function filter(){var t=norm(q.value).trim(),n=0;
-  cards.forEach(function(c){var hit=!t||norm(c.getAttribute('data-text')).indexOf(t)>-1;c.hidden=!hit;if(hit)n++;});
-  secs.forEach(function(s){s.hidden=![].some.call(s.querySelectorAll('.card'),function(c){return !c.hidden})});
-  document.getElementById('nohit').hidden=n>0;}
-q.addEventListener('input',filter);
-var vc=document.getElementById('v-cards'),vl=document.getElementById('v-list');
-function setView(v){document.querySelectorAll('.grid').forEach(function(g){g.classList.toggle('list',v==='list')});
-  vc.setAttribute('aria-pressed',v!=='list');vl.setAttribute('aria-pressed',v==='list');try{localStorage.setItem('view',v)}catch(e){}}
-vc.onclick=function(){setView('cards')};vl.onclick=function(){setView('list')};
-try{setView(localStorage.getItem('view')||'cards')}catch(e){setView('cards')}
-var ed=document.getElementById('edition');if(ed){ed.onchange=function(){if(ed.value)location.href=ed.value};
-  var base=document.documentElement.getAttribute('data-base')||'';
-  fetch(base+'editions.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(list){
-    var cur=ed.value;ed.innerHTML='';list.forEach(function(e){var o=document.createElement('option');o.value=base+e[1];o.textContent=e[0];
-      if(base+e[1]===cur||(cur.slice(-e[1].length)===e[1]))o.selected=true;ed.appendChild(o)})}).catch(function(){})}
-function send(payload){if(!FB)return Promise.resolve();payload.page=location.pathname;payload.ua=navigator.userAgent.slice(0,120);
-  return fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(payload)}).catch(function(){});}
-var voted={};try{voted=JSON.parse(localStorage.getItem('voted')||'{}')}catch(e){}
-document.querySelectorAll('.fb').forEach(function(f){var id=f.getAttribute('data-id');
-  var item=function(){var c=f.closest('.card');return {id:id,title:c.getAttribute('data-title'),url:c.getAttribute('data-url'),
-    category:c.getAttribute('data-cat'),outlet:c.getAttribute('data-outlet')}};
-  function done(msg){f.innerHTML='<span class="done">'+msg+'</span>';voted[id]=1;try{localStorage.setItem('voted',JSON.stringify(voted))}catch(e){}}
-  if(voted[id]){done('Thanks for the feedback');return}
-  f.querySelector('.up').onclick=function(){var p=item();p.type='up';send(p);done('Thanks 👍')};
-  f.querySelector('.down').onclick=function(){f.classList.add('open')};
-  f.querySelectorAll('.why button').forEach(function(b){b.onclick=function(){var p=item();p.type='down';p.reason=b.getAttribute('data-r');send(p);done('Noted 👎 '+b.textContent)}});
-});
-var dlg=document.getElementById('missing');
-document.getElementById('open-missing').onclick=function(){dlg.showModal()};
-document.getElementById('cancel-missing').onclick=function(){dlg.close()};
-document.getElementById('send-missing').onclick=function(ev){ev.preventDefault();var u=document.getElementById('m-url').value.trim(),n=document.getElementById('m-notes').value.trim();
-  if(!u&&!n)return;send({type:'missing',url:u,notes:n.slice(0,500)});dlg.close();document.getElementById('m-url').value='';document.getElementById('m-notes').value='';
-  var t=document.getElementById('toast');t.textContent='Thank you — sent for review.';t.hidden=false;setTimeout(function(){t.hidden=true},3500)};
-if(!FB){document.querySelectorAll('.fb,#open-missing').forEach(function(e){e.hidden=true})}
-})();
-"""
-
 REASONS = (("unrelated", "Unrelated to constituency / portfolio"), ("category", "Wrong category"),
            ("old", "Duplicate / old"), ("spam", "Spam / noise"))
 
@@ -689,122 +725,6 @@ def _image_for(c):
             pass
     return None
 
-
-def _card(c, urgent=False):
-    url = alerts.display_url(c)
-    img = _image_for(c)
-    when = fmt_ist(c["published_at"] or c["discovered_at"])
-    title, outlet, cat = _title(c), alerts.outlet_name(c), c["category"]
-    extra = f'<span class="more">+{len(c["sources"]) - 1} more outlets</span>' if len(c.get("sources") or []) > 1 else ""
-    chips = ('<span class="chip u">URGENT</span>' if urgent else f'<span class="chip">{esc(NICE[cat])}</span>')
-    text = " ".join([title, outlet, NICE[cat], "urgent" if urgent else "", " ".join(c.get("sources") or [])])
-    why = "".join(f'<button type="button" data-r="{k}">{esc(v)}</button>' for k, v in REASONS)
-    return (f'<article class="card" data-id="{c["id"]}" data-cat="{cat}" data-outlet="{esc_attr(outlet)}" '
-            f'data-title="{esc_attr(title)}" data-url="{esc_attr(url)}" data-text="{esc_attr(text)}">'
-            + (f'<a href="{esc_attr(url)}" target="_blank" rel="noopener"><img src="{esc_attr(img)}" alt="" loading="lazy" '
-               f'referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>' if img else "")
-            + f'<div class="body"><h3><a href="{esc_attr(url)}" target="_blank" rel="noopener">{esc(title)}</a></h3>'
-            + (f'<p>{esc(_snippet(c))}</p>' if _snippet(c) else "")
-            + f'<div class="meta">{chips}<span class="chip src">{esc(outlet)}</span><span>{esc(when)}</span>{extra}</div></div>'
-            + f'<div class="fb" data-id="{c["id"]}"><button type="button" class="up" aria-label="Useful">👍</button>'
-            + f'<button type="button" class="down" aria-label="Not useful">👎</button><div class="why">{why}</div></div></article>')
-
-
-def render_page(slot, now, urgent, sections, n_total, n_cands, editions=(), base="", feedback_url="", hours=WEB_WINDOW_H):
-    """editions: [(label, href, selected)] for the selector. base: '' on index, '../' on archive pages."""
-    day = now.astimezone(IST)
-    title = f"{'Morning' if slot == 'morning' else 'Evening'} edition · {day.day} {day:%b %Y}"
-    nav, body = [], []
-    if urgent:
-        nav.append(f'<a href="#urgent">🚨 Urgent<b>{len(urgent)}</b></a>')
-        body.append('<section class="urgent" id="urgent" data-cat="urgent"><h2>🚨 Urgent</h2><div class="grid">'
-                    + "".join(_card(c, urgent=True) for c in urgent) + "</div></section>")
-    for cat in CATEGORIES:
-        items = sections.get(cat) or []
-        if items:
-            nav.append(f'<a href="#{cat}">{ICONS[cat]} {esc(NICE[cat])}<b>{len(items)}</b></a>')
-            body.append(f'<section id="{cat}" data-cat="{cat}"><h2>{ICONS[cat]} {esc(LABELS[cat])}</h2><div class="grid">'
-                        + "".join(_card(c) for c in items) + "</div></section>")
-    if not body:
-        body.append('<section><p class="empty">Nothing kept in the last {} hours.</p></section>'.format(hours))
-    opts = "".join(f'<option value="{esc_attr(h)}"{" selected" if sel else ""}>{esc(lab)}</option>' for lab, h, sel in editions)
-    return (f'<!DOCTYPE html><html lang="en" data-feedback="{esc_attr(feedback_url)}" data-base="{esc_attr(base)}"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">'
-            f'<meta name="robots" content="noindex"><meta name="referrer" content="no-referrer">'
-            f'<title>{esc(title)}</title><style>{PAGE_CSS}</style></head><body><div class="wrap">'
-            f'<header><div><h1>{esc(title)}</h1><div class="sub">{n_total} stories from the last {hours} hours · '
-            f'{n_cands} considered · updated {esc(fmt_ist(iso(now)))}</div></div>'
-            f'<button type="button" class="btn" id="open-missing">+ Submit missing news</button></header>'
-            f'<div class="tools"><input type="search" id="q" placeholder="Search headlines, outlets, categories" aria-label="Search">'
-            + (f'<select id="edition" aria-label="Edition">{opts}</select>' if editions else "")
-            + '<button type="button" id="v-cards" aria-pressed="true">Cards</button>'
-            '<button type="button" id="v-list" aria-pressed="false">List</button></div>'
-            f'<nav>{"".join(nav)}</nav>{"".join(body)}<p class="empty" id="nohit" hidden>No stories match.</p>'
-            '<dialog id="missing"><form method="dialog"><h3 style="margin:0">Report a missing story</h3>'
-            '<label for="m-url">Link to the article or video</label><input id="m-url" type="url" placeholder="https://">'
-            '<label for="m-notes">What is it about, and why does it matter?</label><textarea id="m-notes" rows="3" maxlength="500"></textarea>'
-            '<div class="row"><button type="button" class="btn" id="cancel-missing">Cancel</button>'
-            '<button type="submit" class="btn primary" id="send-missing">Send</button></div></form></dialog>'
-            '<p class="chip" id="toast" hidden style="position:fixed;bottom:16px;left:50%;transform:translateX(-50%)"></p>'
-            f'<footer>Links open the original article or video. Feedback goes to the editor for review.</footer>'
-            f'</div><script>{PAGE_JS}</script></body></html>')
-
-
-def _editions(briefs, current_name, base):
-    """One entry per day for the last EDITION_DAYS days: the latest edition of that day."""
-    by_day = {}
-    for p in briefs.glob("*.html"):
-        d, _, slot = p.stem.rpartition("-")
-        if d not in by_day or slot == "evening":       # the day's later edition
-            by_day[d] = p.name
-    days = sorted(by_day, reverse=True)[:EDITION_DAYS]
-    out = [("Latest edition", base + "index.html", current_name == "index.html")]
-    for d in days:
-        name = by_day[d]
-        try:
-            lab = datetime.strptime(d, "%Y-%m-%d").strftime("%d %b") + (" evening" if name.endswith("evening.html") else " morning")
-        except ValueError:
-            lab = d
-        out.append((lab, base + "briefs/" + name, current_name == name))
-    return out
-
-
-def write_pages(ed, slot, now, docs=None, feedback_url="", hours=WEB_WINDOW_H):
-    """docs/index.html is the latest edition; docs/briefs/<date>-<slot>.html keeps the last 30."""
-    docs = Path(docs or DOCS)
-    briefs = docs / "briefs"
-    briefs.mkdir(parents=True, exist_ok=True)
-    (docs / ".nojekyll").touch()
-    day = now.astimezone(IST)
-    name = f"{day:%Y-%m-%d}-{slot}.html"
-    urgent, sections = ed["urgent"], ed["sections"]
-    args = (slot, now, urgent, sections, len(ed["chosen"]), len(ed["cands"]))
-    (briefs / name).write_text(render_page(*args, feedback_url=feedback_url, hours=hours), encoding="utf-8")
-    for p in sorted(briefs.glob("*.html"), reverse=True)[ARCHIVE_KEEP:]:
-        p.unlink()
-    # every archive page gets the selector, so any of them can reach any other
-    for p in briefs.glob("*.html"):
-        if p.name == name:
-            p.write_text(render_page(*args, editions=_editions(briefs, name, "../"), base="../",
-                                     feedback_url=feedback_url, hours=hours), encoding="utf-8")
-    (docs / "index.html").write_text(render_page(*args, editions=_editions(briefs, "index.html", ""),
-                                                 feedback_url=feedback_url, hours=hours), encoding="utf-8")
-    (docs / "editions.json").write_text(json.dumps([[lab, href] for lab, href, _ in _editions(briefs, "", "")],
-                                                   ensure_ascii=False), encoding="utf-8")
-    return docs / "index.html"
-
-
-def build_edition(con, env, now):
-    """The web page's content: the rolling window, ranked from stored Gemini verdicts (or the
-    rules), merged and selected with the larger web caps. Costs no Gemini calls."""
-    cfg = settings(env)
-    cands, ids = edition(con, now, cfg["web_hours"])
-    st = rank_all(con, cands, None, now)
-    cands = merge_stories(cands)
-    urgent, sections, leftovers = select(cands, cfg["web_per"], cfg["web_max"])
-    chosen = urgent + [c for cat in CATEGORIES for c in sections[cat]]
-    return {"cands": cands, "ids": ids, "urgent": urgent, "sections": sections, "chosen": chosen,
-            "leftovers": leftovers, "stats": st}
 
 
 def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=None):
@@ -865,14 +785,29 @@ def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=N
 
 def _pages(con, env, slot, now, b):
     try:
-        cfg = settings(env)
-        ed = build_edition(con, env, now)
-        b["edition"] = ed
-        write_pages(ed, slot, now, feedback_url=cfg["feedback_url"], hours=cfg["web_hours"])
-        log.info(f"digest: web edition written to docs/index.html -- {len(ed['chosen'])} stories from "
-                 f"{len(ed['ids'])} items in the last {cfg['web_hours']}h")
+        import web
+        eds = web.publish(con, env, now, b.get("gemini"))
+        b["edition"] = eds["latest"]
+        log.info(f"digest: web editions written -- latest {len(eds['latest']['chosen'])} stories from "
+                 f"{len(eds['latest']['ids'])} items; " + ", ".join(f"{k} {len(v['chosen'])}" for k, v in eds.items() if k != "latest"))
     except Exception:
         log.exception("digest: could not write the web page (the brief itself is unaffected)")
+
+
+def cmd_backfill(con, env, days, now=None):
+    """Dated web editions for the past `days` days from what the database already holds."""
+    import web
+    now = now or utcnow()
+    migrate(con)
+    cfg = settings(env)
+    key = (env.get("GEMINI_API_KEY") or "").strip()
+    gemini = Gemini(key, cfg["model"], con, cfg["ai_calls"]) if key else None
+    eds = web.backfill(con, env, now, days, gemini)
+    web.publish(con, env, now, gemini)                        # index + page pick the new days up
+    calls = gemini.calls if gemini else 0
+    log.info(f"backfill: {len(eds)} editions written, {calls} Gemini calls"
+             + (f" (stopped: {gemini.dead})" if gemini and gemini.dead else ""))
+    return eds
 
 
 def feedback_review(env, now=None, days=7):
@@ -936,7 +871,8 @@ def diagnostics(b):
         f"| Ranked by keyword rules (fallback) | {by_rules} |",
         f"| Gemini calls this run | {b['ai_calls']} — {status} |",
         f"| Chosen for the brief | {len(b['chosen'])} (left out: {len(b['leftovers'])}) |"]
-        + ([f"| Web edition | {len(b['edition']['chosen'])} stories from {len(b['edition']['ids'])} items in the rolling window |"]
+        + ([f"| Web edition | {len(b['edition']['chosen'])} stories from {len(b['edition']['ids'])} items in the rolling window"
+            f"{'; ' + str(b['edition']['stats'].get('clusters', 0)) + ' cross-report clusters' if b['edition']['stats'].get('clusters') else ''} |"]
            if b.get("edition") else []) + [""])
 
 
@@ -958,6 +894,7 @@ def main():
     ap.add_argument("--slot", choices=["auto", "morning", "evening"], default="auto")
     ap.add_argument("--dry-run", action="store_true", help="build and print; send nothing, mark nothing")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--backfill", type=int, metavar="DAYS", help="write web editions for the past DAYS days")
     a = ap.parse_args()
     if not DB.exists():
         print("no corpus.db -- run 'python collect.py --init' first")
@@ -970,6 +907,14 @@ def main():
     try:
         if a.status:
             print("\n".join(status_lines(con, env)))
+            return 0
+        if a.backfill:
+            eds = cmd_backfill(con, env, max(1, min(30, a.backfill)))
+            summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary:
+                with open(summary, "a", encoding="utf-8") as f:
+                    f.write("### Backfill\n\n" + "\n".join(f"- {k}: {len(v['chosen'])} stories from {len(v['ids'])} items"
+                                                            for k, v in eds.items()) + "\n")
             return 0
         b = run(con, env, slot=None if a.slot == "auto" else a.slot, dry_run=a.dry_run)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")

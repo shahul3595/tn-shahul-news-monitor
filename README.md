@@ -15,11 +15,15 @@ twice a day.
 ## The web page
 
 The Telegram brief carries only what is new since the last brief. The web page is different:
-a rolling edition of everything kept in the last 36 hours (up to 60 stories), rebuilt on each
-run, with search, a card/list toggle, an edition selector for the last 7 days, and reader
+`docs/index.html` is a small app that renders editions from `docs/data/`: `latest.json`
+(everything kept in the last 36 hours, up to 60 stories) and one file per IST day by
+publication date (kept 30 days; the picker offers 7). Each edition has a 60-second briefing with 2-3
+takeaways per section (tap a section to jump to its cards), a category × sentiment dashboard that filters the cards when tapped,
+search, cards/list, a slide-out menu, back-to-top, WhatsApp share per card, and reader
 feedback (👍/👎 and "Submit missing news") when `FEEDBACK_URL` is set — see `feedback.gs`.
-It is written to `docs/index.html` (latest) and `docs/briefs/<date>-<slot>.html`
-(last 30) and committed to `main`. Turn on GitHub Pages once: Settings → Pages → Source
+Every run rebuilds `latest`, today and yesterday. `python digest.py --backfill 7` (or the
+workflow's *backfill_days* input) writes the past days from what the database holds.
+All of it is committed to `main` after each real brief. Turn on GitHub Pages once: Settings → Pages → Source
 "Deploy from a branch", branch `main`, folder `/docs`. The page is public to anyone with
 the address (it carries `noindex`, so search engines are asked not to list it). A custom
 domain can be set on the same settings page.

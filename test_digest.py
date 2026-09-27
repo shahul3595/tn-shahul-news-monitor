@@ -97,11 +97,14 @@ def add(con, title, tags=(), score=5, band="KEYWORD_KEEP", urgent=0, hours_ago=2
 
 
 class FakeGemini:
-    """Answers by looking at the title: 'X:' prefix sets the category, '!' sets priority 1."""
+    """Answers by looking at the title: 'X:' prefix sets the category, '!' sets priority 1,
+    '~' priority 3, '#7' story 7, '(+)' positive, '(-)' critical. Handles the cluster and
+    summary calls too."""
 
     def __init__(self, fail=False):
         self.calls, self.fail, self.model = 0, fail, "fake"
         self.dead = None
+        self.kinds = []
 
     def rank(self, batch):
         self.calls += 1
@@ -115,10 +118,32 @@ class FakeGemini:
             for k in digest.CATEGORIES:
                 if t.lower().startswith(k[:3]):
                     cat = k
-            pri = 1 if "!" in t else (3 if "~" in t else 2)
-            m = re.search(r"#(\d+)", t)                       # '#7' in a title = story number 7
-            out[c["id"]] = (cat, pri, "fake reason", f"{self.calls}:{m.group(1)}" if m else None)
+            m = re.search(r"#(\d+)", t)
+            out[c["id"]] = {"category": cat, "priority": 1 if "!" in t else (3 if "~" in t else 2), "reason": "fake",
+                            "story": f"{self.calls}:{m.group(1)}" if m else None,
+                            "impact": 9 if "!" in t else 5,
+                            "sentiment": "positive" if "(+)" in t else ("critical" if "(-)" in t or "!" in t else "neutral")}
         return out
+
+    def call(self, prompt, schema, label="call"):
+        self.calls += 1
+        self.kinds.append(label)
+        if self.fail:
+            self.dead = "simulated failure"
+            return None
+        if label == "summary":
+            secs = re.findall(r"^## (.+?) \(", prompt, re.M)
+            return {"groups": [{"section": name, "takeaways": [f"{name} takeaway one.", f"{name} takeaway two."]} for name in secs]}
+        if label == "cluster":               # items whose titles share a '@word' tag are one story
+            items = re.findall(r"^(\d+)\. \[.*?\] (.*)$", prompt, re.M)
+            first = {}
+            out = []
+            for n, t in items:
+                m = re.search(r"@(\w+)", t)
+                g = first.setdefault(m.group(1), int(n)) if m else int(n)
+                out.append({"n": int(n), "story": g})
+            return out
+        return None
 
 
 WORDS = ("lake road bridge sewage metro school hospital market temple bus drain power water rain tender "
@@ -297,61 +322,125 @@ def same_headline_and_same_story_collapse_to_one_candidate():
 
 
 @test
-def the_web_page_is_a_rolling_edition_not_the_telegram_delta():
+def the_web_edition_is_rolling_not_the_telegram_delta():
+    import web
     con = make_db("edition.db")
     old = add(con, "Con story: covered by the morning brief", hours_ago=5)
-    con.execute("UPDATE items SET digested_at=?, ai_category='constituency', ai_priority=2, ai_processed_at=? WHERE id=?",
+    con.execute("UPDATE items SET digested_at=?, ai_category='constituency', ai_priority=2, ai_processed_at=?, "
+                "ai_sentiment='critical', ai_impact=7 WHERE id=?",
                 (alerts.iso(T0 - timedelta(hours=1)), alerts.iso(T0 - timedelta(hours=1)), old))
     add(con, "Con story: too old for the page", hours_ago=40)
     add(con, "Dis story: brand new", hours_ago=0, tags=["district"])
     con.commit()
     cands, *_ = digest.candidates(con, T0)
     check([c["title"] for c in cands] == ["Dis story: brand new"], "Telegram sees only the new item")
-    ed = digest.build_edition(con, {}, T0)
-    titles = sorted(c["title"] for c in ed["chosen"])
+    eds = web.publish(con, {}, T0, None, docs=TMP / "docs-ed")
+    titles = sorted(c["title"] for c in eds["latest"]["chosen"])
     check(titles == ["Con story: covered by the morning brief", "Dis story: brand new"], f"the page keeps both: {titles}")
-    byt = {c["title"]: c for c in ed["cands"]}
-    check(byt["Con story: covered by the morning brief"]["by"] == "gemini (cached)", "stored verdict reused, no calls")
+    byt = {c["title"]: c for c in eds["latest"]["cands"]}
+    check(byt["Con story: covered by the morning brief"]["by"] == "gemini (cached)" and
+          byt["Con story: covered by the morning brief"]["sentiment"] == "critical", "stored verdict and sentiment reused")
     check(byt["Dis story: brand new"]["by"] == "rules", "unranked item ranked by the rules on the page")
+    check("2026-10-15" in eds and "2026-10-14" in eds, "today's and yesterday's dated editions")
+    data = json.loads((TMP / "docs-ed" / "data" / "latest.json").read_text(encoding="utf-8"))
+    check({s["sentiment"] for s in data["stories"]} == {"critical", "neutral"}, data["stories"])
 
 
 @test
-def the_web_page_has_cards_search_data_feedback_and_editions():
-    import shutil
+def cluster_call_merges_tamil_and_english_reports_and_is_not_repeated():
+    import web
+    con = make_db("cluster.db")
+    add(con, "Con story @drain: Oct 10 set as deadline for drain desilting in Chennai", host="newindianexpress.com")
+    add(con, "Con story @drain: சென்னையில் வடிகால் பணிகள் அக்டோபர் 10-க்குள்: ககன்தீப் சிங் பேடி", host="maalaimalar.com")
+    add(con, "Con story: Velachery lake desilting tender floated", host="dtnext.in")
+    g = FakeGemini()
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-cl")
+    lat = eds["latest"]
+    check(len(lat["chosen"]) == 2, f"two stories, not three: {[c['title'][:30] for c in lat['chosen']]}")
+    drain = next(c for c in lat["chosen"] if "@drain" in c["title"])
+    check(len(drain["sources"]) == 2, "the Tamil and English reports pooled")
+    check(lat["stats"].get("clusters") == 1, lat["stats"])
+    keys = con.execute("SELECT story_key FROM items WHERE title LIKE '%@drain%'").fetchall()
+    check(keys[0][0] and keys[0][0] == keys[1][0], "story keys stored on both items")
+    n = g.calls
+    eds2 = web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(minutes=30), g, docs=TMP / "docs-cl")
+    check(len(eds2["latest"]["chosen"]) == 2, "still merged from the stored keys")
+    check(g.calls == n, "no new cluster or summary calls when nothing changed")
+
+
+@test
+def cross_lingual_link_needs_more_than_a_date():
+    def mk(t, d, ts="2026-09-27T05:00:00+00:00"):
+        return {"title": t, "publisher": "", "description": d, "extract_status": "FAILED", "extract_text": None,
+                "published_at": ts, "category": "constituency"}
+    a = mk("Oct 10 set as deadline for drain desilting", "Bedi said desilting must be completed by October 10.")
+    b = mk("வடிகால் பணிகள் அக்டோபர் 10-க்குள்", "அக்டோபர் 10-ந்தேதிக்குள் முடிக்கப்படும்.")
+    c = mk("Chennai Metro: 10 new trains from Alstom by October", "CMRL said ten trains will arrive by October.")
+    d = mk("மெட்ரோ: 10 புதிய ரயில்கள் அக்டோபரில்", "Alstom ரயில்கள் அக்டோபரில் வரும் என CMRL தெரிவித்தது.")
+    e = mk("Rs 450 crore radial road bridge sanctioned", "The 2 km bridge will cost Rs 450 crore.")
+    f = mk("ரூ.450 கோடியில் ரேடியல் சாலை பாலம்: 2 கி.மீ.", "ரூ.450 கோடியில் பாலம்.")
+    for x in (a, b, c, d, e, f):
+        x["etoks"] = digest.entity_tokens(x)
+    check(not digest.cross_lingual_link(a, b), "a month and a day alone do not merge (Gemini's cluster call does that)")
+    check(digest.cross_lingual_link(c, d), "shared Latin names CMRL + Alstom merge")
+    check(digest.cross_lingual_link(e, f), "shared amount 450 + count 2 merge")
+    check(not digest.cross_lingual_link(a, d) and not digest.cross_lingual_link(e, b), "unrelated pairs stay apart")
+
+
+@test
+def summary_is_cached_until_the_top_stories_change():
+    import web
+    con = make_db("summary.db")
+    add(con, "Con story (+) scheme launched")
+    g = FakeGemini()
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-sum")
+    check(eds["latest"]["summary"] == [{"cat": "constituency", "bullets": ["Velachery takeaway one.", "Velachery takeaway two."]}],
+          eds["latest"]["summary"])
+    n = g.kinds.count("summary")
+    web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(minutes=5), g, docs=TMP / "docs-sum")
+    check(g.kinds.count("summary") == n, "same top stories, no new summary call")
+    add(con, "Dis story (-) flood!", hours_ago=0)
+    web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(minutes=10), g, docs=TMP / "docs-sum")
+    check(g.kinds.count("summary") > n, "a new top story refreshes the summary")
+
+
+@test
+def backfill_writes_dated_editions_and_the_index():
+    import web
+    con = make_db("backfill.db")
+    for k in range(1, 9):
+        add(con, f"Con story day{k} {WORDS[k]} {WORDS[k + 3]}", hours_ago=24 * k - 6, tags=["constituency"])
+    docs = TMP / "docs-bf"
+    eds = web.backfill(con, {}, T0, 7, None, docs=docs)
+    check(len(eds) == 7 and all(len(e["chosen"]) == 1 for e in eds.values()), {k: len(v["chosen"]) for k, v in eds.items()})
+    web.publish(con, {}, T0, None, docs=docs)
+    idx = json.loads((docs / "data" / "index.json").read_text(encoding="utf-8"))
+    keys = [e["key"] for e in idx["editions"]]
+    check(keys[0] == "latest" and len(keys) == 8 and keys[1] == "2026-10-15", keys)
+    check((docs / "data" / "2026-10-08.json").exists(), "the 7th day back exists")
+
+
+@test
+def the_page_embeds_the_latest_edition_and_the_app_markup():
+    import web
     con = make_db("page.db")
     a = add(con, "Con! <Flood> & drains in Velachery", body="வேளச்சேரியில் மழைநீர் தேங்கியது. " * 20)
     con.execute("UPDATE items SET image_url='https://img.example.com/flood.jpg?a=1&b=2' WHERE id=?", (a,))
-    con.execute("""UPDATE items SET raw_payload=?, resolved_url='https://www.youtube.com/watch?v=abcdefghijk'
-                   WHERE id=?""", (json.dumps({"via": "youtube_api", "snippet": {"thumbnails": {"medium": {"url": "https://i.ytimg.com/vi/x/mq.jpg"}}}}),
-                                    add(con, "Por story video", host="youtube.com")))
     con.commit()
-    docs = TMP / "docs"
-    shutil.rmtree(docs, ignore_errors=True)
-    saved = digest.Gemini
-    digest.Gemini = lambda *a, **k: FakeGemini()
-    try:
-        digest.run(con, {"GEMINI_API_KEY": "x"}, now=T0, slot="morning", dry_run=True)     # ranks + caches
-    finally:
-        digest.Gemini = saved
-    ed = digest.build_edition(con, {}, T0)
-    digest.write_pages(ed, "morning", T0, docs, feedback_url="https://script.google.com/macros/s/X/exec")
-    digest.write_pages(ed, "evening", T0 + timedelta(hours=11), docs, feedback_url="https://script.google.com/macros/s/X/exec")
+    docs = TMP / "docs-page"
+    web.publish(con, {"GEMINI_API_KEY": "x", "FEEDBACK_URL": "https://script.google.com/macros/s/X/exec"}, T0, FakeGemini(), docs=docs)
     html = (docs / "index.html").read_text(encoding="utf-8")
-    check("&lt;Flood&gt; &amp; drains" in html and "<Flood>" not in html, "escaped headline")
-    check('src="https://img.example.com/flood.jpg?a=1&amp;b=2"' in html, "og:image thumbnail")
-    check("i.ytimg.com" in html, "youtube thumbnail from the API payload")
-    check('class="chip u">URGENT' in html, "urgent chip")
-    check('data-text="' in html and 'data-cat="constituency"' in html, "search data on the cards")
-    check('class="fb" data-id=' in html and 'data-r="unrelated"' in html, "feedback buttons with reasons")
-    check('id="missing"' in html and 'data-feedback="https://script.google.com/macros/s/X/exec"' in html, "missing-news form + endpoint")
-    check('<select id="edition"' in html and "briefs/2026-10-15-evening.html" in html, "edition selector")
-    check("2026-10-15-morning.html" not in html, "one entry per day: the later edition of the day")
-    check('maximum-scale=1.0' in html and "min-height:44px" in html, "mobile viewport and touch targets")
-    arch = (docs / "briefs" / "2026-10-15-evening.html").read_text(encoding="utf-8")
-    check('value="../index.html"' in arch and 'value="../briefs/2026-10-15-evening.html" selected' in arch, "archive pages link back")
-    check((docs / ".nojekyll").exists())
-    plain = digest.write_pages(ed, "morning", T0, docs)                     # no endpoint set
-    check('data-feedback=""' in plain.read_text(encoding="utf-8"), "without an endpoint the page carries none")
+    data = json.loads((docs / "data" / "latest.json").read_text(encoding="utf-8"))
+    s = data["stories"][0]
+    check(s["title"] == "Con! <Flood> & drains in Velachery" and s["urgent"] and s["sentiment"] == "critical" and s["impact"] == 9, s)
+    check(s["image"].startswith("https://img.example.com/flood.jpg"), "image carried in the data")
+    check('id="dashboard"' in html and 'id="drawer"' in html and 'id="top"' in html and 'id="missing"' in html, "app markup")
+    check('data-feedback="https://script.google.com/macros/s/X/exec"' in html, "feedback endpoint")
+    check('<script id="data" type="application/json">' in html and "Urgent takeaway one." in html, "latest edition and summary embedded")
+    data_sum = data["summary"]
+    check(data_sum[0]["cat"] == "urgent" and len(data_sum[0]["bullets"]) == 2, data_sum)
+    check("</script>" not in html.split('<script id="data" type="application/json">')[1].split("</script>")[0], "safe embedding")
+    check("wa.me" in web.JS and "maximum-scale=1.0" in html and "min-height:44px" in html, "share, viewport, touch targets")
 
 
 @test
@@ -435,7 +524,7 @@ def slot_and_budget():
     g = digest.Gemini("key", "m", con, max_calls=1)
     con.execute("INSERT INTO ai_budget (day, calls, tokens) VALUES (?, 1, 0)", (digest.utcnow().strftime("%Y-%m-%d"),))
     con.commit()
-    check(g.rank([{"id": 1}]) is None and "budget" in g.dead, "daily cap respected")
+    check(g.call("prompt", {}, "x") is None and "budget" in g.dead, "daily cap respected")
 
 
 def main():
