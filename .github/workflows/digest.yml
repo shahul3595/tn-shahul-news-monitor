@@ -26,7 +26,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write                 # commits docs/ (the web page) to main
   actions: write
 
 concurrency:
@@ -70,6 +70,29 @@ jobs:
           python collect.py --init
           python digest.py --slot "${{ github.event.inputs.slot || 'auto' }}" \
             ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+
+      - name: Publish the web page (docs/ -> GitHub Pages)
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          git config user.name "tn-news-monitor"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "web page unchanged"
+          else
+            git commit -m "brief: $(date -u +'%Y-%m-%d %H:%M') UTC"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Dry run -- keep the page as a downloadable preview
+        if: github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: brief-preview
+          path: docs/
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Encrypt the database
         run: bash state.sh pack
