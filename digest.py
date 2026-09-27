@@ -15,6 +15,12 @@ What it does, in order:
      category (mention, constituency, district, portfolio, political, opportunity,
      none) and a priority (1 urgent, 2 standard, 3 background). Without a key, over
      quota, or on any error, the keyword rules decide instead.
+  2b. Merging: reports of one event become one candidate. Gemini's story numbers and
+     near-identical headlines only PROPOSE a link; it is accepted when the two reports
+     are within a day, from different outlets and share an identifying headline word
+     (a Tamil/English pair: when Gemini grouped them AND gave both the same category).
+     Numbers and dates never link anything, links never chain, a card pools at most 8
+     reports, one per outlet.
   3. Selection: up to 5 per category first; if a category has fewer, its spare places
      go to the next-best items from other categories, up to DIGEST_MAX in total
      (default 5 x the number of categories = 30). Priority-1 civic items (floods,
@@ -118,6 +124,13 @@ def migrate(con):
         if name not in have:
             con.execute(f"ALTER TABLE items ADD COLUMN {name} {decl}")
     con.execute("CREATE INDEX IF NOT EXISTS ix_items_digested ON items(digested_at)")
+    if rt_get(con, "story_keys") != "v2":
+        # keys written before step 7 looked like "3:12" -- batch 3, story 12 -- and the same
+        # key came up again in the next run on unrelated items. Forget them; the next
+        # cluster call writes keys that carry the edition and a hash of its items.
+        con.execute("UPDATE items SET story_key=NULL WHERE story_key IS NOT NULL AND story_key NOT LIKE '%@%' "
+                    "AND story_key NOT LIKE 'r%'")
+        rt_set(con, "story_keys", "v2")
     con.commit()
 
 
@@ -156,47 +169,39 @@ def norm_title(title, publisher=""):
 
 
 TITLE_SIM = 0.5               # 4-gram Jaccard on normalised titles; well above the 0.35 "topic" band
+STORY_MAX = 8                 # reports one card may pool; a bigger "story" is two stories mislabelled as one
 
 
-class _Union:
-    def __init__(self, n):
-        self.p = list(range(n))
-
-    def find(self, x):
-        while self.p[x] != x:
-            self.p[x] = self.p[self.p[x]]
-            x = self.p[x]
-        return x
-
-    def join(self, a, b):
-        a, b = self.find(a), self.find(b)
-        if a != b:
-            self.p[a] = b
+def _best_first(c):
+    return (c.get("priority") or 9, -(c.get("urgent") or 0), -(c.get("score") or 0), c.get("published_at") or "")
 
 
-def _merge(cands, links):
-    """Collapse candidates into stories. links(i, j) -> True when two are the same story.
-    The representative is the best-ranked report; outlets are pooled."""
-    n = len(cands)
-    u = _Union(n)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if links(cands[i], cands[j]):
-                u.join(i, j)
-    groups = defaultdict(list)
-    for i, c in enumerate(cands):
-        groups[u.find(i)].append(c)
+def _merge(cands, links, cap=STORY_MAX):
+    """Collapse candidates into stories. links(rep, c) -> True when c reports rep's story.
+
+    Anchored, not transitive: candidates are taken best first, and each one joins the first
+    story whose REPRESENTATIVE it links to, or starts its own. A chain A~B, B~C, C~D can
+    therefore never pull A and D together (the union-find this replaces did exactly that,
+    and once it did, a handful of loose links could swallow twenty unrelated items).
+    Outlets are pooled, one report per outlet."""
+    stories = []
+    for c in sorted(cands, key=_best_first):
+        for members in stories:
+            if len(members) < cap and links(members[0], c):
+                members.append(c)
+                break
+        else:
+            stories.append([c])
     out = []
-    for members in groups.values():
-        rep = max(members, key=lambda c: (-(c.get("priority") or 9), c.get("urgent") or 0, c.get("score") or 0,
-                                           c.get("published_at") or ""))
+    for members in stories:
+        rep = members[0]
         rep["sources"] = list(dict.fromkeys(s for m in members for s in m.get("sources") or []))
         rep["merged"] = [m["id"] for m in members]
-        # every report of the story, the representative first, one per url
-        seen, reports = set(), []
-        for m in [rep] + [m for m in members if m is not rep]:
+        seen, reports = set(), []            # the representative's own report first, one per outlet
+        for m in members:
             for r in m.get("reports") or []:
-                if r["url"] not in seen:
+                if r["outlet"] not in seen and r["url"] not in seen:
+                    seen.add(r["outlet"])
                     seen.add(r["url"])
                     reports.append(r)
         rep["reports"] = reports
@@ -239,72 +244,99 @@ def edition(con, now, hours=WEB_WINDOW_H):
     return reps, ids
 
 
-_STOP = {"chennai", "tamil", "nadu", "tamilnadu", "india", "news", "ias", "ips", "minister", "govt", "government",
-         "the", "and", "for", "with", "over", "after", "from", "sept", "sep", "oct", "nov", "dec", "jan", "police", "collector"}
-_NUM = re.compile(r"\d[\d,.]*")
-_LATIN = re.compile(r"[A-Za-z][A-Za-z.\-]{2,}")
-_MONTHS = {"jan": "1", "feb": "2", "mar": "3", "apr": "4", "may": "5", "jun": "6", "jul": "7", "aug": "8",
-           "sep": "9", "sept": "9", "oct": "10", "nov": "11", "dec": "12",
-           "ஜனவரி": "1", "பிப்ரவரி": "2", "மார்ச்": "3", "ஏப்ரல்": "4", "மே": "5", "ஜூன்": "6", "ஜூலை": "7",
-           "ஆகஸ்ட்": "8", "செப்டம்பர்": "9", "அக்டோபர்": "10", "நவம்பர்": "11", "டிசம்பர்": "12"}
+# Words that never identify a story on their own: places every report shares, the words of
+# the news trade, and the KINDS of event (a murder, a flood, a protest). Two floods share
+# "flood"; only a shared victim, locality, official or company makes them one flood.
+_CORE_STOP = set("""chennai tamil nadu tamilnadu india indian state states central centre news story live video watch
+breaking update updates report reports today tonight yesterday tomorrow morning evening night week month
+year years minister ministers ministry govt government collector collectorate corporation police cops
+court high supreme order orders case cases issue issues work works project projects scheme schemes plan
+plans people public residents road roads street water rain rains flood floods flooding protest protests
+death deaths dead died dies killed kills murder murdered accident accidents arrested arrest arrests
+attack attacked fire crore lakh lakhs rupees says said tells told will after before over amid near into
+from with this that these those what when where which their there here about against between
+without within under also more most other another first second third last next new latest
+announce announces announced announcement inaugurate inaugurates inaugurated launch launches launched
+opens opened meeting meet review reviews visit visits speech statement demand demands alleges
+""".split())
+_CORE_STOP_TA = set("""திரு திருமதி சென்னை சென்னையில் தமிழக தமிழகம் தமிழ்நாடு இந்தியா அரசு அரசின் அமைச்சர் முதல்வர்
+ஆட்சியர் மாவட்ட மாவட்டம் மாநகராட்சி போலீஸ் போலீசார் காவல் நீதிமன்றம் உயர்நீதிமன்றம் மக்கள் பொதுமக்கள்
+பணிகள் பணி திட்டம் திட்டங்கள் சாலை சாலைகள் தண்ணீர் மழை வெள்ளம் போராட்டம் மரணம் உயிரிழப்பு கொலை விபத்து
+கைது தாக்குதல் தீ கோடி லட்சம் ரூபாய் இன்று நேற்று நாளை காலை மாலை இரவு வாரம் மாதம் ஆண்டு செய்தி செய்திகள்
+வீடியோ நேரலை புதிய முதல் பிறகு பின்னர் மற்றும் என்று என எனவும் கூறினார் தெரிவித்தார் அறிவிப்பு அறிவித்தார்
+திறப்பு திறந்து தொடக்கம் தொடங்கி ஆய்வு ஆய்வுக்கூட்டம் கூட்டம் பேட்டி பேச்சு கோரிக்கை குற்றச்சாட்டு
+வழக்கு பிரச்சனை பிரச்சினை""".split())
+_WORD = re.compile(r"[\u0B80-\u0BE5]+|[^\W\d_]+")   # a Tamil word (\w misses its vowel signs) or letters of any script; numbers never count
+_TAMIL = re.compile(r"[஀-௿]")
 
 
-def entity_tokens(c):
-    """Language-independent handles of a story: amounts and counts, dates, and Latin-script
-    proper names that Tamil outlets keep in Latin (CMRL, Alstom, acronyms). Returns
-    (strong_numbers, dates, names)."""
-    text = f"{_title(c)} {_snippet(c)}"
-    strong, dates, names = set(), set(), set()
-    for m in _NUM.finditer(text):
-        n = m.group(0).replace(",", "").rstrip(".")
-        if n.isdigit() and 1 <= int(n) <= 31 and len(n) <= 2:
-            dates.add("d" + n)                        # a day of the month, or a small count
-        elif len(n) >= 2:
-            strong.add(n)                             # 450, 2500, 33305, 2026, 10.5
-    low = text.lower()
-    for w, mnum in _MONTHS.items():
-        if w in low:
-            dates.add("m" + mnum)
-    for m in re.finditer(r"\b[A-Z][A-Za-z.\-]{3,}\b", text):
-        w = m.group(0).lower().strip(".-")
-        if w not in _STOP:
-            names.add(w)
-    return strong, dates, names
+def core_terms(c):
+    """The words of a HEADLINE that can identify its story: names of people, places,
+    organisations and things, 4+ letters, minus the generic words above (a Tamil word is
+    generic when a generic word begins it: சென்னையில் is சென்னை). Numbers and dates are
+    deliberately excluded: "October 10" or "450 crore" link nothing."""
+    out = set()
+    for w in _WORD.findall(_title(c)):
+        if _TAMIL.search(w):
+            if len(w) >= 4 and not any(w.startswith(s) for s in _CORE_STOP_TA):
+                out.add("ta:" + w)
+        else:
+            low = w.lower()
+            if len(low) >= 4 and low not in _CORE_STOP:
+                out.add(low)
+    return out
 
 
-def cross_lingual_link(a, b):
-    """A Tamil and an English report within a day, same category, sharing an amount plus a
-    date or a name, or two names, or two amounts. Sharing only 'October' and '10' is not
-    enough: every story with a deadline that day would merge."""
-    sa, da, na = a["etoks"]
-    sb, db, nb = b["etoks"]
-    strong, dates, names = sa & sb, da & db, na & nb
-    return bool(len(strong) >= 2 or (len(strong) >= 1 and (dates or names)) or len(names) >= 2)
+def share_core(a, b):
+    """One identifying word in common. English: the same word. Tamil: the same word, or one
+    is the other plus a short case suffix (ஆவடி / ஆவடியில்), never a longer compound."""
+    ta, tb = a["core"], b["core"]
+    if (ta & tb):
+        return True
+    xs = [x[3:] for x in ta if x.startswith("ta:")]
+    ys = [y[3:] for y in tb if y.startswith("ta:")]
+    for x in xs:
+        for y in ys:
+            s, l = (x, y) if len(x) <= len(y) else (y, x)
+            if l.startswith(s) and len(l) - len(s) <= 5:
+                return True
+    return False
 
 
 def _is_tamil(c):
-    return bool(re.search(r"[\u0B80-\u0BFF]", c["title"] or ""))
+    return bool(_TAMIL.search(c["title"] or ""))
+
+
+def _confirm(a, b, why):
+    """The strict gate every proposed link goes through. Published within a day of each other;
+    no outlet in common (one outlet, two articles = two stories, or a follow-up); and, for two
+    reports in the same language, at least one identifying headline word in common. A Tamil
+    and an English report share no words, so there Gemini's grouping counts -- but only
+    when it also gave both the same category."""
+    pa, pb = parse_ts(a.get("published_at")), parse_ts(b.get("published_at"))
+    if pa and pb and abs((pa - pb).total_seconds()) > 24 * 3600:
+        return False
+    if set(a.get("sources") or []) & set(b.get("sources") or []):
+        return False
+    if _is_tamil(a) != _is_tamil(b):
+        return why == "gemini" and a.get("category") == b.get("category")
+    return share_core(a, b)
 
 
 def merge_stories(cands):
-    """After ranking: Gemini's story numbers, near-identical headlines, and -- for a Tamil and
-    an English report -- shared dates, amounts and Latin-script names finish the job, so one
-    event framed three ways by three outlets is one candidate with one category."""
+    """After ranking: Gemini's story keys and near-identical headlines propose links; the
+    gate above accepts or refuses each one, and _merge never chains them. One event framed
+    three ways by three outlets is one candidate; two events that merely rhyme stay two."""
     for c in cands:
-        if "etoks" not in c:
-            c["etoks"] = entity_tokens(c)
+        if "core" not in c:
+            c["core"] = core_terms(c)
 
     def same(a, b):
         if a.get("story") and a.get("story") == b.get("story"):
-            return True
-        pa, pb = parse_ts(a["published_at"]), parse_ts(b["published_at"])
-        close = not (pa and pb) or abs((pa - pb).total_seconds()) <= 24 * 3600
-        if close and _is_tamil(a) != _is_tamil(b) and a["category"] == b["category"] and cross_lingual_link(a, b):
-            return True
-        if a["tgrams"] and b["tgrams"] and len(a["ntitle"]) >= 25 and len(b["ntitle"]) >= 25:
-            pa, pb = parse_ts(a["published_at"]), parse_ts(b["published_at"])
-            close = not (pa and pb) or abs((pa - pb).total_seconds()) <= 24 * 3600
-            return close and rules.jaccard(a["tgrams"], b["tgrams"]) >= TITLE_SIM
+            return _confirm(a, b, "gemini")
+        if a["tgrams"] and b["tgrams"] and len(a["ntitle"]) >= 25 and len(b["ntitle"]) >= 25 \
+                and rules.jaccard(a["tgrams"], b["tgrams"]) >= TITLE_SIM:
+            return _confirm(a, b, "title")
         return False
     return _merge(cands, same)
 
@@ -397,6 +429,7 @@ class Gemini:
         self.dead = None
         self.t0 = time.monotonic()
         self._client = client
+        self.run = utcnow().strftime("%Y%m%d%H%M%S")   # story keys from this run never collide with another run's
 
     @property
     def client(self):
@@ -467,48 +500,92 @@ class Gemini:
             except (TypeError, ValueError):
                 continue
             if 0 <= i < len(batch):
-                out[batch[i]["id"]] = _verdict(it, f"{self.calls}:")
+                out[batch[i]["id"]] = _verdict(it, f"r{self.run}.{self.calls}:")
         return out
 
 
 CLUSTER_PROMPT = """Below are news items from Tamil Nadu in Tamil and English, collected over about a day.
-Group the items that report the SAME real-world event: the same announcement, press
-conference, order, inauguration, incident or statement -- even when one is in Tamil and one
-in English, and however differently they are headlined. Look at names, places, dates,
-amounts and what actually happened. Different events on the same topic (two separate
-floods, two statements on different days, a recurring daily column) are NOT the same.
-When torn, keep them apart: merging two events hides news.
+Find the items that report the SAME specific incident or announcement: the same murder, the
+same inauguration, the same court order, the same press statement -- in Tamil or English,
+however differently headlined. Two items belong together ONLY when BOTH are true:
+1. they name the same core entities -- the same victim or accused, the same official, the
+   same locality or building, the same company or scheme;
+2. they describe the same thing happening at the same time.
+NOT the same: two incidents of the same kind (two murders, two floods, two protests, two
+accidents) in different places or with different people; the same subject on different
+days; a follow-up, a reaction or an analysis of an event; a daily column; two items that
+merely share a district, a party or a minister's name.
+When torn, leave the item out of the group. A missed merge shows a story twice; a wrong
+merge hides a story from the office. Never put more than {max_group} items in one group.
 
-Return one object per item with a "story" number: the same number for every item in a
-group (use the lowest item number of the group); an item on its own gets its own number.
+Return only the groups (2 or more items each). For each group give the item numbers and
+"shared": the core names the items have in common, written exactly as they appear in the
+items (Tamil names in Tamil, English names in English), for example
+"Avadi, Ramesh, Sekar Nagar" or "ஆவடி, ரமேஷ், Avadi". Items that stand alone are not listed.
 
 ITEMS:
 {payload}"""
 
-CLUSTER_SCHEMA = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-    "n": {"type": "INTEGER"}, "story": {"type": "INTEGER"}}, "required": ["n", "story"]}}
+CLUSTER_SCHEMA = {"type": "OBJECT", "properties": {"groups": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+    "items": {"type": "ARRAY", "items": {"type": "INTEGER"}}, "shared": {"type": "STRING"}},
+    "required": ["items", "shared"]}}}, "required": ["groups"]}
+CLUSTER_MAX_GROUP = 6         # a bigger group is not a story, it is Gemini lumping a topic; dropped whole
+
+
+def _has_evidence(c, shared):
+    """Gemini's "shared" names must actually occur in the item -- checked in the item's own
+    script, so an English item is held to the Latin names and a Tamil item to the Tamil ones.
+    No names in the item's script: nothing to hold it to, the gate in _confirm remains."""
+    text = f"{_title(c)} {_snippet(c)}".lower()
+    tamil = _is_tamil(c)
+    words = [w for w in _WORD.findall(shared or "") if len(w) >= 3 and bool(_TAMIL.search(w)) == tamil]
+    return not words or any(w.lower() in text for w in words)
 
 
 def cluster(gemini, con, cands, key_prefix):
-    """One call over a whole edition: {id: story_key}. Stores the keys on the items so a
-    later run links the same reports again without asking."""
+    """One call over a whole edition. Gemini proposes groups with the names that prove them;
+    a group that is too big, that names nothing, or whose names do not occur in a member is
+    thinned or dropped here, before merge_stories applies its own gate. Every item gets a
+    key (its group's, or one of its own) so a later run links the same reports again
+    without asking and no older key survives on it. Returns the number of groups kept."""
     if gemini is None or not cands or len(cands) < 2:
         return 0
     lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(cands, 1)]
-    data = gemini.call(CLUSTER_PROMPT.format(payload="\n".join(lines)), CLUSTER_SCHEMA, "cluster")
-    if not isinstance(data, list):
+    data = gemini.call(CLUSTER_PROMPT.format(payload="\n".join(lines), max_group=CLUSTER_MAX_GROUP),
+                       CLUSTER_SCHEMA, "cluster")
+    if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
         return 0
-    groups = Counter()
-    for it in data:
-        i, g = _int(it.get("n"), 1, len(cands), 0) - 1, _int(it.get("story"), 1, len(cands), 0)
-        if i >= 0 and g:
-            groups[g] += 1
-            cands[i]["story"] = f"{key_prefix}:{g}"
+    taken, kept, dropped = set(), 0, Counter()
     for c in cands:
-        if c.get("story", "").startswith(key_prefix):
-            con.execute("UPDATE items SET story_key=? WHERE id=?", (c["story"], c["id"]))
+        c["story"] = None
+    for g in data["groups"]:
+        nums = sorted({_int(n, 1, len(cands), 0) for n in (g.get("items") or []) if _int(n, 1, len(cands), 0)})
+        nums = [n for n in nums if n not in taken]
+        shared = str(g.get("shared") or "").strip()
+        if len(nums) < 2:
+            continue
+        if len(nums) > CLUSTER_MAX_GROUP:
+            dropped["too big"] += 1
+            continue
+        if not shared:
+            dropped["no shared names"] += 1
+            continue
+        nums = [n for n in nums if _has_evidence(cands[n - 1], shared)]
+        if len(nums) < 2:
+            dropped["names not in the items"] += 1
+            continue
+        for n in nums:
+            cands[n - 1]["story"] = f"{key_prefix}:{nums[0]}"
+            taken.add(n)
+        kept += 1
+    for n, c in enumerate(cands, 1):
+        if not c["story"]:
+            c["story"] = f"{key_prefix}:s{n}"
+        con.execute("UPDATE items SET story_key=? WHERE id=?", (c["story"], c["id"]))
     con.commit()
-    return sum(1 for g, n in groups.items() if n > 1)
+    if dropped:
+        log.info("cluster: refused " + ", ".join(f"{n} group(s) {why}" for why, n in dropped.items()))
+    return kept
 
 
 def _int(v, lo, hi, default):
@@ -697,10 +774,10 @@ def render(slot, now, urgent, sections, n_total, n_cands, by_gemini):
 def build(con, env, now, slot, transport_client=None):
     cfg = settings(env)
     cands, all_ids, since = candidates(con, now)
-    gemini = None
     key = (env.get("GEMINI_API_KEY") or "").strip()
-    if key and cands:
-        gemini = Gemini(key, cfg["model"], con, cfg["ai_calls"], transport_client)
+    # even with nothing new for Telegram the web editions are rebuilt afterwards, and they
+    # need Gemini for the clusters and the briefing (an empty delta used to leave a stale one)
+    gemini = Gemini(key, cfg["model"], con, cfg["ai_calls"], transport_client) if key else None
     st = rank_all(con, cands, gemini, now)
     before = len(cands)
     cands = merge_stories(cands)

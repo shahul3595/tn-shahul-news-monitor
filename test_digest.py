@@ -101,10 +101,11 @@ class FakeGemini:
     '~' priority 3, '#7' story 7, '(+)' positive, '(-)' critical. Handles the cluster and
     summary calls too."""
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, shared=None):
         self.calls, self.fail, self.model = 0, fail, "fake"
         self.dead = None
         self.kinds = []
+        self.shared = shared or {}           # cluster tag -> the "shared" names the fake claims
 
     def rank(self, batch):
         self.calls += 1
@@ -131,18 +132,21 @@ class FakeGemini:
         if self.fail:
             self.dead = "simulated failure"
             return None
-        if label == "summary":
-            secs = re.findall(r"^## (.+?) \(", prompt, re.M)
-            return {"groups": [{"section": name, "takeaways": [f"{name} takeaway one.", f"{name} takeaway two."]} for name in secs]}
+        if label == "summary":               # two takeaways per section, each on the section's first story
+            groups = []
+            for name, body in re.findall(r"^## (.+?) \(.*?\n((?:\[.*\n?)+)", prompt, re.M):
+                n = int(re.match(r"\[(\d+)\]", body).group(1))
+                groups.append({"section": name, "takeaways": [{"text": f"{name} takeaway one.", "story": n},
+                                                              {"text": f"{name} takeaway two.", "story": n}]})
+            return {"groups": groups}
         if label == "cluster":               # items whose titles share a '@word' tag are one story
             items = re.findall(r"^(\d+)\. \[.*?\] (.*)$", prompt, re.M)
-            first = {}
-            out = []
+            by_tag = {}
             for n, t in items:
                 m = re.search(r"@(\w+)", t)
-                g = first.setdefault(m.group(1), int(n)) if m else int(n)
-                out.append({"n": int(n), "story": g})
-            return out
+                if m:
+                    by_tag.setdefault(m.group(1), []).append(int(n))
+            return {"groups": [{"items": ns, "shared": self.shared.get(tag, tag)} for tag, ns in by_tag.items() if len(ns) > 1]}
         return None
 
 
@@ -353,7 +357,7 @@ def cluster_call_merges_tamil_and_english_reports_and_is_not_repeated():
     add(con, "Con story @drain: Oct 10 set as deadline for drain desilting in Chennai", host="newindianexpress.com")
     add(con, "Con story @drain: சென்னையில் வடிகால் பணிகள் அக்டோபர் 10-க்குள்: ககன்தீப் சிங் பேடி", host="maalaimalar.com")
     add(con, "Con story: Velachery lake desilting tender floated", host="dtnext.in")
-    g = FakeGemini()
+    g = FakeGemini(shared={"drain": "drain desilting, வடிகால்"})
     eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-cl")
     lat = eds["latest"]
     check(len(lat["chosen"]) == 2, f"two stories, not three: {[c['title'][:30] for c in lat['chosen']]}")
@@ -373,22 +377,68 @@ def cluster_call_merges_tamil_and_english_reports_and_is_not_repeated():
 
 
 @test
-def cross_lingual_link_needs_more_than_a_date():
-    def mk(t, d, ts="2026-09-27T05:00:00+00:00"):
-        return {"title": t, "publisher": "", "description": d, "extract_status": "FAILED", "extract_text": None,
-                "published_at": ts, "category": "constituency"}
-    a = mk("Oct 10 set as deadline for drain desilting", "Bedi said desilting must be completed by October 10.")
-    b = mk("வடிகால் பணிகள் அக்டோபர் 10-க்குள்", "அக்டோபர் 10-ந்தேதிக்குள் முடிக்கப்படும்.")
-    c = mk("Chennai Metro: 10 new trains from Alstom by October", "CMRL said ten trains will arrive by October.")
-    d = mk("மெட்ரோ: 10 புதிய ரயில்கள் அக்டோபரில்", "Alstom ரயில்கள் அக்டோபரில் வரும் என CMRL தெரிவித்தது.")
-    e = mk("Rs 450 crore radial road bridge sanctioned", "The 2 km bridge will cost Rs 450 crore.")
-    f = mk("ரூ.450 கோடியில் ரேடியல் சாலை பாலம்: 2 கி.மீ.", "ரூ.450 கோடியில் பாலம்.")
-    for x in (a, b, c, d, e, f):
-        x["etoks"] = digest.entity_tokens(x)
-    check(not digest.cross_lingual_link(a, b), "a month and a day alone do not merge (Gemini's cluster call does that)")
-    check(digest.cross_lingual_link(c, d), "shared Latin names CMRL + Alstom merge")
-    check(digest.cross_lingual_link(e, f), "shared amount 450 + count 2 merge")
-    check(not digest.cross_lingual_link(a, d) and not digest.cross_lingual_link(e, b), "unrelated pairs stay apart")
+def merging_is_strict_numbers_never_link_and_links_never_chain():
+    import web
+    con = make_db("strict.db")
+    # 1. A Tamil/English pair Gemini groups: merged only with the same category. Numbers and
+    #    dates on their own (October 10 here) link nothing any more.
+    add(con, "Con story @g1: Oct 10 set as deadline for drain desilting in Chennai", host="newindianexpress.com")
+    add(con, "Dis story @g1: வடிகால் பணிகள் அக்டோபர் 10-க்குள்: ககன்தீப் சிங் பேடி", host="maalaimalar.com")
+    # 2. Two different incidents Gemini lumps under one tag (tags carry a digit so they
+    #    are not headline words themselves) (the "+19 more outlets" bug):
+    #    same category, no headline word in common -> refused.
+    add(con, "Dis story @g2: Avadi shopkeeper Ramesh murdered over land dispute", host="dtnext.in")
+    add(con, "Dis story @g2: Sewage floods Kanchipuram bank branch, customers turned away", host="thehindu.com")
+    # 3. The same outlet twice under one tag -> two stories (a follow-up, or Gemini's slip).
+    add(con, "Con story @g3: Velachery lake desilting begins near Ram Nagar", host="dinamalar.com")
+    add(con, "Con story @g3: Velachery lake desilting: residents of Ram Nagar want silt removed", host="dinamalar.com")
+    # 4. A genuine same-language pair: shared names, different outlets -> one card, one report per outlet.
+    add(con, "Con story @g4: Tharamani MRTS station gets new lift after 4 years", host="thehindu.com")
+    add(con, "Con story @g4: New lift at Tharamani MRTS station opens", host="dtnext.in")
+    add(con, "Con story @g4: Tharamani MRTS lift finally working, say commuters", host="dtnext.in")
+    g = FakeGemini(shared={"g1": "drain, வடிகால்", "g2": "Avadi, Kanchipuram", "g3": "Velachery, Ram Nagar",
+                           "g4": "Tharamani, MRTS"})
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-strict")
+    titles = sorted(c["title"] for c in eds["latest"]["cands"])
+    drain = [t for t in titles if "@g1" in t]
+    check(len(drain) == 2, f"different categories: the Tamil/English pair stays apart: {drain}")
+    lump = [t for t in titles if "@g2" in t]
+    check(len(lump) == 2, f"Avadi murder and Kanchipuram sewage never merge: {lump}")
+    twice = [t for t in titles if "@g3" in t]
+    check(len(twice) == 2, f"the same outlet twice is two stories: {twice}")
+    ok = [c for c in eds["latest"]["cands"] if "@g4" in c["title"]]
+    check(len(ok) == 1 and sorted(ok[0]["sources"]) == ["Dtnext", "Thehindu"], f"the real pair merged: {[c['sources'] for c in ok]}")
+    check(len(ok[0]["reports"]) == 2 and len({r["outlet"] for r in ok[0]["reports"]}) == 2, f"one report per outlet: {ok[0]['reports']}")
+    # 5. A Gemini group that is too big, or whose "shared" names are not in the items, is refused whole.
+    con = make_db("strict2.db")
+    for i in range(7):
+        add(con, f"Dis story @g5: {t('Big', i)} Tiruttani", host=f"outlet{i}.com")
+    add(con, "Dis story @g6: Ponneri bridge work stalls, Tiruttani lorry drivers protest", host="thehindu.com")
+    add(con, "Dis story @g6: Ambattur estate power cut for six hours, Tiruttani", host="dtnext.in")
+    g = FakeGemini(shared={"g5": "Tiruttani", "g6": "Gummidipoondi"})
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-strict2")
+    check(len(eds["latest"]["cands"]) == 9, f"a 7-item group and an unproven group are refused: {len(eds['latest']['cands'])}")
+    # 6. Links never chain: A~B and B~C do not make A~C. Three items, two gemini keys of which
+    #    only the middle one is shared by both neighbours -- in _merge each joins the REP only.
+    mk = lambda i, title, story, outlet: {"id": i, "title": title, "publisher": "", "description": "", "extract_status": "FAILED",
+                                          "extract_text": None, "published_at": "2026-10-15T05:00:00+00:00", "category": "district",
+                                          "priority": 2, "urgent": 0, "score": 10 - i, "sources": [outlet], "story": story,
+                                          "reports": [{"outlet": outlet, "url": f"u{i}", "title": title, "lang": "English"}],
+                                          "ntitle": digest.norm_title(title), "tgrams": frozenset()}
+    a = mk(1, "Poondi reservoir level rises after rain", "k1", "A")
+    b = mk(2, "Poondi reservoir: Gummidipoondi farmers ask for water", "k1", "B")
+    c = mk(3, "Gummidipoondi SIPCOT unit fined for effluent", "k1", "C")
+    out = digest.merge_stories([a, b, c])
+    check(len(out) == 2 and sorted(out[0]["sources"]) == ["A", "B"], f"B joins A; C shares nothing with the rep A: {[o['sources'] for o in out]}")
+    # 7. numbers alone: "450 crore" and "2 km" in both, no name in common -> apart
+    e = mk(4, "Rs 450 crore radial road bridge sanctioned, 2 km long", "k9", "E")
+    f = mk(5, "450 crore for 2 km of new pipelines in Ambattur", "k9", "F")
+    check(len(digest.merge_stories([e, f])) == 2, "shared amounts never link")
+    ct = digest.core_terms({"title": "Avadi: ஆவடியில் கடை உரிமையாளர் கொலை", "publisher": ""})
+    check(ct == {"avadi", "ta:ஆவடியில்", "ta:உரிமையாளர்"}, f"names kept, generic words and short words out: {ct}")
+    check(digest.share_core({"core": {"ta:ஆவடி"}}, {"core": {"ta:ஆவடியில்"}}), "a case suffix does not hide a shared Tamil name")
+    check(not digest.share_core({"core": {"ta:திருவள்ளூர்"}}, {"core": {"ta:திருவொற்றியூர்"}}), "Tiruvallur is not Tiruvottiyur")
+    check(not digest.share_core({"core": {"ta:பூண்டி"}}, {"core": {"ta:பூண்டிகுளம்பாளையம்"}}), "a longer compound is another name")
 
 
 @test
@@ -398,8 +448,12 @@ def summary_is_cached_until_the_top_stories_change():
     add(con, "Con story (+) scheme launched")
     g = FakeGemini()
     eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-sum")
-    check(eds["latest"]["summary"] == [{"cat": "constituency", "bullets": ["Velachery takeaway one.", "Velachery takeaway two."]}],
+    sid = con.execute("SELECT id FROM items").fetchone()[0]
+    check(eds["latest"]["summary"] == [{"cat": "constituency", "bullets": [{"text": "Velachery takeaway one.", "id": sid},
+                                                                            {"text": "Velachery takeaway two.", "id": sid}]}],
           eds["latest"]["summary"])
+    page = (TMP / "docs-sum" / "index.html").read_text(encoding="utf-8")
+    check('id="story-\'+s.id' in page and "data-story" in page and "function jump(" in page, "cards carry anchors, takeaways link to them")
     n = g.kinds.count("summary")
     web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(minutes=5), g, docs=TMP / "docs-sum")
     check(g.kinds.count("summary") == n, "same top stories, no new summary call")

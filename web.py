@@ -41,10 +41,12 @@ Minister for AI, IT and Digital Services, and in-charge minister for Thiruvallur
 teams read different sections: the constituency team reads Velachery, the district team
 reads Thiruvallur, the portfolio team reads AI / IT / Digital.
 
-Below are today's stories, already ranked, grouped by section. For EVERY section that has
-stories, write 2 or 3 takeaways -- 3 when the section has 4 or more stories, 2 otherwise.
-Each takeaway is one plain English sentence of at most 28 words that names the place, the
-people and what happened, and says what the office should do or watch when that is clear.
+Below are today's stories, already ranked, grouped by section and numbered [1], [2], ...
+For EVERY section that has stories, write 2 or 3 takeaways -- 3 when the section has 4 or
+more stories, 2 otherwise. Each takeaway is one plain English sentence of at most 28 words
+that names the place, the people and what happened, and says what the office should do or
+watch when that is clear. With each takeaway give "story": the number of the ONE story it
+is mainly drawn from (the page links the takeaway to that story's card).
 Do not invent anything not in the stories. Do not write for sections with no stories. No
 preamble, no bullet symbols, no headings inside the text.
 
@@ -54,9 +56,11 @@ STORIES BY SECTION:
 {payload}"""
 
 SUMMARY_SCHEMA = {"type": "OBJECT", "properties": {"groups": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-    "section": {"type": "STRING"}, "takeaways": {"type": "ARRAY", "items": {"type": "STRING"}}},
+    "section": {"type": "STRING"},
+    "takeaways": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+        "text": {"type": "STRING"}, "story": {"type": "INTEGER"}}, "required": ["text", "story"]}}},
     "required": ["section", "takeaways"]}}}, "required": ["groups"]}
-SUMMARY_FORMAT = "v2"         # bumped when the shape changes, so cached summaries are rebuilt
+SUMMARY_FORMAT = "v3"         # bumped when the shape changes, so cached summaries are rebuilt
 SECTION_LABEL = dict([("urgent", "Urgent")] + [(c, NICE[c]) for c in CATEGORIES])
 
 
@@ -109,8 +113,9 @@ def build(con, env, now, key, since, until, gemini=None):
 
 
 def _summary(con, gemini, key, urgent, sections, row, now):
-    """Category-wise takeaways: [{"cat": "urgent"|category, "bullets": [..]}], in section order.
-    Cached until the chosen stories change."""
+    """Category-wise takeaways: [{"cat": "urgent"|category, "bullets": [{"text", "id"}, ..]}]
+    in section order, each takeaway pointing at the story card it comes from (id None when
+    Gemini's number did not resolve). Cached until the chosen stories change."""
     groups = [("urgent", urgent)] + [(cat, sections.get(cat) or []) for cat in CATEGORIES]
     groups = [(cat, items) for cat, items in groups if items]
     sh = _hash([c["id"] for _, items in groups for c in items]) + SUMMARY_FORMAT
@@ -119,10 +124,12 @@ def _summary(con, gemini, key, urgent, sections, row, now):
         return cached
     if gemini is None or not groups:
         return cached if isinstance(cached, list) and cached and isinstance(cached[0], dict) else []
-    payload = []
+    payload, numbered = [], []
     for cat, items in groups:
         payload.append(f"## {SECTION_LABEL[cat]} ({len(items)} stories)")
-        payload += [f"- {digest._title(c)} ({alerts.outlet_name(c)}) -- {digest._snippet(c)}" for c in items[:12]]
+        for c in items[:12]:
+            numbered.append(c)
+            payload.append(f"[{len(numbered)}] {digest._title(c)} ({alerts.outlet_name(c)}) -- {digest._snippet(c)}")
     names = ", ".join(SECTION_LABEL[cat] for cat, _ in groups)
     data = gemini.call(SUMMARY_PROMPT.format(names=names, payload="\n".join(payload)), SUMMARY_SCHEMA, "summary")
     out = []
@@ -131,7 +138,12 @@ def _summary(con, gemini, key, urgent, sections, row, now):
         got = {}
         for g in data.get("groups") or []:
             cat = by_label.get(str(g.get("section", "")).strip().lower())
-            bullets = [str(b).strip() for b in (g.get("takeaways") or []) if str(b).strip()][:3]
+            bullets = []
+            for b in (g.get("takeaways") or [])[:3]:
+                text = str(b.get("text", "") if isinstance(b, dict) else b).strip()
+                n = digest._int(b.get("story"), 1, len(numbered), 0) if isinstance(b, dict) else 0
+                if text:
+                    bullets.append({"text": text, "id": numbered[n - 1]["id"] if n else None})
             if cat and bullets and cat not in got:
                 got[cat] = bullets
         out = [{"cat": cat, "bullets": got[cat]} for cat, _ in groups if cat in got]
@@ -292,7 +304,7 @@ header h1{font-size:19px;margin:0;line-height:1.2}header .sub{color:var(--dim);f
 .callout .sgs{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px 22px}
 .sg h3{font-size:14px;margin:6px 0 2px}.sg h3 a{color:var(--ink);text-decoration:none;display:inline-flex;align-items:center;min-height:32px}
 .sg h3 a span{color:var(--dim);margin-left:4px}.sg h3 a:hover{color:var(--accent)}.sg.urgent h3 a{color:var(--urgent)}
-.sg ul{margin:0 0 6px;padding-left:18px;font-size:14px}.sg li{margin:3px 0}
+.sg ul{margin:0 0 6px;padding-left:18px;font-size:14px}.sg li{margin:3px 0}.sg li a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--line);text-underline-offset:3px}.sg li a:hover{color:var(--accent);text-decoration-color:var(--accent)}@keyframes flash{0%,60%{box-shadow:0 0 0 4px var(--accent);border-color:var(--accent)}100%{box-shadow:0 0 0 0 transparent}}.card{scroll-margin-top:90px}.card.flash{animation:flash 2.4s ease-out}
 .dash{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:10px 0;overflow-x:auto}
 .dash h2{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin:0 0 6px;display:flex;justify-content:space-between;align-items:center}
 .dash table{border-collapse:collapse;width:100%;font-size:14px}.dash th,.dash td{padding:6px 8px;text-align:center;border-top:1px solid var(--line)}
@@ -305,7 +317,7 @@ header h1{font-size:19px;margin:0;line-height:1.2}header .sub{color:var(--dim);f
 .matrix td{padding:4px 4px;vertical-align:middle}.matrix td.day{font-weight:600;white-space:nowrap;text-align:left}.matrix td.day.on{color:var(--accent)}
 .cell{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:64px;min-height:44px;justify-content:center;border-radius:8px;cursor:pointer;border:0;background:transparent;font:inherit;color:var(--ink);padding:3px 4px}
 .cell:hover{background:var(--chip)}.cell .n{font-weight:600;font-size:14px}.cell.zero{opacity:.35;cursor:default}
-.bar{display:flex;width:56px;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}.bar i{display:block;height:100%}.bar .p{background:var(--pos)}.bar .u{background:#98a2b3}.bar .c{background:var(--crit)}
+.cell.all{min-width:80px;border-left:1px solid var(--line);border-radius:0 8px 8px 0}.cell.all .bar{width:72px}.bar{display:flex;width:56px;height:6px;border-radius:3px;overflow:hidden;background:var(--chip)}.bar i{display:block;height:100%}.bar .p{background:var(--pos)}.bar .u{background:#98a2b3}.bar .c{background:var(--crit)}
 .badges{display:flex;gap:2px}.badges b{font-weight:500;font-size:11px;padding:0 4px;border-radius:999px;background:var(--chip);min-width:18px;text-align:center;cursor:pointer}
 .badges b.p{color:var(--pos)}.badges b.c{color:var(--crit)}.badges b.u{color:var(--dim)}
 .outlets{margin:0;padding:6px 14px 8px;list-style:none;border-top:1px dashed var(--line);font-size:14px}.outlets li{padding:4px 0}.outlets a{color:var(--accent);text-decoration:none;min-height:32px;display:inline-flex;align-items:center}
@@ -368,7 +380,7 @@ function group(s){return s.urgent?'urgent':s.cat}
 function card(s){var g=group(s),wa='https://wa.me/?text='+encodeURIComponent((s.urgent?'🚨 ':'')+s.title+'\n'+NAME[s.cat]+' · '+s.outlet+' · '+s.time+'\n'+s.url);
  var why=REASONS.map(function(r){return '<button type="button" data-r="'+r[0]+'">'+esc(r[1])+'</button>'}).join('');
  var acts=state.voted[s.id]?'<span class="done">Thanks for the feedback</span>':'<button type="button" class="up" aria-label="Useful">👍</button><button type="button" class="down" aria-label="Not useful">👎</button><div class="why">'+why+'</div>';
- return '<article class="card" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+s.outlet+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
+ return '<article class="card" id="story-'+s.id+'" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+s.outlet+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
  (s.image?'<a href="'+esc(s.url)+'" target="_blank" rel="noopener"><img src="'+esc(s.image)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>':'')+
  '<div class="body"><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3>'+(s.snippet?'<p>'+esc(s.snippet)+'</p>':'')+
  '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
@@ -378,9 +390,10 @@ function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=b
  $('#title').textContent=d.label+(d.key==='latest'?' · '+d.stories.length+' stories':'');
  $('#sub').textContent=d.stories.length+' stories · '+d.considered+' considered · updated '+d.generated_ist;
  var sum=$('#summary'),ICO={};CATS.forEach(function(c){ICO[c[0]]=c[1]});
- if(d.summary&&d.summary.length&&typeof d.summary[0]==='object'){sum.hidden=false;$('.sgs',sum).innerHTML=d.summary.map(function(g){return '<div class="sg'+(g.cat==='urgent'?' urgent':'')+'"><h3><a href="#sec-'+g.cat+'" data-jump="'+g.cat+'">'+(ICO[g.cat]||'')+' '+esc(NAME[g.cat]||g.cat)+' <span>›</span></a></h3><ul>'+g.bullets.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul></div>'}).join('')}
+ if(d.summary&&d.summary.length&&typeof d.summary[0]==='object'){sum.hidden=false;$('.sgs',sum).innerHTML=d.summary.map(function(g){return '<div class="sg'+(g.cat==='urgent'?' urgent':'')+'"><h3><a href="#sec-'+g.cat+'" data-jump="'+g.cat+'">'+(ICO[g.cat]||'')+' '+esc(NAME[g.cat]||g.cat)+' <span>›</span></a></h3><ul>'+g.bullets.map(function(b){var t=typeof b==='object'?b.text:b,id=typeof b==='object'?b.id:null;return '<li>'+(id?'<a href="#story-'+id+'" data-story="'+id+'">'+esc(t)+'</a>':esc(t))+'</li>'}).join('')+'</ul></div>'}).join('')}
  else if(d.summary&&d.summary.length){sum.hidden=false;$('.sgs',sum).innerHTML='<div class="sg"><ul>'+d.summary.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul></div>'}else{sum.hidden=true}
  $$('[data-jump]',sum).forEach(function(a){a.onclick=function(ev){ev.preventDefault();state.cat='';state.sent='';apply();var t=$('#sec-'+a.getAttribute('data-jump'));if(t)t.scrollIntoView({behavior:'smooth',block:'start'})}});
+ $$('[data-story]',sum).forEach(function(a){a.onclick=function(ev){ev.preventDefault();jump(a.getAttribute('data-story'))}});
  var rows=CATS.filter(function(c){return by[c[0]]}).map(function(c){var l=by[c[0]],n={positive:0,neutral:0,critical:0};l.forEach(function(s){n[s.sentiment]++});
   return '<tr><td class="cat"><button type="button" data-cat="'+c[0]+'" data-sent="">'+c[1]+' '+esc(c[2])+'</button></td>'+['positive','neutral','critical'].map(function(k){return '<td class="'+(n[k]?'':'zero')+'"><button type="button" data-cat="'+c[0]+'" data-sent="'+k+'">'+n[k]+'</button></td>'}).join('')+'<td><button type="button" data-cat="'+c[0]+'" data-sent="">'+l.length+'</button></td></tr>'}).join('');
  var tot={positive:0,neutral:0,critical:0};d.stories.forEach(function(s){tot[s.sentiment]++});
@@ -396,6 +409,8 @@ function apply(){var q=state.q.toLowerCase().normalize('NFC').trim(),n=0;
  $$('section[data-cat]').forEach(function(s){s.hidden=!$$('.card',s).some(function(c){return !c.hidden})});
  $('#nohit').hidden=n>0;$$('#dash-today button').forEach(function(b){b.classList.toggle('on',state.cat===b.getAttribute('data-cat')&&state.sent===b.getAttribute('data-sent')&&(state.cat||state.sent))});
  var fb=$('#filterbar');fb.classList.toggle('on',!!(state.cat||state.sent));$('#filterlabel').textContent=(state.cat?NAME[state.cat]:'All')+(state.sent?' · '+SENT[state.sent]:'')+' · '+n+' shown'}
+function jump(id){var c=$('#story-'+id);if(!c)return;if(c.hidden){state.cat='';state.sent='';state.q='';$('#q').value='';apply()}
+ c.scrollIntoView({behavior:'smooth',block:'center'});c.classList.remove('flash');void c.offsetWidth;c.classList.add('flash');setTimeout(function(){c.classList.remove('flash')},2600);try{history.replaceState(null,'',location.search+'#story-'+id)}catch(e){}}
 function send(p){if(!FB)return;p.page=DATA.key;p.ua=navigator.userAgent.slice(0,120);fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){})}
 function wire(){$$('.more').forEach(function(b){b.onclick=function(){var u=b.closest('.card').querySelector('.outlets'),o=u.hidden;u.hidden=!o;b.setAttribute('aria-expanded',o);b.textContent=b.textContent.replace(o?'▾':'▴',o?'▴':'▾')}});
  $$('.acts').forEach(function(f){var c=f.closest('.card'),id=c.getAttribute('data-id');function item(){var s=DATA.stories.filter(function(x){return String(x.id)===id})[0]||{};return {id:id,title:s.title,url:s.url,category:s.cat,outlet:s.outlet}}
@@ -414,7 +429,9 @@ function matrix(){var days=EDS.filter(function(e){return e.key!=='latest'&&e.cou
  $('#mhead').innerHTML='<tr><th>Day</th>'+cats.map(function(c){return '<th title="'+esc(c[2])+'">'+c[1]+'<span class="mlab"> '+esc(c[2].split(' ')[0])+'</span></th>'}).join('')+'<th>All</th></tr>';
  $('#mbody').innerHTML=days.map(function(d){return '<tr><td class="day'+(d.key===DATA.key?' on':'')+'"><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="" data-sent="" style="min-width:0;align-items:flex-start">'+esc(d.label)+'</button></td>'+cats.map(function(c){var n=d.counts[c[0]]||{positive:0,neutral:0,critical:0},t=n.positive+n.neutral+n.critical;
   if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
-  return '<td><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="'+c[0]+'" data-sent=""><span class="n">'+t+'</span><span class="bar"><i class="p" style="width:'+(100*n.positive/t)+'%"></i><i class="u" style="width:'+(100*n.neutral/t)+'%"></i><i class="c" style="width:'+(100*n.critical/t)+'%"></i></span><span class="badges">'+(n.positive?'<b class="p" data-sent="positive">'+n.positive+'</b>':'')+(n.neutral?'<b class="u" data-sent="neutral">'+n.neutral+'</b>':'')+(n.critical?'<b class="c" data-sent="critical">'+n.critical+'</b>':'')+'</span></button></td>'}).join('')+'<td><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="" data-sent=""><span class="n">'+(d.total||0)+'</span></button></td></tr>'}).join('')||'<tr><td colspan="9" class="empty">No past editions yet — run the backfill.</td></tr>';
+  return '<td><button type="button" class="cell" data-file="'+esc(d.file)+'" data-cat="'+c[0]+'" data-sent=""><span class="n">'+t+'</span><span class="bar"><i class="p" style="width:'+(100*n.positive/t)+'%"></i><i class="u" style="width:'+(100*n.neutral/t)+'%"></i><i class="c" style="width:'+(100*n.critical/t)+'%"></i></span><span class="badges">'+(n.positive?'<b class="p" data-sent="positive">'+n.positive+'</b>':'')+(n.neutral?'<b class="u" data-sent="neutral">'+n.neutral+'</b>':'')+(n.critical?'<b class="c" data-sent="critical">'+n.critical+'</b>':'')+'</span></button></td>'}).join('')+(function(){var a={positive:0,neutral:0,critical:0};cats.forEach(function(c){var n=d.counts[c[0]];if(n){a.positive+=n.positive||0;a.neutral+=n.neutral||0;a.critical+=n.critical||0}});var t=a.positive+a.neutral+a.critical,pc=function(k){return Math.round(100*a[k]/t)};
+  if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
+  return '<td><button type="button" class="cell all" data-file="'+esc(d.file)+'" data-cat="" data-sent="" title="'+esc(d.label)+': '+pc('positive')+'% positive · '+pc('neutral')+'% neutral · '+pc('critical')+'% critical"><span class="n">'+t+'</span><span class="bar"><i class="p" style="width:'+(100*a.positive/t)+'%"></i><i class="u" style="width:'+(100*a.neutral/t)+'%"></i><i class="c" style="width:'+(100*a.critical/t)+'%"></i></span><span class="badges">'+(a.positive?'<b class="p" data-sent="positive">'+pc('positive')+'%</b>':'')+(a.neutral?'<b class="u" data-sent="neutral">'+pc('neutral')+'%</b>':'')+(a.critical?'<b class="c" data-sent="critical">'+pc('critical')+'%</b>':'')+'</span></button></td>'})()+'</tr>'}).join('')||'<tr><td colspan="9" class="empty">No past editions yet — run the backfill.</td></tr>';
  $$('#mbody .cell').forEach(function(b){b.onclick=function(ev){var s=ev.target.closest('b[data-sent]');drill(b.getAttribute('data-file'),b.getAttribute('data-cat'),s?s.getAttribute('data-sent'):'')}})}
 $$('[data-dash]').forEach(function(b){b.onclick=function(){var w=b.getAttribute('data-dash')==='week';$('#dash-today').hidden=w;$('#dash-week').hidden=!w;$('#dashtitle').textContent=w?'Last 7 days':'Today at a glance';$$('[data-dash]').forEach(function(x){x.setAttribute('aria-pressed',x===b)});if(w)matrix();try{localStorage.setItem('dash',w?'week':'today')}catch(e){}}});
 try{if(localStorage.getItem('dash')==='week')$('[data-dash=week]').click()}catch(e){}
@@ -429,6 +446,7 @@ $('#send-missing').onclick=function(ev){ev.preventDefault();var u=$('#m-url').va
 function toast(m){var t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.remove()},3500)}
 if(!FB){$('#open-missing').hidden=true}
 fillPickers();render();matrix();setView(state.view);
+var h=location.hash.match(/^#story-(\d+)$/);if(h)setTimeout(function(){jump(h[1])},300);
 })();
 """
 
@@ -449,7 +467,7 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <div class="callout" id="summary" hidden><h2>60-second briefing · tap a section to jump to its stories</h2><div class="sgs"></div></div>
 <div class="dash" id="dashboard"><h2><span id="dashtitle">Today at a glance</span><span class="seg"><button type="button" class="btn sm" data-dash="today" aria-pressed="true">Today</button><button type="button" class="btn sm" data-dash="week" aria-pressed="false">7 days</button></span></h2>
 <div id="dash-today"><table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table><p class="hint">Tap a number to filter the stories below.</p></div>
-<div id="dash-week" hidden><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. Tap a cell to open that day filtered to that section; tap a badge for one sentiment.</p></div></div>
+<div id="dash-week" hidden><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. The All column stacks the whole day. Tap a cell to open that day filtered to that section; tap a badge for one sentiment.</p></div></div>
 <div class="filterbar" id="filterbar"><span id="filterlabel"></span><button type="button" class="btn" id="clear">Show all</button></div>
 <nav class="chips" id="chips"></nav>
 <div id="content"></div><p class="empty" id="nohit" hidden>No stories match.</p>

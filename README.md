@@ -18,8 +18,8 @@ The Telegram brief carries only what is new since the last brief. The web page i
 `docs/index.html` is a small app that renders editions from `docs/data/`: `latest.json`
 (everything kept in the last 36 hours, up to 60 stories) and one file per IST day by
 publication date (kept 30 days; the picker offers 7). Each edition has a 60-second briefing with 2-3
-takeaways per section (tap a section to jump to its cards), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
-matrix (days × sections, sentiment bars; tap a cell to open that day filtered), expandable
+takeaways per section (tap a takeaway to jump to its card, which lights up; tap a section heading for the whole section), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
+matrix (days × sections, sentiment bars, and the whole day stacked in the *All* column; tap a cell to open that day filtered), expandable
 "+N more outlets" links on merged stories,
 search, cards/list, a slide-out menu, back-to-top, WhatsApp share per card, and reader
 feedback (👍/👎 and "Submit missing news") when `FEEDBACK_URL` is set — see `feedback.gs`.
@@ -29,6 +29,17 @@ All of it is committed to `main` after each real brief. Turn on GitHub Pages onc
 "Deploy from a branch", branch `main`, folder `/docs`. The page is public to anyone with
 the address (it carries `noindex`, so search engines are asked not to list it). A custom
 domain can be set on the same settings page.
+
+## How reports become one card
+
+Reports of one event are merged so a story appears once with its other outlets behind
+"+N more outlets". Merging is deliberately strict: Gemini's grouping and near-identical
+headlines only *propose* a link, and a link is accepted only when the two reports are within
+a day of each other, from different outlets, and share an identifying headline word (a name,
+a place, an organisation -- never a number or a date). A Tamil and an English report are
+merged only when Gemini grouped them, named the shared entities, and gave both the same
+category. Links never chain, a group Gemini proposes with more than 6 items is refused, and a
+card pools at most 8 reports, one per outlet. When in doubt, two cards.
 
 The database travels between runs as an encrypted run artifact (`state`, kept 3
 days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
