@@ -24,6 +24,10 @@ on:
         description: "Only print the brief on the run page; send nothing, mark nothing"
         type: boolean
         default: false
+      backfill_days:
+        description: "Instead of a brief: write web editions for this many past days (0 = normal brief)"
+        type: string
+        default: "0"
 
 permissions:
   contents: write                 # commits docs/ (the web page) to main
@@ -73,8 +77,12 @@ jobs:
           FEEDBACK_CSV_URL: ${{ secrets.FEEDBACK_CSV_URL }}
         run: |
           python collect.py --init
-          python digest.py --slot "${{ github.event.inputs.slot || 'auto' }}" \
-            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+          if [ "${{ github.event.inputs.backfill_days || '0' }}" != "0" ]; then
+            python digest.py --backfill "${{ github.event.inputs.backfill_days }}"
+          else
+            python digest.py --slot "${{ github.event.inputs.slot || 'auto' }}" \
+              ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+          fi
 
       - name: Publish the web page (docs/ -> GitHub Pages)
         if: github.event.inputs.dry_run != 'true'
