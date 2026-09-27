@@ -66,6 +66,11 @@ jobs:
           KEYWORDS_CSV_URL: ${{ secrets.KEYWORDS_CSV_URL }}
           DIGEST_MAX: ${{ vars.DIGEST_MAX }}
           DIGEST_PER_CATEGORY: ${{ vars.DIGEST_PER_CATEGORY }}
+          DIGEST_WEB_MAX: ${{ vars.DIGEST_WEB_MAX }}
+          DIGEST_WEB_PER_CATEGORY: ${{ vars.DIGEST_WEB_PER_CATEGORY }}
+          DIGEST_WEB_HOURS: ${{ vars.DIGEST_WEB_HOURS }}
+          FEEDBACK_URL: ${{ vars.FEEDBACK_URL }}
+          FEEDBACK_CSV_URL: ${{ secrets.FEEDBACK_CSV_URL }}
         run: |
           python collect.py --init
           python digest.py --slot "${{ github.event.inputs.slot || 'auto' }}" \
