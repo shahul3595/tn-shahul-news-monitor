@@ -10,7 +10,15 @@ twice a day.
 |---|---|---|
 | 1 - GitHub test run | by hand | checks that GitHub's servers can reach the feeds and sites; stores nothing |
 | 2 - Collect news | every 30 min | restores the database, collects and scores, saves the database again |
-| 3 - Telegram brief | ~07:00 and ~18:00 IST | ranks what was collected since the last brief (Gemini, or the keyword rules as fallback), posts up to 30 items to Telegram |
+| 3 - Telegram brief | ~07:00 and ~18:00 IST | ranks what was collected since the last brief (Gemini, or the keyword rules as fallback), posts up to 30 items to Telegram, and publishes the same brief as a web page in `docs/` |
+
+## The web page
+
+Each brief is also written to `docs/index.html` (latest) and `docs/briefs/<date>-<slot>.html`
+(last 30) and committed to `main`. Turn on GitHub Pages once: Settings → Pages → Source
+"Deploy from a branch", branch `main`, folder `/docs`. The page is public to anyone with
+the address (it carries `noindex`, so search engines are asked not to list it). A custom
+domain can be set on the same settings page.
 
 The database travels between runs as an encrypted run artifact (`state`, kept 3
 days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off

@@ -30,6 +30,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -51,6 +52,8 @@ log = logging.getLogger("collect.digest")
 CATEGORIES = ["mention", "constituency", "district", "portfolio", "political", "opportunity"]
 LABELS = {"mention": "MENTIONS", "constituency": "VELACHERY", "district": "THIRUVALLUR",
           "portfolio": "AI / IT / DIGITAL", "political": "POLITICAL", "opportunity": "OPPORTUNITIES"}
+NICE = {"mention": "Mentions", "constituency": "Velachery", "district": "Thiruvallur",
+        "portfolio": "AI / IT / Digital", "political": "Political", "opportunity": "Opportunities"}
 ICONS = {"mention": "🗣", "constituency": "📍", "district": "🏛", "portfolio": "💻",
          "political": "🏳", "opportunity": "🎯"}
 URGENT_CATEGORIES = ("constituency", "district")
@@ -60,7 +63,7 @@ MAX_TOTAL = PER_CATEGORY * len(CATEGORIES)
 PUBLISHED_WITHIN_H = 36       # a 14-day query can surface old stories; the brief is about now
 WINDOW_CAP_H = 48             # never look further back than this, even on the first send
 AI_MAX_CALLS_PER_DAY = 40
-AI_BATCH = 30                 # items per Gemini call
+AI_BATCH = 60                 # items per Gemini call (~25k tokens with Tamil)
 AI_PAUSE_S = 4.0              # free tier is per-minute limited
 AI_TIME_BUDGET_S = 420        # after this, the rest is ranked by the rules
 SNIPPET_CHARS = 220
@@ -120,7 +123,9 @@ CAND_SQL = """
 SELECT i.id, i.title, i.description, i.publisher, i.published_at, i.discovered_at, i.rules_at,
        i.resolve_status, i.resolved_url, i.link, i.extract_host, i.extract_status, i.extract_text,
        i.score, i.band, i.urgent, i.target_tags, i.matched_terms, i.event_id,
-       i.ai_category, i.ai_priority, i.ai_reason, i.ai_processed_at, s.name AS source_name
+       i.ai_category, i.ai_priority, i.ai_reason, i.ai_processed_at, i.image_url,
+       CASE WHEN i.raw_payload LIKE '%youtube_api%' THEN i.raw_payload END AS yt_payload,
+       s.name AS source_name
 FROM items i LEFT JOIN sources s ON s.source_id = i.source_id
 WHERE i.digested_at IS NULL
   AND i.rules_at IS NOT NULL AND i.rules_at >= ?
@@ -130,23 +135,88 @@ ORDER BY i.id
 """
 
 
+_PUNCT = re.compile(r"[^\w\s஀-௿]+")
+
+
+def norm_title(title, publisher=""):
+    """For grouping: outlet suffix off, ASCII lowercased, punctuation and zero-width marks out."""
+    t = rules.norm_match(rules.clean_title(title or "", publisher or ""))
+    return " ".join(_PUNCT.sub(" ", t).split())
+
+
+TITLE_SIM = 0.5               # 4-gram Jaccard on normalised titles; well above the 0.35 "topic" band
+
+
+class _Union:
+    def __init__(self, n):
+        self.p = list(range(n))
+
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def join(self, a, b):
+        a, b = self.find(a), self.find(b)
+        if a != b:
+            self.p[a] = b
+
+
+def _merge(cands, links):
+    """Collapse candidates into stories. links(i, j) -> True when two are the same story.
+    The representative is the best-ranked report; outlets are pooled."""
+    n = len(cands)
+    u = _Union(n)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if links(cands[i], cands[j]):
+                u.join(i, j)
+    groups = defaultdict(list)
+    for i, c in enumerate(cands):
+        groups[u.find(i)].append(c)
+    out = []
+    for members in groups.values():
+        rep = max(members, key=lambda c: (-(c.get("priority") or 9), c.get("urgent") or 0, c.get("score") or 0,
+                                           c.get("published_at") or ""))
+        rep["sources"] = list(dict.fromkeys(s for m in members for s in m.get("sources") or []))
+        rep["merged"] = [m["id"] for m in members]
+        out.append(rep)
+    return out
+
+
 def candidates(con, now):
     last = parse_ts(rt_get(con, "last_digest_at"))
     since = max(now - timedelta(hours=WINDOW_CAP_H), last) if last else now - timedelta(hours=WINDOW_CAP_H)
     pub_since = now - timedelta(hours=PUBLISHED_WITHIN_H)
     rows = con.execute(CAND_SQL, (iso(since), iso(pub_since))).fetchall()
-    # one per story: the event's best-scored, then most recent, report
-    groups = defaultdict(list)
+    cands = []
     for r in rows:
-        groups[r["event_id"] if r["event_id"] is not None else f"item:{r['id']}"].append(r)
-    reps, all_ids = [], [r["id"] for r in rows]
-    for members in groups.values():
-        rep = max(members, key=lambda r: (r["urgent"] or 0, r["score"] or 0, r["published_at"] or ""))
-        d = dict(rep)
-        d["sources"] = list(dict.fromkeys(alerts.outlet_name(m) for m in members))
-        d["tags"] = alerts._j(rep["target_tags"], [])
-        reps.append(d)
-    return reps, all_ids, since
+        d = dict(r)
+        d["sources"] = [alerts.outlet_name(r)]
+        d["tags"] = alerts._j(r["target_tags"], [])
+        d["ntitle"] = norm_title(r["title"], r["publisher"])
+        d["tgrams"] = frozenset(rules.sim_grams(d["ntitle"])) if len(d["ntitle"]) >= 12 else frozenset()
+        cands.append(d)
+    # Same event (body match), or the same headline word for word: one story. The same-outlet
+    # copies and Tamil/English pairs that the body match cannot join are caught here.
+    reps = _merge(cands, lambda a, b: (a["event_id"] is not None and a["event_id"] == b["event_id"])
+                  or (len(a["ntitle"]) >= 12 and a["ntitle"] == b["ntitle"]))
+    return reps, [r["id"] for r in rows], since
+
+
+def merge_stories(cands):
+    """After ranking: Gemini's story numbers and near-identical headlines finish the job, so
+    one event framed three ways by three outlets is one candidate with one category."""
+    def same(a, b):
+        if a.get("story") and a.get("story") == b.get("story"):
+            return True
+        if a["tgrams"] and b["tgrams"] and len(a["ntitle"]) >= 25 and len(b["ntitle"]) >= 25:
+            pa, pb = parse_ts(a["published_at"]), parse_ts(b["published_at"])
+            close = not (pa and pb) or abs((pa - pb).total_seconds()) <= 24 * 3600
+            return close and rules.jaccard(a["tgrams"], b["tgrams"]) >= TITLE_SIM
+        return False
+    return _merge(cands, same)
 
 
 # --------------------------------------------------------------------------
@@ -181,7 +251,14 @@ his areas), 2 standard news worth reading today, 3 background.
 Rules: a story about another district's collector or another state's IT minister is "none".
 Local murders, fatal accidents and major protests in Velachery or Thiruvallur are never "none".
 If your reason says the item is generic, unclear or has no link to him or his areas, the
-category must be "none". Return one object per item, using the item numbers given.
+category must be "none".
+
+Also give each item a "story" number: items that report the SAME event -- the same
+inauguration, statement, incident or announcement, in Tamil or English, however differently
+headlined -- share one story number (use the number of the first such item). An item about
+its own event gets its own number.
+
+Return one object per item, using the item numbers given.
 
 ITEMS:
 {payload}"""
@@ -192,8 +269,9 @@ RESPONSE_SCHEMA = {
         "n": {"type": "INTEGER"},
         "category": {"type": "STRING", "enum": CATEGORIES + ["none"]},
         "priority": {"type": "INTEGER"},
-        "reason": {"type": "STRING"}},
-        "required": ["n", "category", "priority", "reason"]},
+        "reason": {"type": "STRING"},
+        "story": {"type": "INTEGER"}},
+        "required": ["n", "category", "priority", "reason", "story"]},
 }
 
 
@@ -278,7 +356,12 @@ class Gemini:
                             pri = min(3, max(1, int(it.get("priority", 2))))
                         except (TypeError, ValueError):
                             pri = 2
-                        out[batch[i]["id"]] = (cat, pri, str(it.get("reason", ""))[:200])
+                        try:
+                            story = int(it.get("story") or 0)
+                        except (TypeError, ValueError):
+                            story = 0
+                        out[batch[i]["id"]] = (cat, pri, str(it.get("reason", ""))[:200],
+                                               f"{self.calls}:{story}" if story else None)
                 return out
             except Exception as ex:
                 log.warning(f"gemini: attempt {attempt + 1}: {type(ex).__name__}: {str(ex)[:100]}")
@@ -318,7 +401,7 @@ def rank_all(con, cands, gemini, now):
                                                                   c["ai_reason"] or "", "gemini (cached)")
         else:
             todo.append(c)
-    st = Counter()
+    st = Counter(cached=len(cands) - len(todo)) if len(cands) > len(todo) else Counter()
     if gemini is not None:
         for k in range(0, len(todo), AI_BATCH):
             batch = todo[k:k + AI_BATCH]
@@ -327,7 +410,7 @@ def rank_all(con, cands, gemini, now):
                 break
             for c in batch:
                 if c["id"] in res:
-                    c["category"], c["priority"], c["reason"] = res[c["id"]]
+                    c["category"], c["priority"], c["reason"], c["story"] = res[c["id"]]
                     c["by"] = "gemini"
                     con.execute("""UPDATE items SET ai_category=?, ai_priority=?, ai_reason=?, ai_model=?,
                                    ai_processed_at=? WHERE id=?""",
@@ -452,12 +535,131 @@ def build(con, env, now, slot, transport_client=None):
     if key and cands:
         gemini = Gemini(key, cfg["model"], con, cfg["ai_calls"], transport_client)
     st = rank_all(con, cands, gemini, now)
+    before = len(cands)
+    cands = merge_stories(cands)
+    st["merged"] = before - len(cands)
     urgent, sections, leftovers = select(cands, cfg["per"], cfg["max"])
     chosen = urgent + [c for cat in CATEGORIES for c in sections[cat]]
     messages = render(slot, now, urgent, sections, len(chosen), len(cands), bool(st.get("gemini")))
     return {"cands": cands, "all_ids": all_ids, "since": since, "chosen": chosen, "leftovers": leftovers,
+            "urgent": urgent, "sections": sections,
             "messages": messages, "stats": st, "ai_calls": gemini.calls if gemini else 0,
             "ai_note": gemini.dead if gemini else ("no GEMINI_API_KEY" if not key else None)}
+
+
+# --------------------------------------------------------------------------
+# 4b. the web page (GitHub Pages serves docs/)
+# --------------------------------------------------------------------------
+
+DOCS = HERE / "docs"
+ARCHIVE_KEEP = 30
+
+PAGE_CSS = """
+:root{--bg:#f4f5f7;--card:#fff;--ink:#17191c;--dim:#667085;--line:#e4e7ec;--accent:#1d4e89;--urgent:#b42318;
+--chip:#eef2f7;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Tamil","Noto Sans",sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#111417;--card:#1a1f24;--ink:#e8ecef;--dim:#98a2b3;--line:#2a323b;--chip:#232a32}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45}
+.wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
+header h1{font-size:22px;margin:0}header .sub{color:var(--dim);font-size:14px;margin:4px 0 14px}
+nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}
+nav a{font-size:13px;padding:5px 10px;border:1px solid var(--line);border-radius:999px;color:var(--ink);text-decoration:none;background:var(--card)}
+nav a b{color:var(--dim);font-weight:500}
+section{margin:0 0 26px}section h2{font-size:15px;letter-spacing:.04em;text-transform:uppercase;margin:0 0 10px;color:var(--dim)}
+section.urgent h2{color:var(--urgent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+.card img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;background:var(--chip)}
+.card .body{padding:12px 14px 14px;display:flex;flex-direction:column;gap:6px;flex:1}
+.card h3{font-size:16px;margin:0;line-height:1.35}.card h3 a{color:var(--ink);text-decoration:none}.card h3 a:hover{text-decoration:underline}
+.card p{margin:0;color:var(--dim);font-size:14px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:auto;padding-top:6px;font-size:12px;color:var(--dim)}
+.chip{background:var(--chip);border-radius:999px;padding:2px 8px;color:var(--ink)}
+.chip.u{background:var(--urgent);color:#fff}.chip.src{border:1px solid var(--line);background:transparent}
+.more{font-size:12px;color:var(--dim)}
+footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
+footer ul{columns:2;padding-left:18px;margin:6px 0 0}footer a{color:var(--accent)}
+@media(max-width:600px){.grid{grid-template-columns:1fr}footer ul{columns:1}}
+"""
+
+
+def _image_for(c):
+    if c.get("image_url"):
+        return c["image_url"]
+    if c.get("yt_payload"):
+        try:
+            th = (json.loads(c["yt_payload"]).get("snippet") or {}).get("thumbnails") or {}
+            for k in ("medium", "high", "default"):
+                if th.get(k, {}).get("url"):
+                    return th[k]["url"]
+        except ValueError:
+            pass
+    return None
+
+
+def _card(c, urgent=False):
+    url = alerts.display_url(c)
+    img = _image_for(c)
+    when = fmt_ist(c["published_at"] or c["discovered_at"])
+    extra = f'<span class="more">+{len(c["sources"]) - 1} more outlets</span>' if len(c.get("sources") or []) > 1 else ""
+    chips = ('<span class="chip u">URGENT</span>' if urgent else f'<span class="chip">{esc(NICE[c["category"]])}</span>')
+    return ('<article class="card">'
+            + (f'<a href="{esc_attr(url)}" target="_blank" rel="noopener"><img src="{esc_attr(img)}" alt="" loading="lazy" '
+               f'referrerpolicy="no-referrer" onerror="this.remove()"></a>' if img else "")
+            + f'<div class="body"><h3><a href="{esc_attr(url)}" target="_blank" rel="noopener">{esc(_title(c))}</a></h3>'
+            + (f'<p>{esc(_snippet(c))}</p>' if _snippet(c) else "")
+            + f'<div class="meta">{chips}<span class="chip src">{esc(alerts.outlet_name(c))}</span>'
+            + f'<span>{esc(when)}</span>{extra}</div></div></article>')
+
+
+def render_page(slot, now, urgent, sections, n_total, n_cands, archive_links=()):
+    day = now.astimezone(IST)
+    title = f"{'Morning' if slot == 'morning' else 'Evening'} brief · {day.day} {day:%b %Y}"
+    nav, body = [], []
+    if urgent:
+        nav.append(f'<a href="#urgent">🚨 Urgent <b>{len(urgent)}</b></a>')
+        body.append('<section class="urgent" id="urgent"><h2>🚨 Urgent</h2><div class="grid">'
+                    + "".join(_card(c, urgent=True) for c in urgent) + "</div></section>")
+    for cat in CATEGORIES:
+        items = sections.get(cat) or []
+        if items:
+            nav.append(f'<a href="#{cat}">{ICONS[cat]} {esc(NICE[cat])} <b>{len(items)}</b></a>')
+            body.append(f'<section id="{cat}"><h2>{ICONS[cat]} {esc(LABELS[cat])}</h2><div class="grid">'
+                        + "".join(_card(c) for c in items) + "</div></section>")
+    if not body:
+        body.append("<section><p>Nothing worth reporting since the last brief.</p></section>")
+    arch = ""
+    if archive_links:
+        arch = "<p>Earlier briefs</p><ul>" + "".join(f'<li><a href="{esc_attr(h)}">{esc(t)}</a></li>'
+                                                     for t, h in archive_links) + "</ul>"
+    return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+            f'<title>{esc(title)}</title><style>{PAGE_CSS}</style></head><body><div class="wrap">'
+            f'<header><h1>{esc(title)}</h1><div class="sub">{n_total} items · {n_cands} stories considered · '
+            f'generated {esc(fmt_ist(iso(now)))}</div></header><nav>{"".join(nav)}</nav>{"".join(body)}'
+            f'<footer>{arch}</footer></div></body></html>')
+
+
+def write_pages(b, slot, now, docs=None):
+    """docs/index.html is the latest brief; docs/briefs/<date>-<slot>.html keeps the last 30."""
+    docs = Path(docs or DOCS)
+    briefs = docs / "briefs"
+    briefs.mkdir(parents=True, exist_ok=True)
+    (docs / ".nojekyll").touch()
+    day = now.astimezone(IST)
+    name = f"{day:%Y-%m-%d}-{slot}.html"
+    urgent, sections = b["urgent"], b["sections"]
+    page = render_page(slot, now, urgent, sections, len(b["chosen"]), len(b["cands"]))
+    (briefs / name).write_text(page, encoding="utf-8")
+    old = sorted(briefs.glob("*.html"), reverse=True)
+    for p in old[ARCHIVE_KEEP:]:
+        p.unlink()
+    links = []
+    for p in old[:ARCHIVE_KEEP]:
+        d, _, s = p.stem.rpartition("-")
+        links.append((f"{d} {s}", f"briefs/{p.name}"))
+    (docs / "index.html").write_text(
+        render_page(slot, now, urgent, sections, len(b["chosen"]), len(b["cands"]), links), encoding="utf-8")
+    return docs / "index.html"
 
 
 def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=None):
@@ -472,7 +674,8 @@ def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=N
              + ", ".join(f"{k} {v}" for k, v in b["stats"].items())
              + (f"; gemini note: {b['ai_note']}" if b["ai_note"] else ""))
     if dry_run:
-        log.info("digest: DRY RUN -- nothing sent, nothing marked")
+        write_pages(b, slot, now)
+        log.info("digest: DRY RUN -- nothing sent, nothing marked; web page written to docs/ for preview")
         return b
     tr = alerts.make_transport(env, client) if transport == "auto" else transport
     if tr is None:
@@ -511,7 +714,28 @@ def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=N
     con.commit()
     log.info(f"digest: sent {len(b['messages'])} message(s), {len(b['chosen'])} items; "
              f"{len(b['all_ids'])} items marked as covered")
+    try:
+        write_pages(b, slot, now)
+        log.info("digest: web page written to docs/index.html")
+    except Exception:
+        log.exception("digest: could not write the web page (the brief itself was sent)")
     return b
+
+
+def diagnostics(b):
+    st = b["stats"]
+    live, cached, by_rules = st.get("gemini", 0), st.get("cached", 0), st.get("rules", 0)
+    status = "not used (no GEMINI_API_KEY)" if b["ai_note"] == "no GEMINI_API_KEY" else \
+             (f"stopped early: {b['ai_note']}" if b["ai_note"] else ("ok" if live or cached else "nothing to rank"))
+    return "\n".join([
+        "### Brief diagnostics", "",
+        "| | |", "|---|---|",
+        f"| Items in the window | {len(b['all_ids'])} |",
+        f"| Stories after merging same-event / same-headline reports | {len(b['cands'])} (merged away {st.get('merged', 0)} more after ranking) |",
+        f"| Ranked by Gemini | {live} live, {cached} cached |",
+        f"| Ranked by keyword rules (fallback) | {by_rules} |",
+        f"| Gemini calls this run | {b['ai_calls']} — {status} |",
+        f"| Chosen for the brief | {len(b['chosen'])} (left out: {len(b['leftovers'])}) |", ""])
 
 
 def status_lines(con, env, now=None):
@@ -549,7 +773,7 @@ def main():
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with open(summary, "a", encoding="utf-8") as f:
-                f.write("```\n" + "\n\n".join(alerts.html_to_plain(m) for m in b["messages"]) + "\n```\n")
+                f.write(diagnostics(b) + "\n```\n" + "\n\n".join(alerts.html_to_plain(m) for m in b["messages"]) + "\n```\n")
         return 0
     finally:
         con.close()

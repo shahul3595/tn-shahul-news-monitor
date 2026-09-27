@@ -45,6 +45,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlparse
 
+from html import unescape as html_unescape
+
 import httpx
 import feedparser
 import trafilatura
@@ -816,6 +818,23 @@ def drain_resolver(con, budget_s, tick=None):
 # fetch + extract
 # --------------------------------------------------------------------------
 
+_OG = (re.compile(r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)', re.I),
+       re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']', re.I),
+       re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)', re.I))
+
+
+def og_image(html_text):
+    """The article's lead image, for the web page. Head only: it is in the first few KB."""
+    head = (html_text or "")[:60000]
+    for rx in _OG:
+        m = rx.search(head)
+        if m:
+            u = html_unescape(m.group(1).strip())
+            if u.startswith("http") and len(u) < 600:
+                return u
+    return None
+
+
 def drain_extractor(con, client, budget_s, tick=None):
     deadline = time.time() + budget_s
     ok = thin = failed = skipped = 0
@@ -870,6 +889,7 @@ def drain_extractor(con, client, budget_s, tick=None):
         text = ""
         err_type = err_text = None
         html = ""
+        image = None
         try:
             r = client.get(url, headers=BROWSER_HEADERS)
             http_status = r.status_code
@@ -884,6 +904,7 @@ def drain_extractor(con, client, budget_s, tick=None):
                                            include_tables=False) or ""
                 chars = len(text)
                 status = "OK" if chars >= THIN_TEXT_CHARS else ("THIN" if chars else "FAILED")
+                image = og_image(html)
         except Exception as ex:
             err_type, err_text = type(ex).__name__, str(ex)
         ms = int((time.time() - t0) * 1000)
@@ -893,6 +914,11 @@ def drain_extractor(con, client, budget_s, tick=None):
                        extract_attempts=extract_attempts+1 WHERE id=?""",
                     (status, host, http_status, chars, text or None, ms, item_id))
         record_attempt(con, item_id, "fetch", status == "OK", http_status, err_type, err_text, ms)
+        if image:
+            try:
+                con.execute("UPDATE items SET image_url=? WHERE id=?", (image, item_id))
+            except sqlite3.OperationalError:
+                pass                                    # column arrives with the next --init
 
         # keep the page only when we could not read it (and not on a machine nobody inspects)
         if status in ("FAILED", "THIN") and html and keep_html:

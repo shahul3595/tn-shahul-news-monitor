@@ -116,14 +116,30 @@ class FakeGemini:
                 if t.lower().startswith(k[:3]):
                     cat = k
             pri = 1 if "!" in t else (3 if "~" in t else 2)
-            out[c["id"]] = (cat, pri, "fake reason")
+            m = re.search(r"#(\d+)", t)                       # '#7' in a title = story number 7
+            out[c["id"]] = (cat, pri, "fake reason", f"{self.calls}:{m.group(1)}" if m else None)
         return out
+
+
+WORDS = ("lake road bridge sewage metro school hospital market temple bus drain power water rain tender "
+         "canal flyover garbage clinic library station stadium beach park bank".split())
+
+
+def t(prefix, i):
+    """Distinct synthetic headlines: similar-looking titles would otherwise merge as one
+    story, which is exactly what the merge tests check."""
+    import random
+    words = random.Random(f"{prefix}-{i}").sample(WORDS, 6)
+    return f"{prefix} story {i}: " + " ".join(words)
 
 
 def build(con, gemini, now=None, per=5, total=30):
     now = now or T0
     cands, all_ids, since = digest.candidates(con, now)
     st = digest.rank_all(con, cands, gemini, now)
+    before = len(cands)
+    cands = digest.merge_stories(cands)
+    st["merged"] = before - len(cands)
     urgent, sections, left = digest.select(cands, per, total)
     chosen = urgent + [c for cat in digest.CATEGORIES for c in sections[cat]]
     return cands, chosen, urgent, sections, left, st
@@ -135,13 +151,13 @@ def build(con, gemini, now=None, per=5, total=30):
 def five_per_category_then_the_balance_goes_elsewhere():
     con = make_db("select.db")
     for i in range(9):
-        add(con, f"Con story {i}")            # constituency: 9 candidates
+        add(con, t("Con", i))            # constituency: 9 candidates
     for i in range(2):
-        add(con, f"Dis story {i}")            # district: 2
+        add(con, t("Dis", i))            # district: 2
     for i in range(12):
-        add(con, f"Por story {i}")            # portfolio: 12
+        add(con, t("Por", i))            # portfolio: 12
     for i in range(3):
-        add(con, f"Non story {i}")            # none: never shown
+        add(con, t("Non", i))            # none: never shown
     cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), total=15)
     counts = {k: len(v) for k, v in sections.items() if v}
     check(len(chosen) == 15, f"total capped at 15, got {len(chosen)}")
@@ -161,7 +177,7 @@ def urgent_civic_items_go_on_top_and_priority_3_only_fills_gaps():
     add(con, "Con story calm")
     add(con, "Por~ background piece")
     for i in range(6):
-        add(con, f"Dis story {i}")
+        add(con, t("Dis", i))
     cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), per=5, total=9)
     check([c["id"] for c in urgent] == [a], "the flood is the urgent block")
     check(a not in [c["id"] for c in sections["constituency"]], "and not repeated in its section")
@@ -183,7 +199,7 @@ def urgent_civic_items_go_on_top_and_priority_3_only_fills_gaps():
 def nothing_repeats_across_sends_and_unchosen_items_are_not_carried_over():
     con = make_db("repeat.db")
     for i in range(8):
-        add(con, f"Con story {i}")
+        add(con, t("Con", i))
     rec = alerts.Recorder()
     env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
     saved = digest.Gemini
@@ -251,10 +267,72 @@ def one_story_per_event_with_a_source_count():
 
 
 @test
+def same_headline_and_same_story_collapse_to_one_candidate():
+    con = make_db("merge.db")
+    # word-for-word the same headline from two feeds, different urls, no event
+    add(con, "Con story: Metro line to Velachery opens on Oct 11", host="etvbharat.com")
+    add(con, "Con story: Metro line to Velachery opens on Oct 11", host="etvbharat.com")
+    add(con, "Con story: Metro line to Velachery opens on Oct 11 - ETV Bharat", host="dinamani.com")
+    cands, *_ = digest.candidates(con, T0)
+    check(len(cands) == 1 and len(cands[0]["sources"]) == 2, f"one story, outlets pooled: {len(cands)}")
+    # near-identical headlines merge; Gemini's story number merges the differently framed one
+    con = make_db("merge2.db")
+    add(con, "Dis story #4: PM inaugurates Chennai Metro extension to Poonamallee", host="thehindu.com")
+    add(con, "Dis story #4: PM inaugurates Chennai Metro extension to Poonamallee today", host="dtnext.in")
+    add(con, "Pol story #4: Opposition slams timing of Metro launch", host="news18.com")
+    add(con, "Opp story: StartupTN summit", host="yourstory.com")
+    cands, chosen, urgent, sections, left, st = build(con, FakeGemini())
+    check(len(cands) == 2, f"two stories after merging: {[c['title'] for c in cands]}")
+    metro = next(c for c in cands if "Metro" in c["title"])
+    check(len(metro["sources"]) == 3, "three outlets pooled")
+    check(sum(len(v) for v in sections.values()) + len(urgent) == 2, "and the story appears once, in one category")
+    check(st["merged"] == 2, st)
+    # a real story is never swallowed by a merely similar-topic headline
+    con = make_db("merge3.db")
+    add(con, "Con story: Velachery lake desilting begins", host="thehindu.com")
+    add(con, "Con story: Velachery flyover work delayed", host="dtnext.in")
+    cands, *_ = digest.candidates(con, T0)
+    cands = digest.merge_stories(cands)
+    check(len(cands) == 2, "different stories stay separate")
+
+
+@test
+def the_web_page_is_written_with_cards_images_and_escaping():
+    import shutil
+    con = make_db("page.db")
+    a = add(con, "Con! <Flood> & drains in Velachery", body="வேளச்சேரியில் மழைநீர் தேங்கியது. " * 20)
+    con.execute("UPDATE items SET image_url='https://img.example.com/flood.jpg?a=1&b=2' WHERE id=?", (a,))
+    con.execute("""UPDATE items SET raw_payload=?, resolved_url='https://www.youtube.com/watch?v=abcdefghijk'
+                   WHERE id=?""", (json.dumps({"via": "youtube_api", "snippet": {"thumbnails": {"medium": {"url": "https://i.ytimg.com/vi/x/mq.jpg"}}}}),
+                                    add(con, "Por story video", host="youtube.com")))
+    con.commit()
+    docs = TMP / "docs"
+    shutil.rmtree(docs, ignore_errors=True)
+    saved = digest.Gemini
+    digest.Gemini = lambda *a, **k: FakeGemini()
+    try:
+        b = digest.run(con, {"GEMINI_API_KEY": "x"}, now=T0, slot="morning", dry_run=True)
+        digest.write_pages(b, "morning", T0, docs)
+        digest.write_pages(b, "evening", T0 + timedelta(hours=11), docs)
+    finally:
+        digest.Gemini = saved
+    html = (docs / "index.html").read_text(encoding="utf-8")
+    check("&lt;Flood&gt; &amp; drains" in html and "<Flood>" not in html, "escaped headline")
+    check('src="https://img.example.com/flood.jpg?a=1&amp;b=2"' in html, "og:image thumbnail")
+    check("i.ytimg.com" in html, "youtube thumbnail from the API payload")
+    check('class="chip u">URGENT' in html, "urgent chip")
+    check("2026-10-15-morning.html" in html and "2026-10-15-evening.html" in html, "archive links")
+    check((docs / ".nojekyll").exists() and (docs / "briefs" / "2026-10-15-morning.html").exists())
+    check("<script" not in html, "no scripts")
+
+
+@test
 def rendering_escapes_html_and_stays_under_the_limit():
     con = make_db("render.db")
     for i in range(30):
-        add(con, f"Con story {i}: " + "வேளச்சேரியில் <கனமழை> & \"மழைநீர்\" தேங்கியது " * 3,
+        add(con, t("Con", i) + f": வேளச்சேரியில் <கனமழை> {i} & \"மழைநீர்\" தேங்கியது " + " ".join(
+            __import__("random").Random(i).sample(["ஏரி", "சாலை", "பாலம்", "கழிவுநீர்", "மெட்ரோ", "பள்ளி", "மருத்துவமனை",
+                                                    "சந்தை", "கோயில்", "பேருந்து", "வடிகால்", "மின்சாரம்", "தண்ணீர்", "மழை"], 8)),
             body="x" * 500)
     cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), per=30, total=30)
     msgs = digest.render("morning", T0, urgent, sections, len(chosen), len(cands), True)
