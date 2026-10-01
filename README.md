@@ -16,11 +16,11 @@ twice a day.
 
 The Telegram brief carries only what is new since the last brief. The web page is different:
 `docs/index.html` is a small app that renders editions from `docs/data/`: `latest.json`
-(everything kept in the last 36 hours, up to 60 stories) and one file per IST day by
+(everything kept in the last 24 hours, up to 60 stories) and one file per IST day by
 publication date (kept 30 days; the picker offers 7). Each edition has a 60-second briefing with 2-3
 takeaways per section (tap a takeaway to jump to its card, which lights up; tap a section heading for the whole section), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
 matrix (days × sections with sentiment bars and 🟢 ⚪ 🔴 counts, the whole day in the *All* column; tap a count for that day and section, a badge for one sentiment of it, the day for all of it), expandable
-"+N more outlets" links on merged stories,
+"+N more outlets" links on merged stories, two AI notes on every card (📝 Notes toggle hides them for a compact view), a ☑ Select mode that bundles chosen stories into one numbered WhatsApp message (with or without the notes, also for the per-card 📲 share),
 search (headlines, summaries, outlets), cards/list, a slide-out menu, back-to-top, WhatsApp share per card, and reader
 feedback (👍/👎 and "Submit missing news") when `FEEDBACK_URL` is set — see `feedback.gs`.
 Every run rebuilds `latest`, today and yesterday. `python digest.py --backfill 7` (or the
@@ -33,13 +33,17 @@ domain can be set on the same settings page.
 ## How reports become one card
 
 Reports of one event are merged so a story appears once with its other outlets behind
-"+N more outlets". Merging is deliberately strict: Gemini's grouping and near-identical
-headlines only *propose* a link, and a link is accepted only when the two reports are within
-a day of each other, from different outlets, and share an identifying headline word (a name,
-a place, an organisation -- never a number or a date). A Tamil and an English report are
-merged only when Gemini grouped them, named the shared entities, and gave both the same
-category. Links never chain, a group Gemini proposes with more than 6 items is refused, and a
-card pools at most 8 reports, one per outlet. When in doubt, two cards.
+"+N more outlets". Gemini groups the edition's items and must name the entities each group
+shares; a group whose names do not occur in a member is thinned or refused. Within one
+category a proven group is one card, however many outlets report it (ten reports of a Metro
+fare are one card: the fullest, latest report in front, up to 8 distinct outlets behind it,
+the rest absorbed). Across categories, and for Gemini's batch story numbers and near-identical
+headlines, the two reports must also share an identifying headline word (a name, a place, an
+organisation -- never a number or a date), and a Tamil/English pair must be in one category.
+Links never chain. An outlet's update on its own earlier report joins the same card. A story
+whose headline or body is 80% the same as one kept the day before is a re-run and is left
+out; a development on the same event (an arrest, an order, a statement) has its own headline
+and stays.
 
 The database travels between runs as an encrypted run artifact (`state`, kept 3
 days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
@@ -56,7 +60,7 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `GEMINI_API_KEY` | recommended | Gemini free tier; ranks the brief. Without it the keyword rules rank |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | yes, for the brief | the bot and the private channel. Without them the brief is only printed on the run page |
 
-Optional *variables* (Settings → Secrets and variables → Actions → Variables): `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (36), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
+Optional *variables* (Settings → Secrets and variables → Actions → Variables): `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (24), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
 
 ## Keeping the keyword list
 

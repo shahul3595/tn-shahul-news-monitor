@@ -10,7 +10,7 @@ digest.py -- the twice-daily Telegram brief (step 3).
 
 What it does, in order:
   1. Candidates: items scored since the last brief that the rules kept (or flagged
-     urgent), published within the last 36 hours, one per story (event).
+     urgent), published within the last 24 hours, one per story (event).
   2. Ranking: Gemini reads headline + first lines of each candidate and gives a
      category (mention, constituency, district, portfolio, political, opportunity,
      none) and a priority (1 urgent, 2 standard, 3 background). Without a key, over
@@ -66,8 +66,9 @@ URGENT_CATEGORIES = ("constituency", "district")
 
 PER_CATEGORY = 5              # first pass
 MAX_TOTAL = PER_CATEGORY * len(CATEGORIES)
-PUBLISHED_WITHIN_H = 36       # a 14-day query can surface old stories; the brief is about now
-WEB_WINDOW_H = 36             # the web page is a rolling edition of everything kept this recently
+PUBLISHED_WITHIN_H = 24       # a 14-day query can surface old stories; the brief is about now
+WEB_WINDOW_H = 24             # the web page is a rolling edition of everything kept this recently
+RERUN_SIM = 0.8               # a headline or body this close to one covered the day before is a re-run
 WEB_PER_CATEGORY = 10         # web page: 10 per category first, then fill to WEB_MAX (60)
 WINDOW_CAP_H = 48             # never look further back than this, even on the first send
 AI_MAX_CALLS_PER_DAY = 80     # a normal day uses ~10-15: ranking, one cluster and one summary per edition
@@ -85,7 +86,7 @@ SCHEMA = [
     "status TEXT, candidates INTEGER, chosen INTEGER, ai_calls INTEGER, message_ids TEXT, body TEXT)",
 ]
 ITEM_COLUMNS = [("digested_at", "TEXT"), ("digest_id", "INTEGER"), ("ai_sentiment", "TEXT"),
-                ("ai_impact", "INTEGER"), ("story_key", "TEXT")]
+                ("ai_impact", "INTEGER"), ("story_key", "TEXT"), ("ai_takeaways", "TEXT")]
 SENTIMENTS = ("positive", "neutral", "critical")
 
 
@@ -147,7 +148,7 @@ SELECT i.id, i.title, i.description, i.publisher, i.published_at, i.discovered_a
        i.resolve_status, i.resolved_url, i.link, i.extract_host, i.extract_status, i.extract_text,
        i.score, i.band, i.urgent, i.target_tags, i.matched_terms, i.event_id,
        i.ai_category, i.ai_priority, i.ai_reason, i.ai_processed_at, i.image_url,
-       i.ai_sentiment, i.ai_impact, i.story_key,
+       i.ai_sentiment, i.ai_impact, i.story_key, i.ai_takeaways,
        CASE WHEN i.raw_payload LIKE '%youtube_api%' THEN i.raw_payload END AS yt_payload,
        s.name AS source_name
 FROM items i LEFT JOIN sources s ON s.source_id = i.source_id
@@ -169,25 +170,31 @@ def norm_title(title, publisher=""):
 
 
 TITLE_SIM = 0.5               # 4-gram Jaccard on normalised titles; well above the 0.35 "topic" band
-STORY_MAX = 8                 # reports one card may pool; a bigger "story" is two stories mislabelled as one
+REPORTS_MAX = 8               # outlets shown behind a card; further reports are absorbed, never new cards
 
 
 def _best_first(c):
-    return (c.get("priority") or 9, -(c.get("urgent") or 0), -(c.get("score") or 0), c.get("published_at") or "")
+    """Priority, urgency and score first; among equals the fuller article, then the latest --
+    so the card's own link is the most detailed, most recent report of the story."""
+    ts = parse_ts(c.get("published_at"))
+    detail = len(c["extract_text"] or "") if c.get("extract_status") in ("OK", "THIN") and c.get("extract_text") else 0
+    return (c.get("priority") or 9, -(c.get("urgent") or 0), -(c.get("score") or 0), -detail, -(ts.timestamp() if ts else 0))
 
 
-def _merge(cands, links, cap=STORY_MAX):
+def _merge(cands, links):
     """Collapse candidates into stories. links(rep, c) -> True when c reports rep's story.
 
     Anchored, not transitive: candidates are taken best first, and each one joins the first
     story whose REPRESENTATIVE it links to, or starts its own. A chain A~B, B~C, C~D can
     therefore never pull A and D together (the union-find this replaces did exactly that,
     and once it did, a handful of loose links could swallow twenty unrelated items).
-    Outlets are pooled, one report per outlet."""
+    A story takes every report that links to it -- a big story is one card with many
+    outlets, never many cards. Behind the card: one report per outlet (the outlet's most
+    detailed, then latest), the representative's own first, at most REPORTS_MAX."""
     stories = []
     for c in sorted(cands, key=_best_first):
         for members in stories:
-            if len(members) < cap and links(members[0], c):
+            if links(members[0], c):
                 members.append(c)
                 break
         else:
@@ -197,14 +204,17 @@ def _merge(cands, links, cap=STORY_MAX):
         rep = members[0]
         rep["sources"] = list(dict.fromkeys(s for m in members for s in m.get("sources") or []))
         rep["merged"] = [m["id"] for m in members]
-        seen, reports = set(), []            # the representative's own report first, one per outlet
+        own = (rep.get("reports") or [None])[0]
+        best = {}
         for m in members:
             for r in m.get("reports") or []:
-                if r["outlet"] not in seen and r["url"] not in seen:
-                    seen.add(r["outlet"])
-                    seen.add(r["url"])
-                    reports.append(r)
-        rep["reports"] = reports
+                cur = best.get(r["outlet"])
+                if cur is None or (r.get("detail", 0), r.get("ts", "")) > (cur.get("detail", 0), cur.get("ts", "")):
+                    best[r["outlet"]] = r
+        if own is not None:
+            best[own["outlet"]] = own                 # the card's own link is the representative's
+        reports = ([own] if own is not None else []) + [r for o, r in best.items() if own is None or o != own["outlet"]]
+        rep["reports"] = reports[:REPORTS_MAX]
         out.append(rep)
     return out
 
@@ -217,7 +227,9 @@ def _load(con, scope, since, pub_since):
         d["sources"] = [alerts.outlet_name(r)]
         d["reports"] = [{"outlet": alerts.outlet_name(r), "url": alerts.display_url(r),
                          "title": rules.clean_title(r["title"] or "", r["publisher"] or ""),
-                         "lang": "Tamil" if re.search(r"[\u0B80-\u0BFF]", r["title"] or "") else "English"}]
+                         "lang": "Tamil" if re.search(r"[\u0B80-\u0BFF]", r["title"] or "") else "English",
+                         "detail": len(r["extract_text"] or "") if r["extract_status"] in ("OK", "THIN") else 0,
+                         "ts": r["published_at"] or r["discovered_at"] or ""}]
         d["tags"] = alerts._j(r["target_tags"], [])
         d["ntitle"] = norm_title(r["title"], r["publisher"])
         d["tgrams"] = frozenset(rules.sim_grams(d["ntitle"])) if len(d["ntitle"]) >= 12 else frozenset()
@@ -234,6 +246,7 @@ def candidates(con, now):
     last = parse_ts(rt_get(con, "last_digest_at"))
     since = max(now - timedelta(hours=WINDOW_CAP_H), last) if last else now - timedelta(hours=WINDOW_CAP_H)
     reps, ids = _load(con, "i.digested_at IS NULL", since, now - timedelta(hours=PUBLISHED_WITHIN_H))
+    reps, _ = drop_reruns(con, reps, now - timedelta(hours=PUBLISHED_WITHIN_H))
     return reps, ids, since
 
 
@@ -308,15 +321,19 @@ def _is_tamil(c):
 
 
 def _confirm(a, b, why):
-    """The strict gate every proposed link goes through. Published within a day of each other;
-    no outlet in common (one outlet, two articles = two stories, or a follow-up); and, for two
-    reports in the same language, at least one identifying headline word in common. A Tamil
-    and an English report share no words, so there Gemini's grouping counts -- but only
-    when it also gave both the same category."""
+    """The gate every proposed link goes through.
+    cluster  -- Gemini's edition-wide grouping, already held to the names it cited: accepted
+                outright in one category (one event, one card per category); across categories
+                only when the headlines share an identifying word.
+    gemini   -- a story number from a ranking batch (no evidence check): within a day, same
+                language with a shared identifying word, or Tamil/English in one category.
+    title    -- near-identical headlines: within a day, with a shared identifying word.
+    The same outlet twice is fine: an update and its first report are one story, and the
+    card keeps the outlet's most detailed link."""
+    if why == "cluster":
+        return a.get("category") == b.get("category") or (_is_tamil(a) == _is_tamil(b) and share_core(a, b))
     pa, pb = parse_ts(a.get("published_at")), parse_ts(b.get("published_at"))
     if pa and pb and abs((pa - pb).total_seconds()) > 24 * 3600:
-        return False
-    if set(a.get("sources") or []) & set(b.get("sources") or []):
         return False
     if _is_tamil(a) != _is_tamil(b):
         return why == "gemini" and a.get("category") == b.get("category")
@@ -333,7 +350,7 @@ def merge_stories(cands):
 
     def same(a, b):
         if a.get("story") and a.get("story") == b.get("story"):
-            return _confirm(a, b, "gemini")
+            return _confirm(a, b, "cluster" if "@" in a["story"] else "gemini")
         if a["tgrams"] and b["tgrams"] and len(a["ntitle"]) >= 25 and len(b["ntitle"]) >= 25 \
                 and rules.jaccard(a["tgrams"], b["tgrams"]) >= TITLE_SIM:
             return _confirm(a, b, "title")
@@ -391,6 +408,11 @@ inauguration, statement, incident or announcement, in Tamil or English, however 
 headlined -- share one story number (use the number of the first such item). An item about
 its own event gets its own number.
 
+And "takeaways": exactly 2 bullet notes in plain English, 10-15 words each, for a reader
+who will not open the article -- the fact and the figure (who, where, what, how much, when),
+then what it means or what comes next. Tamil items get English notes too. No preamble,
+no bullet symbols, no repetition of the headline.
+
 Return one object per item, using the item numbers given.
 
 ITEMS:
@@ -405,9 +427,34 @@ RESPONSE_SCHEMA = {
         "reason": {"type": "STRING"},
         "story": {"type": "INTEGER"},
         "impact": {"type": "INTEGER"},
-        "sentiment": {"type": "STRING", "enum": list(SENTIMENTS)}},
-        "required": ["n", "category", "priority", "reason", "story", "impact", "sentiment"]},
+        "sentiment": {"type": "STRING", "enum": list(SENTIMENTS)},
+        "takeaways": {"type": "ARRAY", "items": {"type": "STRING"}}},
+        "required": ["n", "category", "priority", "reason", "story", "impact", "sentiment", "takeaways"]},
 }
+
+TAKEAWAYS_PROMPT = """For each news item below write "takeaways": exactly 2 bullet notes in plain English,
+10-15 words each, for a reader in the office of R. Kumar (MLA Velachery, Tamil Nadu Minister for
+AI, IT and Digital Services, in-charge minister Thiruvallur) who will not open the article --
+the fact and the figure (who, where, what, how much, when), then what it means or what comes
+next. Tamil items get English notes. No preamble, no bullet symbols, no repetition of the
+headline. Return one object per item, using the item numbers given.
+
+ITEMS:
+{payload}"""
+
+TAKEAWAYS_SCHEMA = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+    "n": {"type": "INTEGER"}, "takeaways": {"type": "ARRAY", "items": {"type": "STRING"}}},
+    "required": ["n", "takeaways"]}}
+
+
+def _takeaways(v):
+    """Two clean notes, or []: strings only, bullets and numbering stripped, 160 chars each."""
+    out = []
+    for s in v if isinstance(v, list) else []:
+        s = re.sub(r"^[\s•\-–*\d.)]+", "", str(s)).strip()
+        if s:
+            out.append(s[:160])
+    return out[:2]
 
 
 def _snippet(c):
@@ -516,7 +563,8 @@ accidents) in different places or with different people; the same subject on dif
 days; a follow-up, a reaction or an analysis of an event; a daily column; two items that
 merely share a district, a party or a minister's name.
 When torn, leave the item out of the group. A missed merge shows a story twice; a wrong
-merge hides a story from the office. Never put more than {max_group} items in one group.
+merge hides a story from the office. A big story may have ten or more reports: that is
+one group, however large.
 
 Return only the groups (2 or more items each). For each group give the item numbers and
 "shared": the core names the items have in common, written exactly as they appear in the
@@ -529,30 +577,32 @@ ITEMS:
 CLUSTER_SCHEMA = {"type": "OBJECT", "properties": {"groups": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
     "items": {"type": "ARRAY", "items": {"type": "INTEGER"}}, "shared": {"type": "STRING"}},
     "required": ["items", "shared"]}}}, "required": ["groups"]}
-CLUSTER_MAX_GROUP = 6         # a bigger group is not a story, it is Gemini lumping a topic; dropped whole
-
 
 def _has_evidence(c, shared):
     """Gemini's "shared" names must actually occur in the item -- checked in the item's own
     script, so an English item is held to the Latin names and a Tamil item to the Tamil ones.
+    Names the items "have in common" are by definition in every item, so a member must carry
+    them all (or at least two of them, for a long list with one odd spelling). "Avadi,
+    Kanchipuram" claimed for a murder in Avadi and a bank in Kanchipuram fails on both.
     No names in the item's script: nothing to hold it to, the gate in _confirm remains."""
     text = f"{_title(c)} {_snippet(c)}".lower()
     tamil = _is_tamil(c)
-    words = [w for w in _WORD.findall(shared or "") if len(w) >= 3 and bool(_TAMIL.search(w)) == tamil]
-    return not words or any(w.lower() in text for w in words)
+    words = {w.lower() for w in _WORD.findall(shared or "") if len(w) >= 3 and bool(_TAMIL.search(w)) == tamil}
+    hits = sum(1 for w in words if w in text)
+    return not words or hits == len(words) or hits >= 2
 
 
 def cluster(gemini, con, cands, key_prefix):
     """One call over a whole edition. Gemini proposes groups with the names that prove them;
-    a group that is too big, that names nothing, or whose names do not occur in a member is
-    thinned or dropped here, before merge_stories applies its own gate. Every item gets a
+    a group that names nothing, or whose names do not occur in a member, is thinned or
+    dropped here, before merge_stories applies its own gate. Size is no objection: a
+    story ten outlets report is one group. Every item gets a
     key (its group's, or one of its own) so a later run links the same reports again
     without asking and no older key survives on it. Returns the number of groups kept."""
     if gemini is None or not cands or len(cands) < 2:
         return 0
     lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(cands, 1)]
-    data = gemini.call(CLUSTER_PROMPT.format(payload="\n".join(lines), max_group=CLUSTER_MAX_GROUP),
-                       CLUSTER_SCHEMA, "cluster")
+    data = gemini.call(CLUSTER_PROMPT.format(payload="\n".join(lines)), CLUSTER_SCHEMA, "cluster")
     if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
         return 0
     taken, kept, dropped = set(), 0, Counter()
@@ -563,9 +613,6 @@ def cluster(gemini, con, cands, key_prefix):
         nums = [n for n in nums if n not in taken]
         shared = str(g.get("shared") or "").strip()
         if len(nums) < 2:
-            continue
-        if len(nums) > CLUSTER_MAX_GROUP:
-            dropped["too big"] += 1
             continue
         if not shared:
             dropped["no shared names"] += 1
@@ -602,7 +649,8 @@ def _verdict(it, story_prefix):
             "reason": str(it.get("reason", ""))[:200],
             "story": f"{story_prefix}{story}" if story else None,
             "impact": _int(it.get("impact"), 1, 10, 5),
-            "sentiment": it.get("sentiment") if it.get("sentiment") in SENTIMENTS else "neutral"}
+            "sentiment": it.get("sentiment") if it.get("sentiment") in SENTIMENTS else "neutral",
+            "takeaways": _takeaways(it.get("takeaways"))}
 
 
 def rule_rank(c):
@@ -623,12 +671,13 @@ def rule_rank(c):
     else:
         pri, impact, sent = 3, 4, "neutral"
     return {"category": cat, "priority": pri, "reason": "keyword rules", "story": None,
-            "impact": impact, "sentiment": sent}
+            "impact": impact, "sentiment": sent, "takeaways": []}
 
 
 def _apply(c, v, by):
     c["category"], c["priority"], c["reason"], c["by"] = v["category"], v["priority"], v["reason"], by
     c["impact"], c["sentiment"] = v.get("impact") or 5, v.get("sentiment") or "neutral"
+    c["takeaways"] = v.get("takeaways") or []
     if v.get("story"):
         c["story"] = v["story"]
 
@@ -641,7 +690,7 @@ def rank_all(con, cands, gemini, now):
         if c["ai_processed_at"] and c["ai_category"]:
             _apply(c, {"category": c["ai_category"], "priority": c["ai_priority"] or 2, "reason": c["ai_reason"] or "",
                        "impact": c.get("ai_impact") or 5, "sentiment": c.get("ai_sentiment") or "neutral",
-                       "story": c.get("story_key")}, "gemini (cached)")
+                       "story": c.get("story_key"), "takeaways": alerts._j(c.get("ai_takeaways"), [])}, "gemini (cached)")
         else:
             todo.append(c)
     st = Counter(cached=len(cands) - len(todo)) if len(cands) > len(todo) else Counter()
@@ -655,10 +704,11 @@ def rank_all(con, cands, gemini, now):
                 if c["id"] in res:
                     _apply(c, res[c["id"]], "gemini")
                     con.execute("""UPDATE items SET ai_category=?, ai_priority=?, ai_reason=?, ai_model=?,
-                                   ai_processed_at=?, ai_impact=?, ai_sentiment=?,
+                                   ai_processed_at=?, ai_impact=?, ai_sentiment=?, ai_takeaways=?,
                                    story_key=coalesce(story_key, ?) WHERE id=?""",
                                 (c["category"], c["priority"], c["reason"], gemini.model, iso(now),
-                                 c["impact"], c["sentiment"], c.get("story"), c["id"]))
+                                 c["impact"], c["sentiment"], json.dumps(c["takeaways"], ensure_ascii=False) if c["takeaways"] else None,
+                                 c.get("story"), c["id"]))
                     st["gemini"] += 1
             con.commit()
             if k + AI_BATCH < len(todo):
@@ -670,6 +720,68 @@ def rank_all(con, cands, gemini, now):
     if gemini is not None and gemini.dead:
         log.warning(f"gemini: stopped -- {gemini.dead}; {st['rules']} items ranked by the rules")
     return st
+
+
+def fill_takeaways(gemini, con, cands, now):
+    """Notes for chosen stories that have none yet -- items ranked before notes existed, or by
+    the rules. One call per 40, stored on the item; returns how many were filled."""
+    todo = [c for c in cands if not c.get("takeaways")]
+    if gemini is None or not todo:
+        return 0
+    done = 0
+    for k in range(0, len(todo), 40):
+        batch = todo[k:k + 40]
+        lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(batch, 1)]
+        data = gemini.call(TAKEAWAYS_PROMPT.format(payload="\n".join(lines)), TAKEAWAYS_SCHEMA, "takeaways")
+        if not isinstance(data, list):
+            break
+        for it in data:
+            i = _int(it.get("n"), 1, len(batch), 0) - 1
+            notes = _takeaways(it.get("takeaways")) if i >= 0 else []
+            if notes:
+                batch[i]["takeaways"] = notes
+                con.execute("UPDATE items SET ai_takeaways=? WHERE id=?", (json.dumps(notes, ensure_ascii=False), batch[i]["id"]))
+                done += 1
+        con.commit()
+    return done
+
+
+def drop_reruns(con, cands, since, days=2):
+    """Stale re-runs out: a candidate whose headline or body is RERUN_SIM-similar to a kept
+    item published in the `days` before the window is yesterday's story syndicated again,
+    not news. A development on the same event has its own headline (an arrest, an inquiry,
+    a statement) and stays. Returns (kept, dropped_count)."""
+    rows = con.execute("""SELECT title, publisher, extract_text, extract_status FROM items
+                          WHERE coalesce(published_at, discovered_at) >= ? AND coalesce(published_at, discovered_at) < ?
+                            AND (band IN ('AUTO_KEEP', 'AI', 'KEYWORD_KEEP') OR urgent = 1)""",
+                       (iso(since - timedelta(days=days)), iso(since))).fetchall()
+    if not rows or not cands:
+        return cands, 0
+    prev = []
+    for r in rows:
+        nt = norm_title(r["title"], r["publisher"])
+        body = (r["extract_text"] or "")[:rules.BODY_CAP] if r["extract_status"] == "OK" else ""
+        prev.append((nt, frozenset(rules.sim_grams(nt)) if len(nt) >= 25 else frozenset(),
+                     frozenset(rules.sim_grams(body)) if len(body) >= 300 else frozenset()))
+    kept, dropped = [], 0
+    for c in cands:
+        body = (c["extract_text"] or "")[:rules.BODY_CAP] if c["extract_status"] == "OK" else ""
+        bg = frozenset(rules.sim_grams(body)) if len(body) >= 300 else frozenset()
+        stale = False
+        for nt, tg, pg in prev:
+            # the same body under a new headline still needs the headlines to rhyme a little
+            # (0.3, the topic band), so boilerplate-heavy pages never make strangers re-runs
+            if (len(c["ntitle"]) >= 12 and c["ntitle"] == nt) \
+                    or (c["tgrams"] and tg and rules.jaccard(c["tgrams"], tg) >= RERUN_SIM) \
+                    or (bg and pg and rules.jaccard(bg, pg) >= RERUN_SIM
+                        and c["tgrams"] and tg and rules.jaccard(c["tgrams"], tg) >= 0.3):
+                stale = True
+                break
+        if stale:
+            dropped += 1
+        else:
+            kept.append(c)
+    return kept, dropped
 
 
 # --------------------------------------------------------------------------
@@ -687,7 +799,18 @@ def select(cands, per=PER_CATEGORY, total=MAX_TOTAL):
     (urgent_block, {category: [items]}, leftovers)."""
     pool = [c for c in cands if c["category"] != "none"]
     by_cat = defaultdict(list)
+    seen_story = {}                      # (category, story key) -> the card; one event, one card per category
     for c in sorted(pool, key=_order):
+        k = (c["category"], c.get("story")) if c.get("story") and "@" in c["story"] else None
+        if k in seen_story:
+            first = seen_story[k]
+            first["sources"] = list(dict.fromkeys(first["sources"] + c.get("sources", [])))
+            first["merged"] = first.get("merged", [first["id"]]) + c.get("merged", [c["id"]])
+            have = {r["outlet"] for r in first["reports"]}
+            first["reports"] = (first["reports"] + [r for r in c.get("reports") or [] if r["outlet"] not in have])[:REPORTS_MAX]
+            continue
+        if k:
+            seen_story[k] = c
         by_cat[c["category"]].append(c)
     chosen, leftovers = [], []
     for cat in CATEGORIES:

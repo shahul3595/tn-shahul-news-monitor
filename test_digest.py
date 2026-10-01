@@ -123,7 +123,8 @@ class FakeGemini:
             out[c["id"]] = {"category": cat, "priority": 1 if "!" in t else (3 if "~" in t else 2), "reason": "fake",
                             "story": f"{self.calls}:{m.group(1)}" if m else None,
                             "impact": 9 if "!" in t else 5,
-                            "sentiment": "positive" if "(+)" in t else ("critical" if "(-)" in t or "!" in t else "neutral")}
+                            "sentiment": "positive" if "(+)" in t else ("critical" if "(-)" in t or "!" in t else "neutral"),
+                            "takeaways": [f"Note one for {t[:20]}.", f"Note two for {t[:20]}."]}
         return out
 
     def call(self, prompt, schema, label="call"):
@@ -139,6 +140,9 @@ class FakeGemini:
                 groups.append({"section": name, "takeaways": [{"text": f"{name} takeaway one.", "story": n},
                                                               {"text": f"{name} takeaway two.", "story": n}]})
             return {"groups": groups}
+        if label == "takeaways":
+            items = re.findall(r"^(\d+)\. \[.*?\] (.*)$", prompt, re.M)
+            return [{"n": int(n), "takeaways": [f"Filled one for {t[:20]}.", f"Filled two for {t[:20]}."]} for n, t in items]
         if label == "cluster":               # items whose titles share a '@word' tag are one story
             items = re.findall(r"^(\d+)\. \[.*?\] (.*)$", prompt, re.M)
             by_tag = {}
@@ -389,9 +393,10 @@ def merging_is_strict_numbers_never_link_and_links_never_chain():
     #    same category, no headline word in common -> refused.
     add(con, "Dis story @g2: Avadi shopkeeper Ramesh murdered over land dispute", host="dtnext.in")
     add(con, "Dis story @g2: Sewage floods Kanchipuram bank branch, customers turned away", host="thehindu.com")
-    # 3. The same outlet twice under one tag -> two stories (a follow-up, or Gemini's slip).
-    add(con, "Con story @g3: Velachery lake desilting begins near Ram Nagar", host="dinamalar.com")
-    add(con, "Con story @g3: Velachery lake desilting: residents of Ram Nagar want silt removed", host="dinamalar.com")
+    # 3. The same outlet twice under one tag: the first report and its update are one story,
+    #    and the card keeps the outlet's more detailed link.
+    add(con, "Con story @g3: Velachery lake desilting begins near Ram Nagar", host="dinamalar.com", body="short " * 30)
+    add(con, "Con story @g3: Velachery lake desilting: residents of Ram Nagar want silt removed", host="dinamalar.com", body="longer " * 80)
     # 4. A genuine same-language pair: shared names, different outlets -> one card, one report per outlet.
     add(con, "Con story @g4: Tharamani MRTS station gets new lift after 4 years", host="thehindu.com")
     add(con, "Con story @g4: New lift at Tharamani MRTS station opens", host="dtnext.in")
@@ -404,20 +409,30 @@ def merging_is_strict_numbers_never_link_and_links_never_chain():
     check(len(drain) == 2, f"different categories: the Tamil/English pair stays apart: {drain}")
     lump = [t for t in titles if "@g2" in t]
     check(len(lump) == 2, f"Avadi murder and Kanchipuram sewage never merge: {lump}")
-    twice = [t for t in titles if "@g3" in t]
-    check(len(twice) == 2, f"the same outlet twice is two stories: {twice}")
+    twice = [c for c in eds["latest"]["cands"] if "@g3" in c["title"]]
+    check(len(twice) == 1 and len(twice[0]["reports"]) == 1, f"the same outlet's update is one story, one link: {[(c['title'][:30], len(c['reports'])) for c in twice]}")
+    check("residents" in twice[0]["reports"][0]["title"], f"the card keeps the outlet's more detailed report: {twice[0]['reports'][0]['title']}")
     ok = [c for c in eds["latest"]["cands"] if "@g4" in c["title"]]
     check(len(ok) == 1 and sorted(ok[0]["sources"]) == ["Dtnext", "Thehindu"], f"the real pair merged: {[c['sources'] for c in ok]}")
     check(len(ok[0]["reports"]) == 2 and len({r["outlet"] for r in ok[0]["reports"]}) == 2, f"one report per outlet: {ok[0]['reports']}")
-    # 5. A Gemini group that is too big, or whose "shared" names are not in the items, is refused whole.
+    # 5. A big story -- twelve reports, three of them from one outlet -- is ONE card with up to
+    #    8 distinct outlets behind it; the rest are absorbed, never cards of their own. A group
+    #    whose "shared" names are not in the items is still refused.
     con = make_db("strict2.db")
-    for i in range(7):
-        add(con, f"Dis story @g5: {t('Big', i)} Tiruttani", host=f"outlet{i}.com")
+    hosts = ["news18.com", "news18.com", "news18.com", "abpnadu.com", "abpnadu.com", "livechennai.com", "dailythanthi.com",
+             "maalaimalar.com", "dinamalar.com", "thehindu.com", "dtnext.in", "dinamani.com"]
+    for i, h in enumerate(hosts):
+        add(con, f"Opp story @g5: Poonamallee Metro fare Rs 10-40 {t('Big', i)}", host=h, hours_ago=1 + i)
     add(con, "Dis story @g6: Ponneri bridge work stalls, Tiruttani lorry drivers protest", host="thehindu.com")
     add(con, "Dis story @g6: Ambattur estate power cut for six hours, Tiruttani", host="dtnext.in")
-    g = FakeGemini(shared={"g5": "Tiruttani", "g6": "Gummidipoondi"})
+    g = FakeGemini(shared={"g5": "Poonamallee, Metro", "g6": "Gummidipoondi"})
     eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-strict2")
-    check(len(eds["latest"]["cands"]) == 9, f"a 7-item group and an unproven group are refused: {len(eds['latest']['cands'])}")
+    metro = [c for c in eds["latest"]["cands"] if "@g5" in c["title"]]
+    check(len(metro) == 1, f"twelve reports of the Metro fare are one card: {len(metro)}")
+    check(len(metro[0]["sources"]) == 9 and len(metro[0]["reports"]) == 8, f"9 outlets counted, 8 shown: {len(metro[0]['sources'])}, {len(metro[0]['reports'])}")
+    check(len({r["outlet"] for r in metro[0]["reports"]}) == 8, "one link per outlet")
+    check(len(eds["latest"]["chosen"]) == 3, f"the page shows 3 cards, not 14: {len(eds['latest']['chosen'])}")
+    check(len([c for c in eds["latest"]["cands"] if "@g6" in c["title"]]) == 2, "an unproven group is still refused")
     # 6. Links never chain: A~B and B~C do not make A~C. Three items, two gemini keys of which
     #    only the middle one is shared by both neighbours -- in _merge each joins the REP only.
     mk = lambda i, title, story, outlet: {"id": i, "title": title, "publisher": "", "description": "", "extract_status": "FAILED",
@@ -442,6 +457,40 @@ def merging_is_strict_numbers_never_link_and_links_never_chain():
 
 
 @test
+def notes_are_filled_for_old_verdicts_and_reruns_are_dropped():
+    import web
+    con = make_db("notes.db")
+    old = add(con, "Con story: ranked before notes existed", ai=("constituency", 2))
+    add(con, "Dis story: ranked today", tags=["district"])
+    g = FakeGemini()
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-notes")
+    byt = {c["title"]: c for c in eds["latest"]["chosen"]}
+    check(byt["Con story: ranked before notes existed"]["takeaways"][0].startswith("Filled one"), "a cached verdict without notes gets them from one extra call")
+    check(byt["Dis story: ranked today"]["takeaways"][0].startswith("Note one"), "a fresh verdict carries its notes")
+    check(g.kinds.count("takeaways") == 1, g.kinds)
+    row = con.execute("SELECT ai_takeaways FROM items WHERE id=?", (old,)).fetchone()
+    check(row[0] and "Filled" in row[0], "stored, so the next run does not ask again")
+    n = g.kinds.count("takeaways")
+    web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(minutes=5), g, docs=TMP / "docs-notes")
+    check(g.kinds.count("takeaways") == n, "no second notes call")
+    # re-runs: yesterday's story syndicated again today is not a card; a development is
+    con = make_db("rerun.db")
+    add(con, "Con story: Pallikaranai marsh encroachment: NGT seeks report from TN govt", hours_ago=30, host="thehindu.com")
+    add(con, "Con story: Pallikaranai marsh encroachment: NGT seeks report from TN government", hours_ago=3, host="newsminute.com")
+    add(con, "Con story: Pallikaranai marsh: NGT orders demolition of 40 structures after report", hours_ago=2, host="dtnext.in")
+    add(con, "Dis story: Poondi reservoir inflow rises", hours_ago=29, host="dinamani.com", body="Inflow into Poondi reservoir rose to 1,200 cusecs on Tuesday after rain in the catchment; storage is at 2,100 mcft, officials said, and the discharge was raised to 500 cusecs. " * 3)
+    add(con, "Dis story: Rain lifts Poondi inflow", hours_ago=1, host="maalaimalar.com", body="Inflow into Poondi reservoir rose to 1,200 cusecs on Tuesday after rain in the catchment; storage is at 2,100 mcft, officials said, and the discharge was raised to 500 cusecs. " * 3)
+    eds = web.publish(con, {}, T0, None, docs=TMP / "docs-rerun")
+    titles = sorted(c["title"] for c in eds["latest"]["cands"])
+    check(titles == ["Con story: Pallikaranai marsh: NGT orders demolition of 40 structures after report"],
+          f"the same headline and the same body as yesterday are out, the development stays: {titles}")
+    check(eds["latest"]["stats"].get("reruns") == 2, eds["latest"]["stats"])
+    cands, *_ = digest.candidates(con, T0)
+    check([c["title"] for c in cands] == ["Con story: Pallikaranai marsh: NGT orders demolition of 40 structures after report"],
+          f"Telegram too (yesterday's items were published outside its 24 h window): {[c['title'][:40] for c in cands]}")
+
+
+@test
 def summary_is_cached_until_the_top_stories_change():
     import web
     con = make_db("summary.db")
@@ -454,6 +503,10 @@ def summary_is_cached_until_the_top_stories_change():
           eds["latest"]["summary"])
     page = (TMP / "docs-sum" / "index.html").read_text(encoding="utf-8")
     check('id="story-\'+s.id' in page and "data-story" in page and "function jump(" in page, "cards carry anchors, takeaways link to them")
+    check('id="notes"' in page and 'id="select"' in page and 'id="selbar"' in page and "waText(" in page, "notes toggle, select mode and the share bar are on the page")
+    data = json.loads((TMP / "docs-sum" / "data" / "latest.json").read_text(encoding="utf-8"))
+    check(data["stories"][0]["takeaways"] == ["Note one for Con story (+) scheme.", "Note two for Con story (+) scheme."], data["stories"][0]["takeaways"])
+    check(data["label"] == "Last 24 hours", data["label"])
     n = g.kinds.count("summary")
     web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(minutes=5), g, docs=TMP / "docs-sum")
     check(g.kinds.count("summary") == n, "same top stories, no new summary call")

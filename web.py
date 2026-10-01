@@ -91,7 +91,10 @@ def build(con, env, now, key, since, until, gemini=None):
     """One edition. Returns dict(key, cands, ids, urgent, sections, chosen, stats, summary)."""
     cfg = digest.settings(env)
     cands, ids = _load_window(con, since, until)
+    cands, st_reruns = digest.drop_reruns(con, cands, since)
     st = digest.rank_all(con, cands, gemini, now)
+    if st_reruns:
+        st["reruns"] = st_reruns
     row = con.execute("SELECT cand_hash, summary, summary_hash FROM editions WHERE key=?", (key,)).fetchone()
     ch = _hash([c["id"] for c in cands])
     # clustering: once per distinct candidate set, then the stored story keys carry it
@@ -107,6 +110,9 @@ def build(con, env, now, key, since, until, gemini=None):
     st["merged"] = before - len(cands)
     urgent, sections, leftovers = digest.select(cands, cfg["web_per"], cfg["web_max"])
     chosen = urgent + [c for cat in CATEGORIES for c in sections[cat]]
+    filled = digest.fill_takeaways(gemini, con, chosen, now)
+    if filled:
+        st["notes"] = filled
     summary = _summary(con, gemini, key, urgent, sections, row, now)
     return {"key": key, "since": since, "until": until, "cands": cands, "ids": ids, "urgent": urgent,
             "sections": sections, "chosen": chosen, "leftovers": leftovers, "stats": st, "summary": summary}
@@ -163,7 +169,9 @@ def _summary(con, gemini, key, urgent, sections, row, now):
 def _story(c, urgent):
     return {"id": c["id"], "title": digest._title(c), "url": alerts.display_url(c),
             "outlet": alerts.outlet_name(c), "sources": len(c.get("sources") or []),
-            "reports": [r for r in (c.get("reports") or []) if r["url"] != alerts.display_url(c)],
+            "reports": [{"outlet": r["outlet"], "url": r["url"], "title": r["title"], "lang": r["lang"]}
+                        for r in (c.get("reports") or []) if r["url"] != alerts.display_url(c)],
+            "takeaways": c.get("takeaways") or [],
             "cat": c["category"], "urgent": bool(urgent), "sentiment": c.get("sentiment") or "neutral",
             "priority": c["priority"], "impact": c.get("impact") or 5,
             "snippet": digest._snippet(c), "image": digest._image_for(c) or "",
@@ -336,6 +344,15 @@ section.urgent h2{color:var(--urgent)}section[hidden]{display:none}
 .card .body{padding:12px 14px 8px;display:flex;flex-direction:column;gap:6px;flex:1}
 .card h3{font-size:16px;margin:0;line-height:1.35;font-weight:600}.card h3 a{color:var(--ink);text-decoration:none}.card h3 a:hover{text-decoration:underline}
 .card p{margin:0;color:var(--dim);font-size:14px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.card .notes{margin:0;padding-left:18px;font-size:14px;color:var(--ink)}.card .notes li{margin:2px 0}
+body.nonotes .card .notes,body.nonotes .card p,body.nonotes .card img{display:none}body.nonotes .card .body{padding:10px 14px 6px}
+.card .hrow{display:flex;gap:10px;align-items:flex-start}.card .hrow h3{flex:1;min-width:0}
+.card .tick{display:none;flex:0 0 44px;height:44px;align-items:center;justify-content:center;background:var(--chip);border:1px solid var(--line);border-radius:10px;cursor:pointer;margin-top:-4px}
+.card .tick input{width:22px;height:22px;margin:0;accent-color:var(--accent);cursor:pointer}body.selecting .card .tick{display:flex}body.selecting .card:has(.tick input:checked){outline:3px solid var(--accent)}
+.selbar{position:fixed;left:50%;bottom:16px;transform:translate(-50%,120%);transition:transform .2s;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.25);padding:8px 12px;display:flex;flex-direction:column;gap:4px;align-items:center;z-index:12;width:min(440px,calc(100% - 32px));font-size:14px}
+.selbar.on{transform:translate(-50%,0)}.selbar label{display:inline-flex;align-items:center;gap:6px;min-height:44px;cursor:pointer}.selbar input{width:20px;height:20px;accent-color:var(--accent)}
+#top.lift{bottom:140px}.grid.list .card .tick{flex-basis:36px;height:36px;margin-top:0}.grid.list .card .notes{display:none}
+.selbar .row{display:flex;gap:8px;align-items:center;justify-content:center;width:100%}.selbar a.btn{text-decoration:none;display:inline-flex;align-items:center}
 .meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:auto;padding-top:6px;font-size:12px;color:var(--dim)}
 .chip{background:var(--chip);border-radius:999px;padding:2px 8px;color:var(--ink)}
 .chip.u{background:var(--urgent);color:#fff}.chip.src{border:1px solid var(--line);background:transparent}
@@ -360,7 +377,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .drawer a,.drawer button.link{display:flex;align-items:center;min-height:44px;padding:0 8px;border-radius:10px;color:var(--ink);text-decoration:none;font:inherit;background:transparent;border:0;width:100%;text-align:left;cursor:pointer;font-size:15px}
 .drawer a:hover,.drawer button.link:hover{background:var(--chip)}.drawer .close{position:absolute;top:10px;right:10px}
 .drawer select{width:100%;min-height:44px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);padding:8px}
-.drawer .seg{display:flex;gap:6px}.drawer .seg .btn{flex:1}
+.drawer .seg{display:flex;gap:6px}.drawer .seg .btn{flex:1}.drawer label.opt{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 8px;font-size:15px;cursor:pointer}.drawer label.opt input{width:20px;height:20px;accent-color:var(--accent)}
 #top{position:fixed;right:16px;bottom:16px;display:none;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.2)}#top.on{display:inline-flex}
 .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30}
 .empty{color:var(--dim);padding:20px 0}footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
@@ -376,18 +393,21 @@ var NAME={};CATS.forEach(function(c){NAME[c[0]]=c[2]});var SENT={positive:'🟢 
 var REASONS=[['unrelated','Unrelated to constituency / portfolio'],['category','Wrong category'],['old','Duplicate / old'],['spam','Spam / noise']];
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return [].slice.call((r||document).querySelectorAll(s))};
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-var state={view:'cards',q:'',cat:'',sent:'',voted:{}};
-try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}')}catch(e){}
+var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{}};
+try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off'}catch(e){}
+function waText(s,withNotes){var t='*'+(s.urgent?'🚨 ':'')+s.title+'*\n';if(withNotes&&s.takeaways&&s.takeaways.length)t+=s.takeaways.map(function(b){return '• '+b}).join('\n')+'\n';return t+'🔗 '+s.url}
+function waLink(text){return 'https://wa.me/?text='+encodeURIComponent(text)}
+function story(id){return DATA.stories.filter(function(x){return String(x.id)===String(id)})[0]}
 function group(s){return s.urgent?'urgent':s.cat}
-function card(s){var g=group(s),wa='https://wa.me/?text='+encodeURIComponent((s.urgent?'🚨 ':'')+s.title+'\n'+NAME[s.cat]+' · '+s.outlet+' · '+s.time+'\n'+s.url);
+function card(s){var g=group(s),notes=s.takeaways&&s.takeaways.length?'<ul class="notes">'+s.takeaways.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul>':(s.snippet?'<p>'+esc(s.snippet)+'</p>':'');
  var why=REASONS.map(function(r){return '<button type="button" data-r="'+r[0]+'">'+esc(r[1])+'</button>'}).join('');
  var acts=state.voted[s.id]?'<span class="done">Thanks for the feedback</span>':'<button type="button" class="up" aria-label="Useful">👍</button><button type="button" class="down" aria-label="Not useful">👎</button><div class="why">'+why+'</div>';
  return '<article class="card" id="story-'+s.id+'" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+(s.snippet||'')+' '+s.outlet+' '+(s.reports||[]).map(function(r){return r.outlet}).join(' ')+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
  (s.image?'<a href="'+esc(s.url)+'" target="_blank" rel="noopener"><img src="'+esc(s.image)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>':'')+
- '<div class="body"><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3>'+(s.snippet?'<p>'+esc(s.snippet)+'</p>':'')+
+ '<div class="body"><div class="hrow"><label class="tick" aria-label="Select this story"><input type="checkbox"'+(state.sel[s.id]?' checked':'')+'></label><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3></div>'+notes+
  '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
  (s.reports&&s.reports.length?'<ul class="outlets" hidden>'+s.reports.map(function(r){return '<li><a href="'+esc(r.url)+'" target="_blank" rel="noopener" title="'+esc(r.title)+'">'+esc(r.outlet)+' <small>('+esc(r.lang)+')</small> ↗</a></li>'}).join('')+'</ul>':'')+'</div>'+
- '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span><a class="wa" href="'+wa+'" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
+ '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span><a class="wa" href="#" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
 function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=by[group(s)]||[]).push(s)});
  $('#title').textContent=d.label+(d.key==='latest'?' · '+d.stories.length+' stories':'');
  $('#sub').textContent=d.stories.length+' stories · '+d.considered+' considered · updated '+d.generated_ist;
@@ -414,11 +434,25 @@ function apply(){var q=state.q.toLowerCase().normalize('NFC').trim(),n=0;
 function jump(id){var c=$('#story-'+id);if(!c)return;if(c.hidden){state.cat='';state.sent='';state.q='';$('#q').value='';apply()}
  c.scrollIntoView({behavior:'smooth',block:'center'});c.classList.remove('flash');void c.offsetWidth;c.classList.add('flash');setTimeout(function(){c.classList.remove('flash')},2600);try{history.replaceState(null,'',location.search+'#story-'+id)}catch(e){}}
 function send(p){if(!FB)return;p.page=DATA.key;p.ua=navigator.userAgent.slice(0,120);fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){})}
-function wire(){$$('.more').forEach(function(b){b.onclick=function(){var u=b.closest('.card').querySelector('.outlets'),o=u.hidden;u.hidden=!o;b.setAttribute('aria-expanded',o);b.textContent=b.textContent.replace(o?'▾':'▴',o?'▴':'▾')}});
+function wire(){$$('.card a.wa').forEach(function(a){a.onclick=function(){var s=story(a.closest('.card').getAttribute('data-id'));if(s)a.href=waLink(waText(s,state.withNotes))}});
+ $$('.card .tick input').forEach(function(i){i.onchange=function(){var id=i.closest('.card').getAttribute('data-id');if(i.checked)state.sel[id]=1;else delete state.sel[id];selbar()}});
+ $$('.more').forEach(function(b){b.onclick=function(){var u=b.closest('.card').querySelector('.outlets'),o=u.hidden;u.hidden=!o;b.setAttribute('aria-expanded',o);b.textContent=b.textContent.replace(o?'▾':'▴',o?'▴':'▾')}});
  $$('.acts').forEach(function(f){var c=f.closest('.card'),id=c.getAttribute('data-id');function item(){var s=DATA.stories.filter(function(x){return String(x.id)===id})[0]||{};return {id:id,title:s.title,url:s.url,category:s.cat,outlet:s.outlet}}
  function done(m){$$('button,.why',f).forEach(function(e){e.remove()});f.insertAdjacentHTML('afterbegin','<span class="done">'+m+'</span>');state.voted[id]=1;try{localStorage.setItem('voted',JSON.stringify(state.voted))}catch(e){}}
  var up=$('.up',f),dn=$('.down',f);if(up)up.onclick=function(){var p=item();p.type='up';send(p);done('Thanks 👍')};if(dn)dn.onclick=function(){f.classList.add('open')};
  $$('.why button',f).forEach(function(b){b.onclick=function(){var p=item();p.type='down';p.reason=b.getAttribute('data-r');send(p);done('Noted 👎')}})})}
+function setNotes(on){state.notes=on;document.body.classList.toggle('nonotes',!on);var b=$('#notes');b.setAttribute('aria-pressed',on);b.textContent=on?'📝 Notes: ON':'📝 Notes: OFF';try{localStorage.setItem('notes',on?'on':'off')}catch(e){}}
+$('#notes').onclick=function(){setNotes(!state.notes)};
+function setSelecting(on){state.selecting=on;document.body.classList.toggle('selecting',on);$('#select').setAttribute('aria-pressed',on);$('#select').textContent=on?'✓ Done':'☑ Select';if(!on){state.sel={};$$('.card .tick input').forEach(function(i){i.checked=false})}selbar()}
+$('#select').onclick=function(){setSelecting(!state.selecting)};
+function setWithNotes(on){state.withNotes=on;$$('.withnotes').forEach(function(i){i.checked=on});try{localStorage.setItem('withnotes',on?'on':'off')}catch(e){}}
+$$('.withnotes').forEach(function(i){i.onchange=function(){setWithNotes(i.checked)}});
+function selbar(){var ids=Object.keys(state.sel),n=ids.length,bar=$('#selbar');bar.classList.toggle('on',n>0);$('#selcount').textContent=n+(n===1?' story':' stories')+' selected';$('#top').classList.toggle('lift',n>0)}
+$('#selclear').onclick=function(){state.sel={};$$('.card .tick input').forEach(function(i){i.checked=false});selbar()};
+var KEY=['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
+$('#selshare').onclick=function(ev){ev.preventDefault();var ids=Object.keys(state.sel);if(!ids.length)return;var list=DATA.stories.filter(function(s){return state.sel[s.id]});
+ var t='📢 *Selected News Updates — Office of Minister R. Kumar*\n_'+DATA.label+' · '+DATA.generated_ist+'_\n\n'+list.map(function(s,i){return (KEY[i]||(i+1)+'.')+' '+waText(s,state.withNotes).replace('🔗 ','🔗 Source: ')}).join('\n\n');
+ if(list.length>25)toast('That is a long message — WhatsApp may cut it');window.open(waLink(t),'_blank','noopener')};
 function setView(v){state.view=v;$$('.grid').forEach(function(g){g.classList.toggle('list',v==='list')});$$('[data-view]').forEach(function(b){b.setAttribute('aria-pressed',b.getAttribute('data-view')===v)});try{localStorage.setItem('view',v)}catch(e){}}
 $$('[data-view]').forEach(function(b){b.onclick=function(){setView(b.getAttribute('data-view'))}});
 $('#q').addEventListener('input',function(){state.q=this.value;apply()});
@@ -447,7 +481,7 @@ var dlg=$('#missing');$('#open-missing').onclick=function(){openD(false);dlg.sho
 $('#send-missing').onclick=function(ev){ev.preventDefault();var u=$('#m-url').value.trim(),n=$('#m-notes').value.trim();if(!u&&!n)return;send({type:'missing',url:u,notes:n.slice(0,500)});dlg.close();$('#m-url').value='';$('#m-notes').value='';toast('Thank you — sent for review.')};
 function toast(m){var t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.remove()},3500)}
 if(!FB){$('#open-missing').hidden=true}
-fillPickers();render();matrix();setView(state.view);
+fillPickers();render();matrix();setView(state.view);setNotes(state.notes);setWithNotes(state.withNotes);
 var h=location.hash.match(/^#story-(\d+)$/);if(h)setTimeout(function(){jump(h[1])},300);
 })();
 """
@@ -461,11 +495,12 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <h2>Edition</h2><select class="pick" aria-label="Edition"></select>
 <h2>Sections</h2><a href="#dashboard">📊 Dashboard</a><div id="drawer-cats"></div>
 <h2>View</h2><div class="seg"><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button></div>
+<h2>Sharing</h2><label class="opt"><input type="checkbox" class="withnotes" checked> Include takeaways in WhatsApp shares</label>
 <h2>More</h2><button type="button" class="link" id="open-missing">＋ Submit missing news</button></aside>
 <div class="wrap">
 <header><button type="button" class="icon" id="menu" aria-label="Menu">☰</button><div style="flex:1;min-width:0"><h1 id="title"></h1><div class="sub" id="sub"></div></div></header>
 <div class="tools"><input type="search" id="q" placeholder="Search headlines, summaries, outlets, categories" aria-label="Search">
-<select class="pick" aria-label="Edition"></select><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button></div>
+<select class="pick" aria-label="Edition"></select><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button><button type="button" class="btn" id="notes" aria-pressed="true">📝 Notes: ON</button><button type="button" class="btn" id="select" aria-pressed="false">☑ Select</button></div>
 <div class="callout" id="summary" hidden><h2>60-second briefing · tap a section to jump to its stories</h2><div class="sgs"></div></div>
 <div class="dash" id="dashboard"><h2><span id="dashtitle">Today at a glance</span><span class="seg"><button type="button" class="btn sm" data-dash="today" aria-pressed="true">Today</button><button type="button" class="btn sm" data-dash="week" aria-pressed="false">7 days</button></span></h2>
 <div id="dash-today"><table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table><p class="hint">Tap a number to filter the stories below.</p></div>
@@ -478,6 +513,7 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <label for="m-notes">What is it about, and why does it matter?</label><textarea id="m-notes" rows="3" maxlength="500"></textarea>
 <div class="row"><button type="button" class="btn" id="cancel-missing">Cancel</button><button type="submit" class="btn primary" id="send-missing">Send</button></div></form></dialog>
 <footer>Links open the original article or video. Feedback goes to the editor for review.</footer></div>
+<div class="selbar" id="selbar" role="region" aria-label="Selected stories"><div class="row"><b id="selcount">0 selected</b><label><input type="checkbox" class="withnotes" checked> Include takeaways</label></div><div class="row"><a class="btn primary" id="selshare" href="#" target="_blank" rel="noopener">Share to WhatsApp ↗</a><button type="button" class="btn" id="selclear">Clear</button></div></div>
 <button type="button" class="icon" id="top" aria-label="Back to top">↑</button>
 <noscript><p style="padding:16px">This page needs JavaScript to show the stories.</p></noscript>
 <script id="data" type="application/json">__DATA__</script>
