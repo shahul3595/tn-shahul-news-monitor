@@ -722,7 +722,12 @@ def record_attempt(con, item_id, kind, ok, http_status, err_type, err_text, ms):
 
 
 def drain_resolver(con, budget_s, tick=None):
-    from googlenewsdecoder import gnewsdecoder
+    try:
+        from googlenewsdecoder import gnewsdecoder
+    except Exception as ex:                 # a broken dependency must not stop the run:
+        log.error(f"resolver unavailable -- {type(ex).__name__}: {str(ex)[:160]}; "
+                  "links stay PENDING for the next run (check requirements.txt pins)")
+        return                              # feeds are stored, scoring and the database save go on
 
     interval = float(rt_get(con, "resolve_interval", RESOLVE_INTERVAL_START))
     okrun = int(rt_get(con, "consecutive_ok", 0))
