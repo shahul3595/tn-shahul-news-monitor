@@ -59,6 +59,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore the saved database
+        id: restore
         run: bash state.sh restore
 
       - name: Build and send the brief
@@ -108,9 +109,11 @@ jobs:
           if-no-files-found: ignore
 
       - name: Encrypt the database
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
         run: bash state.sh pack
 
       - name: Save the database for the next run
+        if: ${{ !cancelled() && steps.restore.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: state
