@@ -40,7 +40,7 @@ concurrency:
 jobs:
   digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       GH_TOKEN: ${{ github.token }}
       STATE_PASSPHRASE: ${{ secrets.STATE_PASSPHRASE }}
@@ -76,6 +76,8 @@ jobs:
           DIGEST_WEB_HOURS: ${{ vars.DIGEST_WEB_HOURS }}
           FEEDBACK_URL: ${{ vars.FEEDBACK_URL }}
           FEEDBACK_CSV_URL: ${{ secrets.FEEDBACK_CSV_URL }}
+          MINISTER_NAMES: ${{ vars.MINISTER_NAMES }}
+          ADMIN_PIN: ${{ secrets.ADMIN_PIN }}
         run: |
           python collect.py --init
           if [ "${{ github.event.inputs.backfill_days || '0' }}" != "0" ]; then
