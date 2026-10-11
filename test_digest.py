@@ -84,12 +84,19 @@ def add(con, title, tags=(), score=5, band="KEYWORD_KEEP", urgent=0, hours_ago=2
     _n[0] += 1
     n = _n[0]
     t = alerts.iso(T0 - timedelta(hours=hours_ago))
+    # the guards (step 9) want the article to carry what its category claims: a Velachery
+    # locality, a Thiruvallur place, his name. The synthetic prefix decides the category in
+    # FakeGemini, so the matching anchor goes into the description (and body) here.
+    anchor = {"con": "Velachery", "pol": "Velachery", "dis": "Thiruvallur", "men": "Minister R. Kumar"}.get(title[:3].lower(), "")
+    desc = f"{anchor} report" if anchor else ""
+    if body and anchor:
+        body = f"{anchor}. {body}"
     cur = con.execute("""INSERT INTO items (item_key, source_id, link, title, publisher, published_at, discovered_at,
-                   rules_at, resolve_status, resolved_url, extract_status, extract_host, extract_text,
+                   rules_at, resolve_status, resolved_url, extract_status, extract_host, extract_text, description,
                    score, band, urgent, target_tags, event_id, ai_category, ai_priority, ai_processed_at)
-                   VALUES (?, 'gn', ?, ?, ?, ?, ?, ?, 'RESOLVED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, 'gn', ?, ?, ?, ?, ?, ?, 'RESOLVED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (f"k{n}", f"https://news.google.com/rss/articles/T{n}", title, host.split(".")[0].title(),
-                 t, t, t, f"https://www.{host}/news/{n}", "OK" if body else "FAILED", host, body or None,
+                 t, t, t, f"https://www.{host}/news/{n}", "OK" if body else "FAILED", host, body or None, desc,
                  score, band, urgent, json.dumps(list(tags)), event,
                  ai[0] if ai else None, ai[1] if ai else None, t if ai else None))
     con.commit()
@@ -155,7 +162,12 @@ class FakeGemini:
 
 
 WORDS = ("lake road bridge sewage metro school hospital market temple bus drain power water rain tender "
-         "canal flyover garbage clinic library station stadium beach park bank".split())
+         "canal flyover garbage clinic library station stadium beach park bank harbour quarry pipeline "
+         "subway bypass junction crossing terminus depot nursery orchard gymnasium auditorium museum "
+         "aquarium theatre pavilion granary dairy bakery foundry kiln shipyard lighthouse jetty pier "
+         "marina reservoir aqueduct culvert embankment causeway tunnel viaduct arcade bazaar plaza "
+         "courtyard cloister chapel shrine monastery observatory planetarium laboratory refinery "
+         "warehouse silo hangar barracks armoury arsenal citadel fortress palace".split())
 
 
 def t(prefix, i):
@@ -258,16 +270,18 @@ def without_gemini_the_rules_rank_and_on_failure_they_take_over():
     add(con, "வேளச்சேரியில் வெள்ளம்", tags=["constituency"], urgent=1)
     add(con, "Thiruvallur collector meeting", tags=["district"], band="AUTO_KEEP")
     add(con, "TN AI mission", tags=["portfolio"])
-    add(con, "TVK vs DMK spat", tags=["party"])
+    add(con, "TVK vs DMK spat over Velachery drains", tags=["party"])
+    add(con, "TVK vs DMK spat in Madurai", tags=["party"])
     cands, chosen, urgent, sections, left, st = build(con, None)
     cats = {c["title"]: (c["category"], c["priority"]) for c in cands}
     check(cats["வேளச்சேரியில் வெள்ளம்"] == ("constituency", 1), cats)
     check(cats["Thiruvallur collector meeting"] == ("district", 2), cats)
-    check(cats["TVK vs DMK spat"] == ("political", 3), cats)
+    check(cats["TVK vs DMK spat over Velachery drains"] == ("political", 3), cats)
+    check(cats["TVK vs DMK spat in Madurai"] == ("none", 3), "generic party politics is none even from the rules")
     check(len(urgent) == 1, "rule-urgent item is on top")
-    check(st["rules"] == 4 and not st.get("gemini"), st)
+    check(st["rules"] == 5 and not st.get("gemini"), st)
     cands, chosen, *_ , st = build(con, FakeGemini(fail=True))
-    check(st["rules"] == 4, "gemini failed -> every item ranked by the rules")
+    check(st["rules"] == 5, "gemini failed -> every item ranked by the rules")
     check(any("stopped" in m for m in LOGS), "and the log says so")
 
 
@@ -319,7 +333,7 @@ def same_headline_and_same_story_collapse_to_one_candidate():
     metro = next(c for c in cands if "Metro" in c["title"])
     check(len(metro["sources"]) == 3, "three outlets pooled")
     check(sum(len(v) for v in sections.values()) + len(urgent) == 2, "and the story appears once, in one category")
-    check(st["merged"] == 2, st)
+    check(st["merged"] == 1, f"the two near-identical headlines met already in _load (one inside the other); the framing met here: {st}")
     # a real story is never swallowed by a merely similar-topic headline
     con = make_db("merge3.db")
     add(con, "Con story: Velachery lake desilting begins", host="thehindu.com")
@@ -491,6 +505,112 @@ def notes_are_filled_for_old_verdicts_and_reruns_are_dropped():
 
 
 @test
+def guards_refile_what_the_article_cannot_support():
+    import web
+    con = make_db("guards.db")
+    # Gemini said "mention" for other ministers; the article never names him
+    a = add(con, "திறந்து வைத்தார் அமைச்சர் ராஜீவ்: இசை உரிம மேலாண்மை தளம்", ai=("mention", 2))
+    con.execute("UPDATE items SET ai_takeaways=? WHERE id=?", (json.dumps(["Minister R. Kumar inaugurated the Online Music License portal.", "Second."]), a))
+    add(con, "அமைச்சர் ராஜ்குமார் மகிழ்ச்சி: வேளச்சேரியில் வீட்டுவசதி திட்டம்", tags=["constituency"], ai=("mention", 2))
+    add(con, "Minister R. Kumar inaugurates AI lab at Anna University", ai=("mention", 2))
+    # Velachery contamination
+    add(con, "Complaints over unauthorized street vending in Ambattur Ward 91", ai=("constituency", 2))
+    add(con, "Thoraipakkam police arrest serving constable", ai=("constituency", 2))
+    add(con, "CUMTA plans GST Road bus corridor in Tambaram", ai=("constituency", 2))
+    add(con, "Velachery-Thoraipakkam road floods after rain", ai=("constituency", 1))
+    # commercial vs land governance
+    add(con, "Chennai Office Space Rent Guide 2026: OMR vs Guindy vs Ambattur", ai=("portfolio", 3))
+    add(con, "Collector orders removal of encroachments on Velachery lake patta land", ai=("constituency", 2))
+    # generic politics
+    add(con, "TVK celebrates Madurantakam by-election win, cadres in Dharapuram", tags=["party"], ai=("political", 3))
+    add(con, "DMK slams TVK govt over Velachery drain delays", tags=["party"], ai=("political", 2))
+    con.commit()
+    g = FakeGemini()
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-guards")
+    def cat(prefix):
+        c = next(x for x in eds["latest"]["cands"] if x["title"].startswith(prefix))
+        return c["category"], c.get("guard")
+    check(cat("திறந்து வைத்தார்") == ("none", "name not in article"), cat("திறந்து வைத்தார்"))
+    check(cat("அமைச்சர் ராஜ்குமார்") == ("constituency", "name not in article"), "re-filed by the rules, not thrown away")
+    check(cat("Minister R. Kumar") == ("mention", None), "a real mention stands")
+    check(cat("Complaints over") == ("district", "outside Velachery (headline)"), cat("Complaints over"))
+    check(cat("Thoraipakkam police")[0] == "none" and cat("CUMTA plans")[0] == "none", (cat("Thoraipakkam police"), cat("CUMTA plans")))
+    check(cat("Velachery-Thoraipakkam") == ("constituency", None), "a Velachery headline stays whatever else it names")
+    check(cat("Chennai Office Space") == ("none", "commercial listing"), cat("Chennai Office Space"))
+    check(cat("Collector orders") == ("constituency", None), "land governance bypasses the commercial filter")
+    check(cat("TVK celebrates") == ("none", "generic politics"), cat("TVK celebrates"))
+    check(cat("DMK slams") == ("political", None), cat("DMK slams"))
+    byid = {c["id"]: c for c in eds["latest"]["cands"]}
+    check(byid[a]["takeaways"] == [] or not any("R. Kumar" in n for n in byid[a]["takeaways"]), f"notes that put his name into Rajeev's story are gone: {byid[a]['takeaways']}")
+    check(eds["latest"]["stats"]["guards"]["name not in article"] == 2, eds["latest"]["stats"].get("guards"))
+    # the briefing never says R. Kumar for a story that does not name him
+    check(all("R. Kumar" not in b["text"] or digest.names_in(digest._text(byid[b["id"]])) for grp in eds["latest"]["summary"] for b in grp["bullets"] if b.get("id") in byid), "briefing lines checked")
+
+
+@test
+def duplicates_merge_without_gemini_and_different_places_never_do():
+    import web
+    con = make_db("dupes.db")
+    hosts = ["thehindu.com", "thehindu.com", "illustrateddailynews.com", "timesnownews.com", "ndtv.com"]
+    for i, t_ in enumerate(["MeitY issues advisory on deepfakes, asks platforms to label manipulated content",
+                            "Centre's MeitY advisory: social media must flag deepfake and manipulated content",
+                            "MeitY advisory on manipulated content: what platforms must do now",
+                            "Deepfakes: MeitY advisory tells intermediaries to act on manipulated media",
+                            "Govt advisory on deepfakes puts onus on platforms"]):
+        add(con, "Por " + t_, host=hosts[i], hours_ago=1 + i, tags=["portfolio"])
+    add(con, "Con story: Zee Tamil report on Adambakkam MRTS station delay", host="zeenews.india.com", tags=["constituency"])
+    add(con, "Con story: Zee Tamil report on Adambakkam MRTS station delay | Zee Tamil News on Facebook", host="facebook.com", tags=["constituency"])
+    add(con, "Con story: வேளச்சேரியில் கனமழை: மழைநீர் தேங்கியது, குடியிருப்போர் அவதி", host="dinamalar.com", tags=["constituency"])
+    add(con, "Con story: அடையாறில் கனமழை: மழைநீர் தேங்கியது, குடியிருப்போர் அவதி", host="dinamalar.com", tags=["constituency"])
+    eds = web.publish(con, {}, T0, None, docs=TMP / "docs-dupes")       # no Gemini at all
+    cands = eds["latest"]["cands"]
+    meity = [c for c in cands if "MeitY" in c["title"] or "advisory" in c["title"]]
+    check(len(meity) == 1 and len(meity[0]["sources"]) == 4, f"five advisory reports are one card with 4 outlets: {[(c['title'][:30], c['sources']) for c in meity]}")
+    zee = [c for c in cands if "Adambakkam" in c["title"]]
+    check(len(zee) == 1, f"the Facebook copy (headline inside the post text) joins the report: {len(zee)}")
+    rain = [c for c in cands if "கனமழை" in c["title"]]
+    check(len(rain) == 2, f"a Velachery flood and an Adyar flood are two stories however alike: {len(rain)}")
+
+
+@test
+def archive_status_and_admin_page():
+    import web
+    con = make_db("archive.db")
+    add(con, "Con story: Velachery lake desilting begins", hours_ago=24 * 2 + 3, tags=["constituency"])   # the day before yesterday
+    add(con, "Dis story: Poondi reservoir level rises", hours_ago=24 * 2 + 5, tags=["district"])
+    add(con, "Non story: cinema gossip", hours_ago=24 * 2 + 1, band="DROP")
+    add(con, "Con story: today's item", hours_ago=1)
+    docs = TMP / "docs-arch"
+    env = {"ADMIN_PIN": "orchid-9981", "GITHUB_REPOSITORY": "someone/some-repo", "FEEDBACK_CSV_URL": ""}
+    web.backfill(con, env, T0, 3, None, docs=docs)
+    web.publish(con, env, T0, None, docs=docs)
+    day = (T0.astimezone(alerts.IST).date() - timedelta(days=2)).strftime("%Y-%m-%d")
+    arch = json.loads((docs / "archive" / f"{day}.json").read_text(encoding="utf-8"))
+    check(arch["stories"] == 2 and not arch["final"], f"two kept items archived for {day}, the dropped one not: {arch['stories']}")
+    check(all(k in arch["items"][0] for k in ("title", "url", "outlet", "cat", "sentiment", "takeaways", "shown")) and "extract_text" not in json.dumps(arch), "no article bodies")
+    check(all(i["shown"] for i in arch["items"]), "both made the page, so both are marked shown")
+    idx = json.loads((docs / "archive" / "index.json").read_text(encoding="utf-8"))
+    check(idx["days"][0]["day"] == day, idx)
+    n = (docs / "archive" / f"{day}.json").stat().st_mtime_ns
+    web.publish(con, env, T0 + timedelta(hours=1), None, docs=docs)
+    check((docs / "archive" / f"{day}.json").stat().st_mtime_ns == n, "written once, not every run")
+    ed_idx = json.loads((docs / "data" / "index.json").read_text(encoding="utf-8"))
+    check(len([e for e in ed_idx["editions"] if e["key"] != "latest"]) == 4 and sum(1 for e in ed_idx["editions"] if e.get("pick")) == 4, "every edition stays and is listed")
+    st = json.loads((docs / "data" / "status.json").read_text(encoding="utf-8"))
+    check(st["gemini"]["state"] == "standby" and st["gemini"]["limit"] == 80 and st["feedback"] == {"connected": False}, st["gemini"])
+    check(st["collector"]["items_24h"] == 1 and st["editions"]["archive_days"] == 1, st["collector"])
+    check("github" not in json.dumps(st).lower(), "the snapshot names no host")
+    page = (docs / "admin.html").read_text(encoding="utf-8")
+    check("github" not in page.lower() and "actions" not in page.lower().replace("transactions", ""), "the admin page names no host before the PIN")
+    sealed = json.loads(page.split('<script id="sealed" type="application/json">')[1].split("</script>")[0])
+    cfg = json.loads(web.unseal("orchid-9981", sealed))
+    check(cfg["runs"].startswith("https://api.github.com/repos/someone/some-repo/") and web.unseal("orchid-9980", sealed) is None, "sealed with the PIN")
+    check('id="open-archive"' in (docs / "index.html").read_text(encoding="utf-8") and "admin" not in (docs / "index.html").read_text(encoding="utf-8").lower(), "the public page has the archive, no link to admin")
+    web.write_admin(docs, {})
+    check("Not configured" in (docs / "admin.html").read_text(encoding="utf-8"), "without ADMIN_PIN the page says so")
+
+
+@test
 def summary_is_cached_until_the_top_stories_change():
     import web
     con = make_db("summary.db")
@@ -527,7 +647,8 @@ def backfill_writes_dated_editions_and_the_index():
     web.publish(con, {}, T0, None, docs=docs)
     idx = json.loads((docs / "data" / "index.json").read_text(encoding="utf-8"))
     keys = [e["key"] for e in idx["editions"]]
-    check(keys[0] == "latest" and len(keys) == 8 and keys[1] == "2026-10-15", keys)
+    check(keys[0] == "latest" and len(keys) == 9 and keys[1] == "2026-10-15", f"latest + every day (7 backfilled + today): {keys}")
+    check([e["key"] for e in idx["editions"] if e.get("pick")] == keys[1:8], "the picker offers the first 7; the archive view the rest")
     check((docs / "data" / "2026-10-08.json").exists(), "the 7th day back exists")
     day = next(e for e in idx["editions"] if e["key"] == "2026-10-14")
     check(day["counts"] == {"constituency": {"positive": 0, "neutral": 1, "critical": 0}} and day["total"] == 1, day)
@@ -560,17 +681,24 @@ def the_page_embeds_the_latest_edition_and_the_app_markup():
 @test
 def rendering_escapes_html_and_stays_under_the_limit():
     con = make_db("render.db")
+    hosts = ["dinamalar.com", "dailythanthi.com", "maalaimalar.com", "dinamani.com", "thehindu.com", "dtnext.in"]
+    TA = ["ஏரி", "சாலை", "பாலம்", "கழிவுநீர்", "மெட்ரோ", "பள்ளி", "மருத்துவமனை", "சந்தை", "கோயில்", "பேருந்து", "வடிகால்",
+          "மின்சாரம்", "தண்ணீர்", "மழை", "துறைமுகம்", "நூலகம்", "அரங்கம்", "கடற்கரை", "பூங்கா", "வங்கி", "கால்வாய்", "மேம்பாலம்",
+          "குப்பை", "மருந்தகம்", "நிலையம்", "விமானம்", "ரயில்", "சுரங்கம்", "அணை", "கிணறு", "குளம்", "காடு", "மலை", "ஆறு", "தீவு",
+          "கோட்டை", "அரண்மனை", "சந்திப்பு", "முனையம்", "பணிமனை", "தொழிற்சாலை", "கிடங்கு"]
     for i in range(30):
-        add(con, t("Con", i) + f": வேளச்சேரியில் <கனமழை> {i} & \"மழைநீர்\" தேங்கியது " + " ".join(
-            __import__("random").Random(i).sample(["ஏரி", "சாலை", "பாலம்", "கழிவுநீர்", "மெட்ரோ", "பள்ளி", "மருத்துவமனை",
-                                                    "சந்தை", "கோயில்", "பேருந்து", "வடிகால்", "மின்சாரம்", "தண்ணீர்", "மழை"], 8)),
-            body="x" * 500)
+        # 30 genuinely distinct stories -- no two share more than one word -- each carrying
+        # the characters the renderer must escape; alike-looking lines from one outlet are
+        # one story now, so the fixture must not look alike
+        add(con, f"Con story {i}: {WORDS[2 * i]} {WORDS[2 * i + 1]} <மழை> {i} & \"மழைநீர்\" "
+                 f"{TA[i]} {TA[(i + 11) % 42]} {TA[(i + 23) % 42]}",
+            host=hosts[i % 6], body="x" * 500)
     cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), per=30, total=30)
     msgs = digest.render("morning", T0, urgent, sections, len(chosen), len(cands), True)
     check(len(msgs) >= 2, f"30 long Tamil lines need more than one message: {len(msgs)}")
     for m in msgs:
         check(rules.utf16_len(m) <= 4096, "under Telegram's limit")
-        check("<கனமழை>" not in m and "&lt;கனமழை&gt;" in m, "angle brackets escaped")
+        check("<மழை>" not in m and "&lt;மழை&gt;" in m, "angle brackets escaped")
         check("&amp;" in m, "ampersand escaped")
         check(re.search(r"\(\d/\d\)", m), "numbered parts")
         check(m.count("<a href=") == m.count("</a>"), "links balanced")

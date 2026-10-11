@@ -17,9 +17,12 @@ English reports of one event become one story) -> merge -> select (10 per catego
 total) -> a 3-bullet executive summary (one call, cached until the top stories change).
 """
 
+import base64
 import hashlib
+import hmac
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -29,8 +32,10 @@ from alerts import IST, esc, fmt_ist, iso
 
 log = logging.getLogger("collect.digest.web")
 DOCS = digest.HERE / "docs"
-KEEP_DAYS = 30                # dated editions kept in docs/data
-PICKER_DAYS = 7               # offered in the date picker
+PICKER_DAYS = 7               # offered in the date picker; every edition ever published stays in docs/data
+ARCHIVE_AT_DAYS = 2           # a day's kept items are archived once it is this old ...
+ARCHIVE_FINAL_DAYS = 15       # ... and once more here, after Google News has stopped re-serving it
+MATRIX_DAYS = 30              # the 7-day matrix can be widened to this
 CATEGORIES, NICE, ICONS = digest.CATEGORIES, digest.NICE, digest.ICONS
 
 SCHEMA = ["CREATE TABLE IF NOT EXISTS editions (key TEXT PRIMARY KEY, cand_hash TEXT, clustered_at TEXT, "
@@ -101,12 +106,15 @@ def build(con, env, now, key, since, until, gemini=None):
     if gemini is not None and cands and (row is None or row["cand_hash"] != ch):
         groups = digest.cluster(gemini, con, cands, f"{key}@{ch}")
         st["clusters"] = groups
+        if getattr(digest.cluster, "last_refused", None):
+            st["refused"] = list(digest.cluster.last_refused)
+            digest.cluster.last_refused = []
         con.execute("INSERT INTO editions (key, cand_hash, clustered_at, made_at) VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET cand_hash=excluded.cand_hash, clustered_at=excluded.clustered_at",
                     (key, ch, iso(now), iso(now)))
         con.commit()
     before = len(cands)
-    cands = digest.merge_stories(cands)
+    cands = digest.merge_stories(cands, con)
     st["merged"] = before - len(cands)
     urgent, sections, leftovers = digest.select(cands, cfg["web_per"], cfg["web_max"])
     chosen = urgent + [c for cat in CATEGORIES for c in sections[cat]]
@@ -148,8 +156,11 @@ def _summary(con, gemini, key, urgent, sections, row, now):
             for b in (g.get("takeaways") or [])[:3]:
                 text = str(b.get("text", "") if isinstance(b, dict) else b).strip()
                 n = digest._int(b.get("story"), 1, len(numbered), 0) if isinstance(b, dict) else 0
+                src = numbered[n - 1] if n else None
+                if text and digest.names_in(text, (), strict=True) and (src is None or not digest.names_in(digest._text(src), src.get("tags") or ())):
+                    continue                          # his name put into a story that does not carry it
                 if text:
-                    bullets.append({"text": text, "id": numbered[n - 1]["id"] if n else None})
+                    bullets.append({"text": text, "id": src["id"] if src else None})
             if cat and bullets and cat not in got:
                 got[cat] = bullets
         out = [{"cat": cat, "bullets": got[cat]} for cat, _ in groups if cat in got]
@@ -172,6 +183,7 @@ def _story(c, urgent):
             "reports": [{"outlet": r["outlet"], "url": r["url"], "title": r["title"], "lang": r["lang"]}
                         for r in (c.get("reports") or []) if r["url"] != alerts.display_url(c)],
             "takeaways": c.get("takeaways") or [],
+            "merged": [i for i in (c.get("merged") or []) if i != c["id"]],
             "cat": c["category"], "urgent": bool(urgent), "sentiment": c.get("sentiment") or "neutral",
             "priority": c["priority"], "impact": c.get("impact") or 5,
             "snippet": digest._snippet(c), "image": digest._image_for(c) or "",
@@ -201,14 +213,11 @@ def _index(data_dir, now):
             days.append(datetime.strptime(p.stem, "%Y-%m-%d").date())
         except ValueError:
             continue
-    days.sort(reverse=True)
-    for d in days[KEEP_DAYS:]:
-        (data_dir / f"{d:%Y-%m-%d}.json").unlink(missing_ok=True)
-    days = days[:KEEP_DAYS]
+    days.sort(reverse=True)               # nothing is deleted: every edition ever published stays
     entries = [{"key": "latest", "file": "data/latest.json", "label": "Latest"}]
-    entries += [{"key": f"{d:%Y-%m-%d}", "file": f"data/{d:%Y-%m-%d}.json", "label": d.strftime("%a %d %b")}
-                for d in days[:PICKER_DAYS]]
-    for e in entries:                     # category x sentiment counts, for the 7-day matrix
+    entries += [{"key": f"{d:%Y-%m-%d}", "file": f"data/{d:%Y-%m-%d}.json", "label": d.strftime("%a %d %b"),
+                 "pick": k < PICKER_DAYS} for k, d in enumerate(days)]
+    for e in entries:                     # category x sentiment counts, for the matrix
         try:
             payload = json.loads((data_dir / Path(e["file"]).name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -245,13 +254,237 @@ def write_page(docs, latest_payload, entries, feedback_url=""):
 
 
 # --------------------------------------------------------------------------
+# the item archive -- one file per day, everything the rules kept, not only the page
+# --------------------------------------------------------------------------
+
+def _shown_ids(docs, day_key):
+    try:
+        ed = json.loads((Path(docs) / "data" / f"{day_key}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    out = set()
+    for st in ed.get("stories", []):
+        out.add(st["id"])
+        out.update(st.get("merged") or [])
+    return out
+
+
+def write_archive(con, docs, now, env=None, force_days=()):
+    """docs/archive/YYYY-MM-DD.json for the day that turned ARCHIVE_AT_DAYS old (written
+    once) and the day that turned ARCHIVE_FINAL_DAYS old (written once more, marked final:
+    Google News re-serves a story for up to 14 days, so that pass catches late arrivals).
+    No article bodies -- titles, links, outlets, dates, categories, sentiment, notes."""
+    docs = Path(docs)
+    adir = docs / "archive"
+    adir.mkdir(parents=True, exist_ok=True)
+    today = now.astimezone(IST).date()
+    written = []
+    jobs = [(today - timedelta(days=ARCHIVE_AT_DAYS), False), (today - timedelta(days=ARCHIVE_FINAL_DAYS), True)]
+    jobs += [(d, True) for d in force_days]
+    for day, final in jobs:
+        path = adir / f"{day:%Y-%m-%d}.json"
+        if path.exists() and not final:
+            continue
+        if path.exists() and final:
+            try:
+                if json.loads(path.read_text(encoding="utf-8")).get("final"):
+                    continue
+            except (OSError, ValueError):
+                pass
+        since, until = _day_bounds(day)
+        cands, ids = digest._load(con, f"coalesce(i.published_at, i.discovered_at) < '{iso(until)}'",
+                                  since - timedelta(days=2), since)
+        if not ids and not path.exists():
+            continue
+        digest.rank_all(con, cands, None, now)          # stored verdicts and the rules; no Gemini calls
+        shown = _shown_ids(docs, f"{day:%Y-%m-%d}")
+        items = []
+        for c in sorted(cands, key=digest._order):
+            items.append({"id": c["id"], "title": digest._title(c), "url": alerts.display_url(c),
+                          "outlet": alerts.outlet_name(c), "lang": "ta" if digest._is_tamil(c) else "en",
+                          "published": fmt_ist(c["published_at"] or c["discovered_at"]),
+                          "cat": c["category"], "priority": c["priority"], "sentiment": c.get("sentiment") or "neutral",
+                          "takeaways": c.get("takeaways") or [], "by": c.get("by", ""),
+                          "outlets": c.get("sources") or [], "shown": c["id"] in shown or bool(set(c.get("merged") or []) & shown)})
+        payload = {"day": f"{day:%Y-%m-%d}", "label": day.strftime("%A %d %B %Y"), "written": iso(now), "final": final,
+                   "items_in_db": len(ids), "stories": len(items), "shown": sum(1 for i in items if i["shown"]), "items": items}
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        written.append(f"{day:%Y-%m-%d}")
+    # the archive index
+    days = []
+    for p in sorted(adir.glob("????-??-??.json"), reverse=True):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            days.append({"day": d["day"], "file": f"archive/{p.name}", "stories": d.get("stories", 0),
+                         "shown": d.get("shown", 0), "final": bool(d.get("final"))})
+        except (OSError, ValueError, KeyError):
+            continue
+    (adir / "index.json").write_text(json.dumps({"generated": iso(now), "days": days}, ensure_ascii=False), encoding="utf-8")
+    return written
+
+
+# --------------------------------------------------------------------------
+# the status snapshot (docs/data/status.json) and the admin page
+# --------------------------------------------------------------------------
+
+def _feedback_counts(env, now):
+    url = digest.settings(env)["feedback_csv"]
+    if not url:
+        return {"connected": False}
+    try:
+        import csv
+        import io
+        import httpx
+        r = httpx.get(url, timeout=20.0, follow_redirects=True)
+        if r.status_code != 200:
+            return {"connected": True, "error": f"HTTP {r.status_code}"}
+        rows = list(csv.reader(io.StringIO(r.text)))
+    except Exception as ex:
+        return {"connected": True, "error": type(ex).__name__}
+    out = {"connected": True, "all": {"up": 0, "down": 0, "missing": 0}, "week": {"up": 0, "down": 0, "missing": 0}}
+    week = now - timedelta(days=7)
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
+        kind = row[1].strip().lower()
+        if kind not in out["all"]:
+            continue
+        out["all"][kind] += 1
+        ts = None
+        try:
+            ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=IST)
+        except ValueError:
+            pass
+        if ts is not None and ts >= week:
+            out["week"][kind] += 1
+    return out
+
+
+def status_snapshot(con, env, now, editions, brief=None, gemini=None):
+    """What the admin page shows. Counts and times only -- nothing that names the host."""
+    cfg = digest.settings(env)
+    day = alerts.utcnow().strftime("%Y-%m-%d")          # the budget table is kept by the real clock
+    r = con.execute("SELECT calls FROM ai_budget WHERE day=?", (day,)).fetchone()
+    calls = r[0] if r else 0
+    dead = gemini.dead if gemini is not None else None
+    if not (env.get("GEMINI_API_KEY") or "").strip():
+        state, note = "standby", "no GEMINI_API_KEY"
+    elif dead and ("HTTP 4" in dead or "check GEMINI" in dead):
+        state, note = "standby", dead
+    elif dead or calls >= cfg["ai_calls"]:
+        state, note = "throttled", dead or "daily cap reached"
+    else:
+        state, note = "active", ""
+    since24 = iso(now - timedelta(hours=24))
+    q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
+    last_run = q("SELECT max(ts) FROM poll_runs")
+    items24 = q("SELECT count(*) FROM items WHERE discovered_at >= ?", since24)
+    kept24 = q("SELECT count(*) FROM items WHERE discovered_at >= ? AND (band IN ('AUTO_KEEP','AI','KEYWORD_KEEP') OR urgent=1)", since24)
+    unscored = q("SELECT count(*) FROM items WHERE rules_at IS NULL")
+    pending_resolve = q("SELECT count(*) FROM items WHERE resolve_status='PENDING'")
+    pending_extract = q("SELECT count(*) FROM items WHERE extract_status='PENDING' AND resolve_status='RESOLVED'")
+    yt_failing = [row[0] for row in con.execute("""SELECT s.name FROM sources s WHERE s.kind='youtube' AND coalesce(s.enabled,1)=1
+                     AND EXISTS (SELECT 1 FROM poll_runs p WHERE p.source_id=s.source_id AND p.ts >= ?)
+                     AND NOT EXISTS (SELECT 1 FROM poll_runs p WHERE p.source_id=s.source_id AND p.ts >= ? AND coalesce(p.entries,0) > 0)
+                     ORDER BY s.name""", (since24, since24))]
+    grouping = {"clusters": 0, "refused": [], "reruns": 0, "guards": {}}
+    for key, ed in (editions or {}).items():
+        st = ed.get("stats") or {}
+        grouping["clusters"] += st.get("clusters", 0)
+        grouping["reruns"] += st.get("reruns", 0)
+        for why, n in (st.get("guards") or {}).items():
+            grouping["guards"][why] = grouping["guards"].get(why, 0) + n
+        for rf in st.get("refused") or []:
+            grouping["refused"].append(dict(rf, edition=key))
+    grouping["refused"] = grouping["refused"][:12]
+    last_brief = con.execute("SELECT slot, sent_at, chosen, status FROM digests ORDER BY id DESC LIMIT 1").fetchone()
+    adir = Path(DOCS) / "archive"
+    try:
+        arch = json.loads((adir / "index.json").read_text(encoding="utf-8")).get("days", [])
+    except (OSError, ValueError):
+        arch = []
+    return {"generated": iso(now), "generated_ist": fmt_ist(iso(now)),
+            "gemini": {"calls_today": calls, "limit": cfg["ai_calls"], "state": state, "note": note,
+                       "calls_this_run": gemini.calls if gemini is not None else 0, "model": cfg["model"]},
+            "collector": {"last_run": fmt_ist(last_run) if last_run else "", "last_run_iso": last_run or "",
+                          "items_24h": items24, "kept_24h": kept24, "dropped_24h": items24 - kept24, "unscored": unscored,
+                          "pending_resolve": pending_resolve, "pending_extract": pending_extract, "youtube_failing": yt_failing},
+            "brief": {"slot": last_brief["slot"], "sent": fmt_ist(last_brief["sent_at"] or ""), "chosen": last_brief["chosen"],
+                      "status": last_brief["status"]} if last_brief else {},
+            "grouping": grouping,
+            "editions": {"stories_latest": len((editions or {}).get("latest", {}).get("chosen", [])),
+                         "dated": len(list((Path(DOCS) / "data").glob("????-??-??.json"))), "archive_days": len(arch)},
+            "feedback": _feedback_counts(env, now)}
+
+
+# --- a secret sealed with the PIN: PBKDF2 -> HMAC-SHA256 keystream (CTR) + HMAC tag.
+#     The browser does the same with WebCrypto, so nothing in admin.html says where the
+#     runs live until the right PIN has been typed.
+
+def _kdf(pin, salt, iters=120000):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, iters, dklen=64)
+
+
+def seal(pin, text, iters=120000):
+    salt, nonce = os.urandom(16), os.urandom(16)
+    key = _kdf(pin, salt, iters)
+    enc_key, mac_key = key[:32], key[32:]
+    data = text.encode("utf-8")
+    stream = b""
+    for i in range((len(data) + 31) // 32):
+        stream += hmac.new(enc_key, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest()
+    ct = bytes(a ^ b for a, b in zip(data, stream))
+    tag = hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    b64 = lambda b: base64.b64encode(b).decode()
+    return {"v": 1, "iters": iters, "salt": b64(salt), "nonce": b64(nonce), "ct": b64(ct), "tag": b64(tag)}
+
+
+def unseal(pin, blob):
+    """Python twin of the page's unlock, for the tests."""
+    b = lambda k: base64.b64decode(blob[k])
+    key = _kdf(pin, b("salt"), blob["iters"])
+    enc_key, mac_key = key[:32], key[32:]
+    nonce, ct = b("nonce"), b("ct")
+    if not hmac.compare_digest(hmac.new(mac_key, nonce + ct, hashlib.sha256).digest(), b("tag")):
+        return None
+    stream = b""
+    for i in range((len(ct) + 31) // 32):
+        stream += hmac.new(enc_key, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest()
+    return bytes(a ^ b for a, b in zip(ct, stream)).decode("utf-8")
+
+
+def write_admin(docs, env):
+    """docs/admin.html: a PIN prompt and, behind it, the status page. The run-log host is
+    sealed with the PIN; without ADMIN_PIN the page says it is not configured."""
+    docs = Path(docs)
+    pin = (env.get("ADMIN_PIN") or "").strip()
+    repo = (env.get("GITHUB_REPOSITORY") or os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    sealed = "null"
+    if pin:
+        cfg = {"status": "data/status.json"}
+        if repo:
+            cfg["runs"] = f"https://api.github.com/repos/{repo}/actions/runs?per_page=12"
+            cfg["web"] = f"https://github.com/{repo}/actions/runs/"
+            cfg["accept"] = "application/vnd.github+json"
+        sealed = json.dumps(seal(pin, json.dumps(cfg)))
+    html = ADMIN_PAGE.replace("__SEALED__", sealed).replace("__CSS__", CSS)
+    (docs / "admin.html").write_text(html, encoding="utf-8")
+    return docs / "admin.html"
+
+
+# --------------------------------------------------------------------------
 # entry points
 # --------------------------------------------------------------------------
 
-def publish(con, env, now, gemini=None, docs=None, days_back=1):
+def publish(con, env, now, gemini=None, docs=None, days_back=1, brief=None):
     """Rebuild the latest edition and the dated editions for today and `days_back` earlier
-    days (late-arriving stories land on the right day), then the index and the page."""
+    days (late-arriving stories land on the right day), then the index, the archive, the
+    status snapshot, the page and the admin page."""
+    global DOCS
     docs = Path(docs or DOCS)
+    DOCS = docs
     cfg = digest.settings(env)
     migrate(con)
     out = {}
@@ -267,6 +500,18 @@ def publish(con, env, now, gemini=None, docs=None, days_back=1):
         out[f"{day:%Y-%m-%d}"] = ed
     entries = _index(docs / "data", now)
     write_page(docs, latest_payload, entries, cfg["feedback_url"])
+    try:
+        archived = write_archive(con, docs, now, env)
+        if archived:
+            log.info(f"archive: wrote {', '.join(archived)}")
+    except Exception:
+        log.exception("archive: could not write (the page itself is unaffected)")
+    try:
+        snap = status_snapshot(con, env, now, out, brief, gemini)
+        (docs / "data" / "status.json").write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+        write_admin(docs, env)
+    except Exception:
+        log.exception("status: could not write the snapshot or admin page")
     return out
 
 
@@ -344,7 +589,8 @@ section.urgent h2{color:var(--urgent)}section[hidden]{display:none}
 .card .body{padding:12px 14px 8px;display:flex;flex-direction:column;gap:6px;flex:1}
 .card h3{font-size:16px;margin:0;line-height:1.35;font-weight:600}.card h3 a{color:var(--ink);text-decoration:none}.card h3 a:hover{text-decoration:underline}
 .card p{margin:0;color:var(--dim);font-size:14px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.card .notes{margin:0;padding-left:18px;font-size:14px;color:var(--ink)}.card .notes li{margin:2px 0}
+.card .ailbl{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim)}.card .notes{margin:0;padding-left:18px;font-size:14px;color:var(--ink)}.card .notes li{margin:2px 0}
+body.nonotes .card .ailbl{display:none}
 body.nonotes .card .notes,body.nonotes .card p,body.nonotes .card img{display:none}body.nonotes .card .body{padding:10px 14px 6px}
 .card .hrow{display:flex;gap:10px;align-items:flex-start}.card .hrow h3{flex:1;min-width:0}
 .card .tick{display:none;flex:0 0 44px;height:44px;align-items:center;justify-content:center;background:var(--chip);border:1px solid var(--line);border-radius:10px;cursor:pointer;margin-top:-4px}
@@ -377,7 +623,10 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .drawer a,.drawer button.link{display:flex;align-items:center;min-height:44px;padding:0 8px;border-radius:10px;color:var(--ink);text-decoration:none;font:inherit;background:transparent;border:0;width:100%;text-align:left;cursor:pointer;font-size:15px}
 .drawer a:hover,.drawer button.link:hover{background:var(--chip)}.drawer .close{position:absolute;top:10px;right:10px}
 .drawer select{width:100%;min-height:44px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);padding:8px}
-.drawer .seg{display:flex;gap:6px}.drawer .seg .btn{flex:1}.drawer label.opt{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 8px;font-size:15px;cursor:pointer}.drawer label.opt input{width:20px;height:20px;accent-color:var(--accent)}
+.drawer .seg{display:flex;gap:6px}.drawer .seg .btn{flex:1}.tools label.opt.sm{display:inline-flex;align-items:center;gap:6px;min-height:44px;font-size:14px;color:var(--dim);cursor:pointer}.tools label.opt.sm input{width:18px;height:18px;accent-color:var(--accent)}
+.hits{margin:0;padding-left:0;list-style:none;font-size:14px}.hits li{padding:6px 0;border-top:1px solid var(--line)}.hits li:first-child{border-top:0}.hits a{color:var(--ink);text-decoration:none}.hits a:hover{color:var(--accent)}.hits small{color:var(--dim);margin-left:6px}
+.month{margin:10px 0 4px;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim)}.arow{display:flex;align-items:center;gap:8px;min-height:44px;border-top:1px solid var(--line)}.arow b{flex:1;font-weight:500}.arow button{font:inherit;font-size:13px;min-height:36px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);padding:4px 10px;cursor:pointer}
+.architems{max-height:60vh;overflow:auto;font-size:14px}.architems div{padding:6px 0;border-top:1px solid var(--line)}.architems a{color:var(--ink);text-decoration:none}.architems small{color:var(--dim)}.architems .dim{opacity:.6}.drawer label.opt{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 8px;font-size:15px;cursor:pointer}.drawer label.opt input{width:20px;height:20px;accent-color:var(--accent)}
 #top{position:fixed;right:16px;bottom:16px;display:none;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.2)}#top.on{display:inline-flex}
 .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30}
 .empty{color:var(--dim);padding:20px 0}footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
@@ -395,11 +644,11 @@ var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){retu
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{}};
 try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off'}catch(e){}
-function waText(s,withNotes){var t='*'+(s.urgent?'🚨 ':'')+s.title+'*\n';if(withNotes&&s.takeaways&&s.takeaways.length)t+=s.takeaways.map(function(b){return '• '+b}).join('\n')+'\n';return t+'🔗 '+s.url}
+function waText(s,withNotes){var t='*'+(s.urgent?'🚨 ':'')+s.title+'*\n';if(withNotes&&s.takeaways&&s.takeaways.length)t+='_AI summary_\n'+s.takeaways.map(function(b){return '• '+b}).join('\n')+'\n';return t+'🔗 '+s.url}
 function waLink(text){return 'https://wa.me/?text='+encodeURIComponent(text)}
 function story(id){return DATA.stories.filter(function(x){return String(x.id)===String(id)})[0]}
 function group(s){return s.urgent?'urgent':s.cat}
-function card(s){var g=group(s),notes=s.takeaways&&s.takeaways.length?'<ul class="notes">'+s.takeaways.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul>':(s.snippet?'<p>'+esc(s.snippet)+'</p>':'');
+function card(s){var g=group(s),notes=s.takeaways&&s.takeaways.length?'<div class="ailbl">✨ AI summary</div><ul class="notes">'+s.takeaways.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul>':(s.snippet?'<p>'+esc(s.snippet)+'</p>':'');
  var why=REASONS.map(function(r){return '<button type="button" data-r="'+r[0]+'">'+esc(r[1])+'</button>'}).join('');
  var acts=state.voted[s.id]?'<span class="done">Thanks for the feedback</span>':'<button type="button" class="up" aria-label="Useful">👍</button><button type="button" class="down" aria-label="Not useful">👎</button><div class="why">'+why+'</div>';
  return '<article class="card" id="story-'+s.id+'" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+(s.snippet||'')+' '+s.outlet+' '+(s.reports||[]).map(function(r){return r.outlet}).join(' ')+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
@@ -455,13 +704,30 @@ $('#selshare').onclick=function(ev){ev.preventDefault();var ids=Object.keys(stat
  if(list.length>25)toast('That is a long message — WhatsApp may cut it');window.open(waLink(t),'_blank','noopener')};
 function setView(v){state.view=v;$$('.grid').forEach(function(g){g.classList.toggle('list',v==='list')});$$('[data-view]').forEach(function(b){b.setAttribute('aria-pressed',b.getAttribute('data-view')===v)});try{localStorage.setItem('view',v)}catch(e){}}
 $$('[data-view]').forEach(function(b){b.onclick=function(){setView(b.getAttribute('data-view'))}});
-$('#q').addEventListener('input',function(){state.q=this.value;apply()});
+$('#q').addEventListener('input',function(){state.q=this.value;apply();allSearch()});
+var ALL={},ARCH=null,qt=null;$('#qall').onchange=function(){allSearch()};
+function loadEdition(e){if(ALL[e.key])return Promise.resolve(ALL[e.key]);return fetch(e.file,{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){ALL[e.key]=d;return d})}
+function allSearch(){var box=$('#allhits');clearTimeout(qt);var q=state.q.toLowerCase().normalize('NFC').trim();if(!$('#qall').checked||q.length<3){box.hidden=true;return}
+ qt=setTimeout(function(){var eds=EDS.filter(function(e){return e.key!=='latest'});Promise.all(eds.map(function(e){return loadEdition(e).catch(function(){return null})})).then(function(ds){var hits=[];ds.forEach(function(d,i){if(!d)return;d.stories.forEach(function(s){var txt=(s.title+' '+(s.snippet||'')+' '+(s.takeaways||[]).join(' ')+' '+s.outlet).toLowerCase();if(txt.indexOf(q)>-1)hits.push({e:eds[i],s:s})})});
+  if(hits.length>60)hits=hits.slice(0,60);$('#allhits-n').textContent=hits.length+(hits.length===60?'+ matches':' matches');box.hidden=false;
+  $('#allhits-list').innerHTML=hits.map(function(h){return '<li><a href="#" data-e="'+esc(h.e.file)+'" data-s="'+h.s.id+'">'+esc(h.s.title)+'</a><small>'+esc(h.e.label)+' · '+esc(h.s.outlet)+'</small></li>'}).join('')||'<li>nothing in '+ds.filter(Boolean).length+' editions</li>';
+  $$('#allhits-list a').forEach(function(a){a.onclick=function(ev){ev.preventDefault();var id=a.getAttribute('data-s');$('#q').value='';state.q='';box.hidden=true;drill(a.getAttribute('data-e'),'','');setTimeout(function(){jump(id)},400)}})})},250)}
+function archive(){var dlg=$('#archive'),days=EDS.filter(function(e){return e.key!=='latest'});var months={},order=[];days.forEach(function(e){var m=e.key.slice(0,7);if(!months[m]){months[m]=[];order.push(m)}months[m].push(e)});
+ var mname=function(m){var d=new Date(m+'-01T00:00:00');return d.toLocaleString('en-IN',{month:'long',year:'numeric'})};
+ var arch={};(ARCH||[]).forEach(function(a){arch[a.day]=a});
+ $('#archlist').innerHTML=order.map(function(m){return '<div class="month">'+esc(mname(m))+'</div>'+months[m].map(function(e){var a=arch[e.key];return '<div class="arow"><b>'+esc(e.label)+'</b><span class="sub">'+(e.total||0)+' stories</span><button type="button" data-open="'+esc(e.file)+'">Open</button>'+(a?'<button type="button" data-arch="'+esc(a.file)+'" data-day="'+esc(e.label)+'">all kept ('+a.stories+')</button>':'')+'</div>'}).join('')}).join('')||'<p class="empty">No editions yet.</p>';
+ $$('#archlist [data-open]').forEach(function(b){b.onclick=function(){dlg.close();load(b.getAttribute('data-open'))}});
+ $$('#archlist [data-arch]').forEach(function(b){b.onclick=function(){fetch(b.getAttribute('data-arch'),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){$('#archday-title').textContent='Everything kept — '+(d.label||b.getAttribute('data-day'));
+  $('#archday-list').innerHTML=d.items.map(function(i){return '<div'+(i.shown?'':' class="dim"')+'><a href="'+esc(i.url)+'" target="_blank" rel="noopener">'+esc(i.title)+'</a><br><small>'+esc(NAME[i.cat]||i.cat)+' · '+esc(SENT[i.sentiment]||'')+' · '+esc(i.outlet)+' · '+esc(i.published)+(i.shown?'':' · not on the page')+'</small></div>'}).join('');dlg.close();$('#archday').showModal()}).catch(function(){toast('Could not load that day')})}});
+ dlg.showModal()}
+$('#open-archive').onclick=function(){openD(false);if(ARCH===null){fetch('archive/index.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){ARCH=j.days||[];archive()}).catch(function(){ARCH=[];archive()})}else archive()};
+$('#close-archive').onclick=function(){$('#archive').close()};$('#close-archday').onclick=function(){$('#archday').close()};
 $('#clear').onclick=function(){state.cat='';state.sent='';apply()};
-function fillPickers(){var o=EDS.map(function(e){return '<option value="'+esc(e.file)+'"'+(e.key===DATA.key?' selected':'')+'>'+esc(e.label)+'</option>'}).join('');$$('select.pick').forEach(function(s){s.innerHTML=o})}
+function fillPickers(){var o=EDS.filter(function(e){return e.key==='latest'||e.pick!==false||e.key===DATA.key}).map(function(e){return '<option value="'+esc(e.file)+'"'+(e.key===DATA.key?' selected':'')+'>'+esc(e.label)+'</option>'}).join('');$$('select.pick').forEach(function(s){s.innerHTML=o})}
 function load(file,after){if(!file)return;var e=EDS.filter(function(x){return x.file===file})[0];if(e&&e.key===DATA.key){if(after)after();return}
  fetch(file,{cache:'no-store'}).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){DATA=d;state.cat='';state.sent='';render();fillPickers();matrix();try{history.replaceState(null,'','?e='+encodeURIComponent(d.key))}catch(x){};if(after)after();else window.scrollTo({top:0,behavior:'smooth'})}).catch(function(){toast('Could not load that edition')})}
 function drill(file,cat,sent){load(file,function(){state.cat=cat||'';state.sent=sent||'';apply();var t=$(cat?'#sec-'+cat:'#content');if(t)t.scrollIntoView({behavior:'smooth',block:'start'})})}
-function matrix(){var days=EDS.filter(function(e){return e.key!=='latest'&&e.counts});var cats=CATS.filter(function(c){return days.some(function(d){return d.counts[c[0]]})});
+function matrix(){var days=EDS.filter(function(e){return e.key!=='latest'&&e.counts}).slice(0,state.mdays||7);$$('[data-mdays]').forEach(function(b){b.setAttribute('aria-pressed',+b.getAttribute('data-mdays')===(state.mdays||7))});var cats=CATS.filter(function(c){return days.some(function(d){return d.counts[c[0]]})});
  $('#mhead').innerHTML='<tr><th>Day</th>'+cats.map(function(c){return '<th title="'+esc(c[2])+'">'+c[1]+'<span class="mlab"> '+esc(c[2].split(' ')[0])+'</span></th>'}).join('')+'<th>All</th></tr>';
  function cell(file,cat,n,cls){var t=n.positive+n.neutral+n.critical;if(!t)return '<td><span class="cell zero"><span class="n">·</span></span></td>';
   var w=function(k){return (100*n[k]/t)+'%'},badge=function(k,c,ic){return n[k]?'<button type="button" class="bd" data-file="'+esc(file)+'" data-cat="'+cat+'" data-sent="'+k+'" aria-label="'+n[k]+' '+k+'"><b class="'+c+'">'+ic+' '+n[k]+'</b></button>':''};
@@ -469,6 +735,8 @@ function matrix(){var days=EDS.filter(function(e){return e.key!=='latest'&&e.cou
  $('#mbody').innerHTML=days.map(function(d){var a={positive:0,neutral:0,critical:0};cats.forEach(function(c){var n=d.counts[c[0]];if(n){a.positive+=n.positive||0;a.neutral+=n.neutral||0;a.critical+=n.critical||0}});
   return '<tr><td class="day'+(d.key===DATA.key?' on':'')+'"><button type="button" class="n day" data-file="'+esc(d.file)+'" data-cat="" data-sent="" aria-label="Open '+esc(d.label)+'">'+esc(d.label)+'</button></td>'+cats.map(function(c){return cell(d.file,c[0],d.counts[c[0]]||{positive:0,neutral:0,critical:0},'')}).join('')+cell(d.file,'',a,' all')+'</tr>'}).join('')||'<tr><td colspan="9" class="empty">No past editions yet — run the backfill.</td></tr>';
  $$('#mbody button[data-file]').forEach(function(b){b.onclick=function(){drill(b.getAttribute('data-file'),b.getAttribute('data-cat'),b.getAttribute('data-sent'))}})}
+$$('[data-mdays]').forEach(function(b){b.onclick=function(){state.mdays=+b.getAttribute('data-mdays');matrix();try{localStorage.setItem('mdays',state.mdays)}catch(e){}}});
+try{state.mdays=+localStorage.getItem('mdays')||7}catch(e){}
 $$('[data-dash]').forEach(function(b){b.onclick=function(){var w=b.getAttribute('data-dash')==='week';$('#dash-today').hidden=w;$('#dash-week').hidden=!w;$('#dashtitle').textContent=w?'Last 7 days':'Today at a glance';$$('[data-dash]').forEach(function(x){x.setAttribute('aria-pressed',x===b)});if(w)matrix();try{localStorage.setItem('dash',w?'week':'today')}catch(e){}}});
 try{if(localStorage.getItem('dash')==='week')$('[data-dash=week]').click()}catch(e){}
 $$('select.pick').forEach(function(s){s.onchange=function(){load(this.value)}});
@@ -486,6 +754,84 @@ var h=location.hash.match(/^#story-(\d+)$/);if(h)setTimeout(function(){jump(h[1]
 })();
 """
 
+ADMIN_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex, nofollow"><meta name="referrer" content="no-referrer">
+<title>System status</title><style>__CSS__
+.lock{max-width:420px;margin:60px auto;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}
+.lock input{width:100%;min-height:48px;font:inherit;font-size:18px;letter-spacing:.2em;padding:8px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);margin:10px 0}
+.lock .err{color:var(--crit);min-height:20px;font-size:14px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin:12px 0}
+.kcard{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}.kcard h2{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin:0 0 8px}
+.big{font-size:28px;font-weight:700;line-height:1.1}.kcard .row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid var(--line);font-size:14px}.kcard .row:first-of-type{border-top:0}.kcard .row[hidden]{display:none}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;font-weight:600}.pill.active{background:#dcf5ea;color:var(--pos)}.pill.throttled{background:#fdecc8;color:#8a5a00}.pill.standby{background:var(--chip);color:var(--dim)}
+.meter{height:8px;background:var(--chip);border-radius:4px;overflow:hidden;margin:8px 0}.meter i{display:block;height:100%;background:var(--accent)}
+.runs .row span:first-child{flex:1}.runs a{color:var(--accent);text-decoration:none}.ok{color:var(--pos)}.bad{color:var(--crit)}.run{color:var(--dim)}
+.refused{font-size:13px;color:var(--dim)}.refused li{margin:4px 0}
+</style></head><body><div class="wrap">
+<header><div style="flex:1"><h1 id="title">System status</h1><div class="sub" id="sub">private page</div></div><a class="btn" href="index.html">← Brief</a></header>
+<div class="lock" id="lock"><h2 style="margin:0 0 4px">Enter the PIN</h2><p class="sub" style="margin:0">Nothing loads until the PIN is right.</p>
+<form id="f"><input id="pin" type="password" inputmode="text" autocomplete="current-password" aria-label="PIN" autofocus><div class="err" id="err"></div><button type="submit" class="btn primary" style="width:100%">Unlock</button></form></div>
+<div id="panel" hidden>
+<div class="cards">
+<div class="kcard"><h2>Gemini</h2><div class="big"><span id="g-calls">–</span> <small style="font-size:14px;color:var(--dim)">of <span id="g-limit">80</span> calls today</small></div><div class="meter"><i id="g-bar" style="width:0"></i></div>
+<div class="row"><span>Status</span><span class="pill" id="g-state">–</span></div><div class="row"><span>Model</span><span id="g-model">–</span></div><div class="row" id="g-note-row" hidden><span>Note</span><span id="g-note"></span></div></div>
+<div class="kcard"><h2>Collector</h2><div class="row"><span>Last poll</span><span id="c-last">–</span></div><div class="row"><span>Items in, 24 h</span><span id="c-items">–</span></div><div class="row"><span>Kept / dropped</span><span id="c-kept">–</span></div>
+<div class="row"><span>Waiting: resolve / extract / score</span><span id="c-pending">–</span></div><div class="row"><span>YouTube channels returning nothing</span><span id="c-yt">–</span></div></div>
+<div class="kcard"><h2>Last brief</h2><div class="row"><span>Sent</span><span id="b-sent">–</span></div><div class="row"><span>Stories</span><span id="b-chosen">–</span></div><div class="row"><span>Status</span><span id="b-status">–</span></div><div class="row"><span>Latest edition</span><span id="e-latest">–</span></div><div class="row"><span>Dated editions / archive days</span><span id="e-days">–</span></div></div>
+<div class="kcard"><h2>Grouping (this run)</h2><div class="row"><span>Story groups kept</span><span id="r-clusters">–</span></div><div class="row"><span>Re-runs dropped</span><span id="r-reruns">–</span></div><div id="r-guards"></div><ul class="refused" id="r-refused"></ul></div>
+<div class="kcard"><h2>Reader feedback</h2><div id="fb"></div></div>
+<div class="kcard runs" id="runs-card"><h2>Recent runs <small id="runs-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2><div id="runs">–</div></div>
+</div><p class="hint" id="gen"></p></div>
+<script id="sealed" type="application/json">__SEALED__</script>
+<script>
+(function(){
+var S=JSON.parse(document.getElementById('sealed').textContent),$=function(s){return document.querySelector(s)};
+function b64(s){var b=atob(s),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a}
+function cat(a,b){var o=new Uint8Array(a.length+b.length);o.set(a,0);o.set(b,a.length);return o}
+function be32(i){return new Uint8Array([(i>>>24)&255,(i>>>16)&255,(i>>>8)&255,i&255])}
+function eq(a,b){if(a.length!==b.length)return false;var d=0;for(var i=0;i<a.length;i++)d|=a[i]^b[i];return d===0}
+async function open(pin){
+ if(!S)return null;var enc=new TextEncoder();
+ var base=await crypto.subtle.importKey('raw',enc.encode(pin),'PBKDF2',false,['deriveBits']);
+ var key=new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:b64(S.salt),iterations:S.iters},base,512));
+ var hk=function(k){return crypto.subtle.importKey('raw',k,{name:'HMAC',hash:'SHA-256'},false,['sign'])};
+ var encKey=await hk(key.slice(0,32)),macKey=await hk(key.slice(32,64)),nonce=b64(S.nonce),ct=b64(S.ct);
+ var mac=new Uint8Array(await crypto.subtle.sign('HMAC',macKey,cat(nonce,ct)));
+ if(!eq(mac,b64(S.tag)))return null;
+ var out=new Uint8Array(ct.length);
+ for(var i=0;i*32<ct.length;i++){var blk=new Uint8Array(await crypto.subtle.sign('HMAC',encKey,cat(nonce,be32(i))));for(var j=0;j<32&&i*32+j<ct.length;j++)out[i*32+j]=ct[i*32+j]^blk[j]}
+ return JSON.parse(new TextDecoder().decode(out))}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.editions||{},r=st.grouping||{},fb=st.feedback||{};
+ $('#g-calls').textContent=g.calls_today;$('#g-limit').textContent=g.limit;$('#g-bar').style.width=Math.min(100,100*g.calls_today/(g.limit||80))+'%';
+ var p=$('#g-state');p.textContent=(g.state||'').replace(/^./,function(x){return x.toUpperCase()});p.className='pill '+g.state;$('#g-model').textContent=g.model||'';
+ if(g.note){$('#g-note-row').hidden=false;$('#g-note').textContent=g.note}
+ $('#c-last').textContent=c.last_run||'never';$('#c-items').textContent=c.items_24h;$('#c-kept').textContent=c.kept_24h+' / '+c.dropped_24h;
+ $('#c-pending').textContent=c.pending_resolve+' / '+c.pending_extract+' / '+c.unscored;$('#c-yt').textContent=(c.youtube_failing||[]).length?(c.youtube_failing||[]).join(', '):'none';
+ $('#b-sent').textContent=b.sent||'–';$('#b-chosen').textContent=b.chosen==null?'–':b.chosen;$('#b-status').textContent=b.status||'–';$('#e-latest').textContent=e.stories_latest+' stories';$('#e-days').textContent=e.dated+' / '+e.archive_days;
+ $('#r-clusters').textContent=r.clusters;$('#r-reruns').textContent=r.reruns;var gs=r.guards||{},keys=Object.keys(gs);
+ $('#r-guards').innerHTML=keys.length?keys.map(function(k){return '<div class="row"><span>Re-filed: '+esc(k)+'</span><span>'+gs[k]+'</span></div>'}).join(''):'<div class="row"><span>Verdicts re-filed by the guards</span><span>0</span></div>';
+ $('#r-refused').innerHTML=(r.refused||[]).map(function(x){return '<li><b>'+esc(x.why)+'</b> ('+esc(x.edition)+') — shared: '+esc(x.shared||'–')+'<br>'+(x.titles||[]).map(esc).join(' · ')+'</li>'}).join('');
+ if(fb.connected===false)$('#fb').innerHTML='<div class="row"><span>Feedback tab</span><span>not connected (FEEDBACK_CSV_URL)</span></div>';
+ else if(fb.error)$('#fb').innerHTML='<div class="row"><span>Feedback tab</span><span class="bad">'+esc(fb.error)+'</span></div>';
+ else $('#fb').innerHTML=['up','down','missing'].map(function(k){var l={up:'👍 Useful',down:'👎 Not useful',missing:'➕ Missing news'}[k];return '<div class="row"><span>'+l+'</span><span>'+fb.all[k]+' all time · '+fb.week[k]+' this week</span></div>'}).join('');
+ $('#gen').textContent='Snapshot taken '+(st.generated_ist||'')+' at the last brief. Runs below are live.'}
+async function runs(cfg){if(!cfg.runs){$('#runs-card').hidden=true;return}
+ try{var r=await fetch(cfg.runs,{headers:{'Accept':cfg.accept||'application/json'}});if(!r.ok)throw new Error('HTTP '+r.status);var j=await r.json();
+  $('#runs').innerHTML=(j.workflow_runs||[]).map(function(x){var ok=x.conclusion==='success',live=x.status!=='completed';var when=new Date(x.updated_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+   return '<div class="row"><span>'+(live?'<span class="run">⏳</span>':ok?'<span class="ok">✅</span>':'<span class="bad">❌</span>')+' '+esc(x.name)+'</span><span>'+esc(when)+' · <a href="'+esc(cfg.web+x.id)+'" target="_blank" rel="noopener">log ↗</a></span></div>'}).join('')||'no runs yet';
+  $('#runs-note').textContent='· live'}catch(e){$('#runs').innerHTML='<span class="bad">could not reach the run list ('+esc(e.message)+')</span>'}}
+async function unlocked(cfg){$('#lock').hidden=true;$('#panel').hidden=false;
+ try{var st=await (await fetch(cfg.status,{cache:'no-store'})).json();show(st)}catch(e){$('#gen').textContent='status snapshot not available yet — it is written at each brief'}
+ runs(cfg)}
+if(!S){$('#f').hidden=true;$('#err').textContent='Not configured: set the ADMIN_PIN secret and run a brief.'}
+try{var saved=sessionStorage.getItem('admin');if(saved&&S){unlocked(JSON.parse(saved))}}catch(e){}
+$('#f').onsubmit=async function(ev){ev.preventDefault();$('#err').textContent='';var pin=$('#pin').value;if(!pin)return;
+ try{var cfg=await open(pin);if(!cfg){$('#err').textContent='Wrong PIN';$('#pin').value='';return}
+  try{sessionStorage.setItem('admin',JSON.stringify(cfg))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
+})();
+</script></body></html>"""
+
 PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <meta name="robots" content="noindex"><meta name="referrer" content="no-referrer">
@@ -496,18 +842,21 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <h2>Sections</h2><a href="#dashboard">📊 Dashboard</a><div id="drawer-cats"></div>
 <h2>View</h2><div class="seg"><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button></div>
 <h2>Sharing</h2><label class="opt"><input type="checkbox" class="withnotes" checked> Include takeaways in WhatsApp shares</label>
-<h2>More</h2><button type="button" class="link" id="open-missing">＋ Submit missing news</button></aside>
+<h2>More</h2><button type="button" class="link" id="open-archive">🗄 Archive — every edition</button><button type="button" class="link" id="open-missing">＋ Submit missing news</button></aside>
 <div class="wrap">
 <header><button type="button" class="icon" id="menu" aria-label="Menu">☰</button><div style="flex:1;min-width:0"><h1 id="title"></h1><div class="sub" id="sub"></div></div></header>
-<div class="tools"><input type="search" id="q" placeholder="Search headlines, summaries, outlets, categories" aria-label="Search">
+<div class="tools"><input type="search" id="q" placeholder="Search headlines, summaries, outlets, categories" aria-label="Search"><label class="opt sm" title="Search every edition ever published, not only this one"><input type="checkbox" id="qall"> All editions</label>
 <select class="pick" aria-label="Edition"></select><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button><button type="button" class="btn" id="notes" aria-pressed="true">📝 Notes: ON</button><button type="button" class="btn" id="select" aria-pressed="false">☑ Select</button></div>
-<div class="callout" id="summary" hidden><h2>60-second briefing · tap a section to jump to its stories</h2><div class="sgs"></div></div>
+<div class="callout" id="summary" hidden><h2>✨ 60-second AI briefing · tap a line to open its story</h2><div class="sgs"></div></div>
 <div class="dash" id="dashboard"><h2><span id="dashtitle">Today at a glance</span><span class="seg"><button type="button" class="btn sm" data-dash="today" aria-pressed="true">Today</button><button type="button" class="btn sm" data-dash="week" aria-pressed="false">7 days</button></span></h2>
 <div id="dash-today"><table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table><p class="hint">Tap a number to filter the stories below.</p></div>
-<div id="dash-week" hidden><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. Tap a count to open that day and section; tap 🟢 ⚪ 🔴 for one sentiment only; tap the day to open all of it.</p></div></div>
+<div id="dash-week" hidden><div class="seg" style="margin:0 0 8px"><button type="button" class="btn sm" data-mdays="7" aria-pressed="true">7 days</button><button type="button" class="btn sm" data-mdays="30" aria-pressed="false">30 days</button></div><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. Tap a count to open that day and section; tap 🟢 ⚪ 🔴 for one sentiment only; tap the day to open all of it.</p></div></div>
 <div class="filterbar" id="filterbar"><span id="filterlabel"></span><button type="button" class="btn" id="clear">Show all</button></div>
+<div class="callout" id="allhits" hidden><h2>Across all editions · <span id="allhits-n"></span></h2><ul class="hits" id="allhits-list"></ul></div>
 <nav class="chips" id="chips"></nav>
 <div id="content"></div><p class="empty" id="nohit" hidden>No stories match.</p>
+<dialog id="archive"><h3 style="margin:0 0 6px">Archive</h3><p class="sub" style="margin:0 0 10px">Every edition, by month. Tap a day to open it; "all kept" lists everything the rules kept that day, shown or not.</p><div id="archlist"></div><div class="row"><button type="button" class="btn" id="close-archive">Close</button></div></dialog>
+<dialog id="archday"><h3 id="archday-title" style="margin:0 0 6px"></h3><div id="archday-list" class="architems"></div><div class="row"><button type="button" class="btn" id="close-archday">Close</button></div></dialog>
 <dialog id="missing"><form method="dialog"><h3 style="margin:0">Report a missing story</h3>
 <label for="m-url">Link to the article or video</label><input id="m-url" type="url" placeholder="https://">
 <label for="m-notes">What is it about, and why does it matter?</label><textarea id="m-notes" rows="3" maxlength="500"></textarea>

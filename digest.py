@@ -110,9 +110,12 @@ def settings(env):
 def load_env():
     env = rules.load_env()
     for k in ("GEMINI_MODEL", "DIGEST_MAX", "DIGEST_PER_CATEGORY", "DIGEST_AI_MAX_CALLS",
-              "DIGEST_WEB_MAX", "DIGEST_WEB_PER_CATEGORY", "DIGEST_WEB_HOURS", "FEEDBACK_URL", "FEEDBACK_CSV_URL"):
+              "DIGEST_WEB_MAX", "DIGEST_WEB_PER_CATEGORY", "DIGEST_WEB_HOURS", "FEEDBACK_URL", "FEEDBACK_CSV_URL",
+              "MINISTER_NAMES", "ADMIN_PIN"):
         if k not in env and os.environ.get(k):
             env[k] = os.environ[k]
+    if env.get("MINISTER_NAMES"):
+        os.environ["MINISTER_NAMES"] = env["MINISTER_NAMES"]
     return env
 
 
@@ -234,10 +237,11 @@ def _load(con, scope, since, pub_since):
         d["ntitle"] = norm_title(r["title"], r["publisher"])
         d["tgrams"] = frozenset(rules.sim_grams(d["ntitle"])) if len(d["ntitle"]) >= 12 else frozenset()
         cands.append(d)
-    # Same event (body match), or the same headline word for word: one story. The same-outlet
-    # copies and Tamil/English pairs that the body match cannot join are caught here.
+    # Same event (body match), the same headline word for word, or one headline inside the
+    # other (a Facebook or YouTube copy carries the post text around the headline): one story.
     reps = _merge(cands, lambda a, b: (a["event_id"] is not None and a["event_id"] == b["event_id"])
-                  or (len(a["ntitle"]) >= 12 and a["ntitle"] == b["ntitle"]))
+                  or (len(a["ntitle"]) >= 12 and a["ntitle"] == b["ntitle"])
+                  or (len(a["ntitle"]) >= 30 and len(b["ntitle"]) >= 30 and (a["ntitle"] in b["ntitle"] or b["ntitle"] in a["ntitle"])))
     return reps, [r["id"] for r in rows]
 
 
@@ -295,25 +299,42 @@ def core_terms(c):
                 out.add("ta:" + w)
         else:
             low = w.lower()
-            if len(low) >= 4 and low not in _CORE_STOP:
+            # 4+ letters, or a 3-letter acronym written in capitals (OMR, GST, NGT, ECR)
+            if (len(low) >= 4 or (len(w) == 3 and w.isupper())) and low not in _CORE_STOP:
                 out.add(low)
     return out
 
 
-def share_core(a, b):
-    """One identifying word in common. English: the same word. Tamil: the same word, or one
-    is the other plus a short case suffix (ஆவடி / ஆவடியில்), never a longer compound."""
+def _stem_en(w):
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    for suf in ("ing", "es", "ed", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            return w[:-len(suf)]
+    return w
+
+
+def shared_core(a, b):
+    """How many identifying words two headlines share. English: the same word or its plural /
+    tense form (deepfake, deepfakes; advisory, advisories). Tamil: the same word, or one is
+    the other plus a short case suffix (ஆவடி / ஆவடியில்), never a longer compound."""
     ta, tb = a["core"], b["core"]
-    if (ta & tb):
-        return True
+    en_a = {_stem_en(x) for x in ta if not x.startswith("ta:")}
+    en_b = {_stem_en(x) for x in tb if not x.startswith("ta:")}
+    n = len(en_a & en_b)
     xs = [x[3:] for x in ta if x.startswith("ta:")]
     ys = [y[3:] for y in tb if y.startswith("ta:")]
     for x in xs:
         for y in ys:
             s, l = (x, y) if len(x) <= len(y) else (y, x)
             if l.startswith(s) and len(l) - len(s) <= 5:
-                return True
-    return False
+                n += 1
+                break
+    return n
+
+
+def share_core(a, b):
+    return shared_core(a, b) >= 1
 
 
 def _is_tamil(c):
@@ -340,20 +361,38 @@ def _confirm(a, b, why):
     return share_core(a, b)
 
 
-def merge_stories(cands):
+def merge_stories(cands, con=None):
     """After ranking: Gemini's story keys and near-identical headlines propose links; the
     gate above accepts or refuses each one, and _merge never chains them. One event framed
     three ways by three outlets is one candidate; two events that merely rhyme stay two."""
+    kw = vocabulary(con)
     for c in cands:
         if "core" not in c:
             c["core"] = core_terms(c)
+            c["places"] = places(_title(c), kw)
 
     def same(a, b):
+        # two headlines naming different places are two stories, whoever says otherwise
+        # (a Velachery flood and an Adyar flood on the same evening)
+        if a.get("places") and b.get("places") and not (a["places"] & b["places"]):
+            return False
         if a.get("story") and a.get("story") == b.get("story"):
             return _confirm(a, b, "cluster" if "@" in a["story"] else "gemini")
         if a["tgrams"] and b["tgrams"] and len(a["ntitle"]) >= 25 and len(b["ntitle"]) >= 25 \
                 and rules.jaccard(a["tgrams"], b["tgrams"]) >= TITLE_SIM:
             return _confirm(a, b, "title")
+        # no Gemini grouping (budget spent, key missing): two reports in one category and one
+        # language, within a day, that share three identifying words and a sixth of their
+        # headline -- or two words and a quarter -- are one story. "MeitY advisory on
+        # deepfakes / manipulated content" five ways passes (3-5 words, 0.24-0.39 overlap); a
+        # murder and a sewage overflow, or two bag-of-words coincidences, never do.
+        if a.get("category") == b.get("category") and a.get("category") != "none" and _is_tamil(a) == _is_tamil(b) \
+                and a["tgrams"] and b["tgrams"]:
+            pa, pb = parse_ts(a.get("published_at")), parse_ts(b.get("published_at"))
+            if pa and pb and abs((pa - pb).total_seconds()) > 24 * 3600:
+                return False
+            n, j = shared_core(a, b), rules.jaccard(a["tgrams"], b["tgrams"])
+            return (n >= 3 and j >= 0.15) or (n >= 2 and j >= 0.25)
         return False
     return _merge(cands, same)
 
@@ -368,22 +407,34 @@ Services, Government of Tamil Nadu, and District In-Charge Minister for Thiruval
 to Tamilaga Vettri Kazhagam (TVK), the governing party.
 
 Give each item ONE category:
-mention      - names or quotes this R. Kumar, or criticism/praise of him
+mention      - names or quotes THIS R. Kumar ("R. Kumar", "ஆர். குமார்", "Minister R. Kumar"),
+               or criticism/praise of him. ONLY when the text literally names him. Minister
+               Rajkumar (Housing), Minister Rajeev, Rajendra Kumar, R.B. Udhayakumar, C.T.R.
+               Nirmal Kumar, Ramesh Kumar (Avadi MLA), Sarathkumar, or any other initial + Kumar
+               is a DIFFERENT person: never "mention", never written as R. Kumar anywhere.
 constituency - civic issues, flooding, sewage, drains, roads, lakes, MRTS, crime or law-and-order
-               in Velachery, Adyar, Besant Nagar, Thiruvanmiyur, Tharamani, Adambakkam,
-               Pallikaranai -- whether or not he is named
+               in Velachery assembly constituency ONLY: Velachery, Taramani/Tharamani, Adyar,
+               Besant Nagar, Thiruvanmiyur, Pallikaranai, Adambakkam (and their colonies: Baby
+               Nagar, Vijaya Nagar, Ram Nagar, Kakkan Bridge, Indira Nagar, Kasturba Nagar)
+               -- whether or not he is named. NOT constituency, ever: Ambattur (that is
+               "district"), Thoraipakkam, Sholinganallur, Perungudi, OMR beyond Thoraipakkam,
+               Tambaram, Chromepet, Pallavaram, GST Road, Guindy, Saidapet, Porur, Medavakkam
 district     - Thiruvallur district administration, collectorate, review meetings, Poondi
                reservoir, Gummidipoondi, Ponneri, Avadi, Ambattur, Poonamallee, Tiruttani
 portfolio    - AI, IT, digital governance, ELCOT, TIDEL, StartupTN, data centres, GCC
                investment, IT corridor, and rival-state (Karnataka/Telangana) IT policy
-political    - attacks or alliances specifically touching his seat, district or department.
-               GENERIC TVK vs DMK vs AIADMK battles are "none"
+political    - attacks or alliances specifically touching his seat (Velachery), his district
+               (Thiruvallur) or his department (AI / IT). GENERIC party politics -- TVK vs DMK vs
+               AIADMK battles, by-election results and celebrations elsewhere (Madurantakam,
+               Dharapuram, Panaiyur ...), cadre meetings, alliance talk -- is "none"
 opportunity  - schemes, inaugurations, foundation stones, summits he could attend
 none         - irrelevant, a DIFFERENT person named Kumar (R.B. Udhayakumar, C.T.R. Nirmal Kumar,
                Ramesh Kumar of Avadi, actor Sarathkumar, Praveen/Vinoth/Ashok/Santhosh Kumar, Kumar
                Sanu, Akshay Kumar ...) unless our R. Kumar is also named or the story is about
-               his constituency, film or cinema news, real estate listings, hotel
-               or motor-trade press releases, exam-prep content, a place with the same name
+               his constituency, film or cinema news, commercial real estate (office-space or
+               rental guides, flats for sale, price-per-sq-ft trends; land governance --
+               encroachment, acquisition, patta, poramboke -- is NOT this), hotel or
+               motor-trade press releases, exam-prep content, a place with the same name
                outside Tamil Nadu
 
 Priority: 1 immediate (flooding now, a death, a major protest, an urgent official statement in
@@ -411,7 +462,8 @@ its own event gets its own number.
 And "takeaways": exactly 2 bullet notes in plain English, 10-15 words each, for a reader
 who will not open the article -- the fact and the figure (who, where, what, how much, when),
 then what it means or what comes next. Tamil items get English notes too. No preamble,
-no bullet symbols, no repetition of the headline.
+no bullet symbols, no repetition of the headline. Name people exactly as the item names
+them (Minister Rajkumar stays Minister Rajkumar); write "R. Kumar" ONLY when the item does.
 
 Return one object per item, using the item numbers given.
 
@@ -437,7 +489,9 @@ TAKEAWAYS_PROMPT = """For each news item below write "takeaways": exactly 2 bull
 AI, IT and Digital Services, in-charge minister Thiruvallur) who will not open the article --
 the fact and the figure (who, where, what, how much, when), then what it means or what comes
 next. Tamil items get English notes. No preamble, no bullet symbols, no repetition of the
-headline. Return one object per item, using the item numbers given.
+headline. Name people exactly as the item names them; write "R. Kumar" ONLY when the item
+does -- an item marked [does not name R. Kumar] must not mention him at all.
+Return one object per item, using the item numbers given.
 
 ITEMS:
 {payload}"""
@@ -477,6 +531,7 @@ class Gemini:
         self.t0 = time.monotonic()
         self._client = client
         self.run = utcnow().strftime("%Y%m%d%H%M%S")   # story keys from this run never collide with another run's
+        self.budget_s = AI_TIME_BUDGET_S
 
     @property
     def client(self):
@@ -510,7 +565,7 @@ class Gemini:
                                      "responseSchema": schema}}
         delay = AI_PAUSE_S
         for attempt in range(4):
-            if time.monotonic() - self.t0 > AI_TIME_BUDGET_S:
+            if time.monotonic() - self.t0 > self.budget_s:
                 self.dead = "Gemini time budget spent"
                 return None
             try:
@@ -605,7 +660,7 @@ def cluster(gemini, con, cands, key_prefix):
     data = gemini.call(CLUSTER_PROMPT.format(payload="\n".join(lines)), CLUSTER_SCHEMA, "cluster")
     if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
         return 0
-    taken, kept, dropped = set(), 0, Counter()
+    taken, kept, dropped, refused = set(), 0, Counter(), []
     for c in cands:
         c["story"] = None
     for g in data["groups"]:
@@ -616,8 +671,13 @@ def cluster(gemini, con, cands, key_prefix):
             continue
         if not shared:
             dropped["no shared names"] += 1
+            refused.append({"why": "no shared names", "shared": "", "titles": [_title(cands[n - 1])[:80] for n in nums[:4]]})
             continue
-        nums = [n for n in nums if _has_evidence(cands[n - 1], shared)]
+        proven = [n for n in nums if _has_evidence(cands[n - 1], shared)]
+        if len(proven) < len(nums):
+            refused.append({"why": "names not in the items" if len(proven) < 2 else "thinned",
+                            "shared": shared[:80], "titles": [_title(cands[n - 1])[:80] for n in nums if n not in proven][:4]})
+        nums = proven
         if len(nums) < 2:
             dropped["names not in the items"] += 1
             continue
@@ -632,6 +692,7 @@ def cluster(gemini, con, cands, key_prefix):
     con.commit()
     if dropped:
         log.info("cluster: refused " + ", ".join(f"{n} group(s) {why}" for why, n in dropped.items()))
+    cluster.last_refused = refused
     return kept
 
 
@@ -659,7 +720,7 @@ def rule_rank(c):
     cat = "none"
     for tag, name in (("mention", "mention"), ("constituency", "constituency"), ("district", "district"),
                       ("portfolio", "portfolio"), ("party", "political")):
-        if tag in tags:
+        if tag in tags and (tag != "mention" or names_in(_text(c), tags)):
             cat = name
             break
     if cat == "none" and c.get("urgent"):
@@ -682,9 +743,210 @@ def _apply(c, v, by):
         c["story"] = v["story"]
 
 
+# --------------------------------------------------------------------------
+# 2a. guards -- what Gemini may not decide on its own
+# --------------------------------------------------------------------------
+
+MINISTER_NAMES_DEFAULT = ("R. Kumar|R Kumar|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|"
+                          "அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|Minister Kumar")
+GENERIC_FORMS = ("அமைச்சர் குமார்", "minister kumar")   # other states have ministers called Kumar
+_TN_ANCHOR = re.compile(r"tamil ?nadu|chennai|velachery|thiruvallur|tiruvallur|elcot|tidel|startuptn|"
+                        r"தமிழக|தமிழ்நாடு|சென்னை|வேளச்சேரி|திருவள்ளூர்", re.I)
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+# Built-in place vocabularies, grouped so a Tamil and an English spelling are one place. The
+# keyword sheet remains the master list (its place groups are used too); these are the floor.
+AC26 = {"velachery": ("velachery", "வேளச்சேரி"), "taramani": ("taramani", "tharamani", "தரமணி"),
+        "adyar": ("adyar", "அடையாறு", "அடையார்"), "besant nagar": ("besant nagar", "பெசன்ட் நகர்", "பெசண்ட் நகர்"),
+        "thiruvanmiyur": ("thiruvanmiyur", "tiruvanmiyur", "திருவான்மியூர்"), "pallikaranai": ("pallikaranai", "பள்ளிக்கரணை"),
+        "adambakkam": ("adambakkam", "ஆதம்பாக்கம்"), "baby nagar": ("baby nagar", "பேபி நகர்"),
+        "vijaya nagar": ("vijaya nagar", "vijayanagar", "விஜயநகர்", "விஜய நகர்"), "ram nagar": ("ram nagar", "ராம் நகர்"),
+        "kakkan bridge": ("kakkan bridge", "காக்கன்"), "indira nagar": ("indira nagar", "இந்திரா நகர்"),
+        "kasturba nagar": ("kasturba nagar", "கஸ்தூரிபா நகர்"), "guru nanak": ("guru nanak",)}
+NOT_AC26 = {"ambattur": ("ambattur", "ஆம்பத்தூர்"), "thoraipakkam": ("thoraipakkam", "thuraipakkam", "துரைப்பாக்கம்"),
+            "sholinganallur": ("sholinganallur", "சோழிங்கநல்லூர்"), "perungudi": ("perungudi", "பெருங்குடி"),
+            "tambaram": ("tambaram", "தாம்பரம்"), "chromepet": ("chromepet", "chrompet", "குரோம்பேட்டை"),
+            "pallavaram": ("pallavaram", "பல்லாவரம்"), "gst road": ("gst road", "ஜிஎஸ்டி சாலை"), "guindy": ("guindy", "கிண்டி"),
+            "saidapet": ("saidapet", "சைதாப்பேட்டை"), "porur": ("porur", "போரூர்"), "medavakkam": ("medavakkam", "மேடவாக்கம்"),
+            "karapakkam": ("karapakkam",), "navalur": ("navalur",), "siruseri": ("siruseri",), "kelambakkam": ("kelambakkam",)}
+DISTRICT = {"thiruvallur": ("thiruvallur", "tiruvallur", "திருவள்ளூர்"), "avadi": ("avadi", "ஆவடி"), "ambattur": ("ambattur", "ஆம்பத்தூர்"),
+            "poonamallee": ("poonamallee", "பூந்தமல்லி"), "gummidipoondi": ("gummidipoondi", "கும்மிடிப்பூண்டி"),
+            "ponneri": ("ponneri", "பொன்னேரி"), "tiruttani": ("tiruttani", "திருத்தணி"), "poondi": ("poondi", "பூண்டி")}
+AC26_WORDS = tuple(w for ws in AC26.values() for w in ws)
+NOT_AC26_WORDS = tuple(w for ws in NOT_AC26.values() for w in ws)
+DISTRICT_PLACES = tuple(w for ws in DISTRICT.values() for w in ws)
+PORTFOLIO_WORDS = re.compile(r"\b(ai|artificial intelligence|it\b|information technology|elcot|tidel|startuptn|"
+                             r"data cent|digital|semiconductor|gcc)\b|செயற்கை நுண்ணறிவு|தகவல் தொழில்நுட்ப|எல்காட்|டைடல்", re.I)
+# commercial property marketing -- never news; land GOVERNANCE is, and bypasses this
+COMMERCIAL_RE = re.compile(r"office space|office rent|rent guide|rental guide|per sq\.? ?ft|sq\.? ?ft rent|"
+                           r"flats? for sale|plots? for sale|\b[1-5] ?bhk\b|luxury (?:apartment|villa|flat)|"
+                           r"price trends?|ready[- ]to[- ]move|real estate (?:guide|listing|prices?)|"
+                           r"விற்பனைக்கு|வாடகைக்கு|சதுர அடி", re.I)
+GOVERNANCE_RE = re.compile(r"collector|corporation|encroach|acquisition|acquire|demoli|\blake\b|patta|poramboke|"
+                           r"cmda|tahsildar|revenue|eviction|court|tribunal|ngt\b|"
+                           r"ஆட்சியர்|மாநகராட்சி|ஆக்கிரமிப்பு|கையகப்படுத்த|இடிப்பு|இடிக்க|ஏரி|பட்டா|புறம்போக்கு|வருவாய்|நீதிமன்ற", re.I)
+
+_NAME_CACHE = {}
+
+
+def _form_re(form):
+    """One name form -> a regex that also takes Tamil case endings (குமாரின், குமாருக்கு) and
+    optional dots/spaces between the parts; never a longer name (Kumaraswamy, குமாரசாமி)."""
+    parts = []
+    for tok in re.split(r"[.\s]+", form):
+        if not tok:
+            continue
+        if _TAMIL.search(tok):
+            # a final pulli may be any case sign (குமார் / குமாரின் / குமாருக்கு); a consonant
+            # there is another name (குமாரசாமி, குமாரன்) and does not match
+            parts.append(re.escape(tok.rstrip("\u0BCD")) + (rules._TA_END if tok.endswith("\u0BCD") else ""))
+        else:
+            parts.append(re.escape(tok.lower()))
+    pat = r"\.?\s*".join(parts)
+    if not _TAMIL.search(form):
+        pat = r"(?<![a-z0-9])" + pat + r"(?![a-z0-9])"
+    else:
+        pat = r"(?<![\u0B80-\u0BE5])" + pat
+    return re.compile(pat, re.I)
+
+
+def name_forms():
+    raw = (os.environ.get("MINISTER_NAMES") or MINISTER_NAMES_DEFAULT).strip() or MINISTER_NAMES_DEFAULT
+    if raw not in _NAME_CACHE:
+        forms = [f.strip() for f in raw.split("|") if f.strip()]
+        _NAME_CACHE[raw] = [(f, _form_re(f), f.lower() in GENERIC_FORMS) for f in forms]
+    return _NAME_CACHE[raw]
+
+
+def names_in(text, tags=(), strict=False):
+    """Does this text name the minister? A generic form ("அமைச்சர் குமார்", "Minister Kumar")
+    counts only next to a Tamil Nadu anchor -- a place, his department, or a sheet tag --
+    unless `strict` (used on Gemini's own notes, where any such phrase is the problem)."""
+    text = text or ""
+    low = text.lower()
+    anchored = bool(_TN_ANCHOR.search(text)) or bool({"constituency", "district", "portfolio"} & set(tags or ()))
+    for _form, rx, generic in name_forms():
+        if rx.search(low if not _TAMIL.search(rx.pattern) else text):
+            if not generic or strict or anchored:
+                return True
+    return False
+
+
+def _ta_stem(w):
+    """A Tamil place inflects at its end: அடையாறு -> அடையாறில், ஆதம்பாக்கம் -> ஆதம்பாக்கத்தில்.
+    Match the stem, so the locality is found in any case."""
+    if _TAMIL.search(w):
+        if w.endswith("ம்"):
+            return w[:-2]
+        if w.endswith(("ு", "்")):
+            return w[:-1]
+    return w
+
+
+def _has_any(text, words):
+    low = (text or "").lower()
+    return any(_ta_stem(w) in low for w in words)
+
+
+def _ac26(text):
+    return _has_any(text, AC26_WORDS)
+
+
+_VOCAB = {}
+
+
+def vocabulary(con):
+    """The keyword sheet as cached in the database (what the collector scored with), for
+    place groups; None when there is none."""
+    k = id(con)
+    if k not in _VOCAB:
+        rows = rules._cached_rows(con) if con is not None else []
+        _VOCAB[k] = rules.Keywords(rows, origin="cache") if rows else None
+    return _VOCAB[k]
+
+
+def places(text, kw=None):
+    """The place groups a text names -- built-in localities and the sheet's place tiers --
+    so two reports naming different places are never one story."""
+    low = (text or "").lower()
+    out = set()
+    for table in (AC26, NOT_AC26, DISTRICT):
+        for grp, words in table.items():
+            if any(_ta_stem(w) in low for w in words):
+                out.add(grp)
+    if kw is not None:
+        try:
+            for tier, found in kw.hits(rules.norm_match(text or "")).items():
+                if tier in rules.PLACE_TIERS:
+                    out.update((term.group or term.term).lower() for term, _ in found)
+        except Exception:
+            pass
+    return out
+
+
+def _text(c):
+    return f"{_title(c)} {_snippet(c)}"
+
+
+def _refile(c, exclude):
+    """The keyword rules' next-best category for a card a guard has rejected: only a
+    category whose own evidence is present, never the one just rejected."""
+    tags = set(c.get("tags") or [])
+    text = _text(c)
+    order = [("mention", lambda: names_in(text, tags)),
+             ("constituency", lambda: (_ac26(_title(c)) or ("constituency" in tags and not _has_any(_title(c), NOT_AC26_WORDS))
+                                       or (_ac26(text) and not _has_any(_title(c), NOT_AC26_WORDS)))),
+             ("district", lambda: "district" in tags or _has_any(text, DISTRICT_PLACES)),
+             ("portfolio", lambda: "portfolio" in tags or bool(PORTFOLIO_WORDS.search(text))),
+             ("political", lambda: "party" in tags and _anchored(c))]
+    for cat, ok in order:
+        if cat not in exclude and ok():
+            return cat
+    return "none"
+
+
+def _anchored(c):
+    """Something of his in the article: his name, an AC-26 locality, a Thiruvallur-district
+    place, or his portfolio -- by the sheet's tags or the built-in lists."""
+    tags = set(c.get("tags") or [])
+    text = _text(c)
+    return bool({"constituency", "district", "portfolio"} & tags) or names_in(text, tags) \
+        or _ac26(text) or _has_any(text, DISTRICT_PLACES) or bool(PORTFOLIO_WORDS.search(text))
+
+
+def guard(c):
+    """Re-files a verdict the article cannot support. Returns the reason, or None. Priority,
+    impact and sentiment stay as ranked; only the category (and tainted notes) change."""
+    text, title, tags = _text(c), _title(c), set(c.get("tags") or [])
+    why = None
+    cat = c.get("category") or "none"
+    if cat != "none" and COMMERCIAL_RE.search(text) and not GOVERNANCE_RE.search(text):
+        cat, why = "none", "commercial listing"
+    elif cat == "mention" and not names_in(text, tags):
+        cat, why = _refile(c, {"mention"}), "name not in article"
+    elif cat == "constituency" and not _ac26(title):
+        if _has_any(title, NOT_AC26_WORDS):
+            cat, why = _refile(c, {"constituency"}), "outside Velachery (headline)"
+        elif not (_ac26(text) or "constituency" in tags):
+            cat, why = _refile(c, {"constituency"}), "no Velachery locality in article"
+    elif cat == "political" and not _anchored(c):
+        cat, why = _refile(c, {"political"}), "generic politics"
+    if why:
+        c["category"], c["guard"] = cat, why
+        c["reason"] = f"{c.get('reason', '')} [guard: {why} -> {cat}]"[:240]
+    # notes that put his name in an article that does not carry it are thrown away and
+    # written again with the article marked (fill_takeaways)
+    if c.get("takeaways") and not names_in(text, tags):
+        if any(names_in(n, (), strict=True) for n in c["takeaways"]):
+            c["takeaways"], c["notes_note"] = [], "does not name R. Kumar"
+            c["guard"] = c.get("guard") or "notes named him"
+    return why
+
+
 def rank_all(con, cands, gemini, now):
     """Fills category, priority, reason, impact, sentiment, by. Reuses Gemini's stored verdict
-    on an item when there is one (a re-run costs nothing)."""
+    on an item when there is one (a re-run costs nothing). Every verdict, live or cached,
+    then passes the guards above."""
     todo = []
     for c in cands:
         if c["ai_processed_at"] and c["ai_category"]:
@@ -717,6 +979,11 @@ def rank_all(con, cands, gemini, now):
         if "category" not in c:
             _apply(c, rule_rank(c), "rules")
             st["rules"] += 1
+    for c in cands:
+        why = guard(c)
+        if why:
+            st["guarded"] += 1
+            st.setdefault("guards", Counter())[why] += 1
     if gemini is not None and gemini.dead:
         log.warning(f"gemini: stopped -- {gemini.dead}; {st['rules']} items ranked by the rules")
     return st
@@ -731,13 +998,16 @@ def fill_takeaways(gemini, con, cands, now):
     done = 0
     for k in range(0, len(todo), 40):
         batch = todo[k:k + 40]
-        lines = [f"{n}. [{alerts.outlet_name(c)}] {_title(c)}\n   {_snippet(c)}" for n, c in enumerate(batch, 1)]
+        lines = [f"{n}. [{alerts.outlet_name(c)}]{' [does not name R. Kumar]' if c.get('notes_note') else ''} {_title(c)}\n   {_snippet(c)}"
+                 for n, c in enumerate(batch, 1)]
         data = gemini.call(TAKEAWAYS_PROMPT.format(payload="\n".join(lines)), TAKEAWAYS_SCHEMA, "takeaways")
         if not isinstance(data, list):
             break
         for it in data:
             i = _int(it.get("n"), 1, len(batch), 0) - 1
             notes = _takeaways(it.get("takeaways")) if i >= 0 else []
+            if notes and batch[i].get("notes_note") and any(names_in(n, (), strict=True) for n in notes):
+                notes = []                            # it did it again; the card shows the snippet instead
             if notes:
                 batch[i]["takeaways"] = notes
                 con.execute("UPDATE items SET ai_takeaways=? WHERE id=?", (json.dumps(notes, ensure_ascii=False), batch[i]["id"]))
@@ -903,7 +1173,7 @@ def build(con, env, now, slot, transport_client=None):
     gemini = Gemini(key, cfg["model"], con, cfg["ai_calls"], transport_client) if key else None
     st = rank_all(con, cands, gemini, now)
     before = len(cands)
-    cands = merge_stories(cands)
+    cands = merge_stories(cands, con)
     st["merged"] = before - len(cands)
     urgent, sections, leftovers = select(cands, cfg["per"], cfg["max"])
     chosen = urgent + [c for cat in CATEGORIES for c in sections[cat]]
@@ -997,7 +1267,7 @@ def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=N
 def _pages(con, env, slot, now, b):
     try:
         import web
-        eds = web.publish(con, env, now, b.get("gemini"))
+        eds = web.publish(con, env, now, b.get("gemini"), brief=b.get("stats"))
         b["edition"] = eds["latest"]
         log.info(f"digest: web editions written -- latest {len(eds['latest']['chosen'])} stories from "
                  f"{len(eds['latest']['ids'])} items; " + ", ".join(f"{k} {len(v['chosen'])}" for k, v in eds.items() if k != "latest"))
@@ -1013,6 +1283,8 @@ def cmd_backfill(con, env, days, now=None):
     cfg = settings(env)
     key = (env.get("GEMINI_API_KEY") or "").strip()
     gemini = Gemini(key, cfg["model"], con, cfg["ai_calls"]) if key else None
+    if gemini is not None:
+        gemini.budget_s = AI_TIME_BUDGET_S * 2 + 60     # 15 minutes: a 14-day rebuild must not stop half way
     eds = web.backfill(con, env, now, days, gemini)
     web.publish(con, env, now, gemini)                        # index + page pick the new days up
     calls = gemini.calls if gemini else 0
@@ -1083,8 +1355,16 @@ def diagnostics(b):
         f"| Gemini calls this run | {b['ai_calls']} — {status} |",
         f"| Chosen for the brief | {len(b['chosen'])} (left out: {len(b['leftovers'])}) |"]
         + ([f"| Web edition | {len(b['edition']['chosen'])} stories from {len(b['edition']['ids'])} items in the rolling window"
-            f"{'; ' + str(b['edition']['stats'].get('clusters', 0)) + ' cross-report clusters' if b['edition']['stats'].get('clusters') else ''} |"]
-           if b.get("edition") else []) + [""])
+            f"{'; ' + str(b['edition']['stats'].get('clusters', 0)) + ' cross-report clusters' if b['edition']['stats'].get('clusters') else ''}"
+            f"{'; ' + str(b['edition']['stats'].get('reruns', 0)) + ' re-runs dropped' if b['edition']['stats'].get('reruns') else ''} |"]
+           if b.get("edition") else [])
+        + (["| Guards re-filed | " + ", ".join(f"{n} ({why})" for why, n in sorted(g.items())) + " |"]
+           if (g := {**(st.get("guards") or {}), **((b.get("edition") or {}).get("stats", {}).get("guards") or {})}) else [])
+        + [""]
+        + ([("### Gemini groups refused or thinned\n\n" + "\n".join(
+                f"- **{r['why']}** — shared: _{r.get('shared') or '–'}_ — " + " · ".join(r.get("titles") or [])
+                for r in (b.get("edition") or {}).get("stats", {}).get("refused") or []) + "\n")]
+           if (b.get("edition") or {}).get("stats", {}).get("refused") else []))
 
 
 def status_lines(con, env, now=None):
