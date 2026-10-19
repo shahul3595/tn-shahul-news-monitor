@@ -65,7 +65,7 @@ SUMMARY_SCHEMA = {"type": "OBJECT", "properties": {"groups": {"type": "ARRAY", "
     "takeaways": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
         "text": {"type": "STRING"}, "story": {"type": "INTEGER"}}, "required": ["text", "story"]}}},
     "required": ["section", "takeaways"]}}}, "required": ["groups"]}
-SUMMARY_FORMAT = "v3"         # bumped when the shape changes, so cached summaries are rebuilt
+SUMMARY_FORMAT = "v4"         # bumped when the shape or order changes, so cached summaries are rebuilt
 SECTION_LABEL = dict([("urgent", "Urgent")] + [(c, NICE[c]) for c in CATEGORIES])
 
 
@@ -130,7 +130,8 @@ def _summary(con, gemini, key, urgent, sections, row, now):
     """Category-wise takeaways: [{"cat": "urgent"|category, "bullets": [{"text", "id"}, ..]}]
     in section order, each takeaway pointing at the story card it comes from (id None when
     Gemini's number did not resolve). Cached until the chosen stories change."""
-    groups = [("urgent", urgent)] + [(cat, sections.get(cat) or []) for cat in CATEGORIES]
+    groups = [("mention", sections.get("mention") or []), ("urgent", urgent)] \
+        + [(cat, sections.get(cat) or []) for cat in CATEGORIES if cat != "mention"]
     groups = [(cat, items) for cat, items in groups if items]
     sh = _hash([c["id"] for _, items in groups for c in items]) + SUMMARY_FORMAT
     cached = json.loads(row["summary"]) if row is not None and row["summary"] else []
@@ -193,9 +194,11 @@ def _story(c, urgent):
 
 
 def edition_json(ed, label, now):
-    stories = [_story(c, True) for c in ed["urgent"]]
+    stories = [_story(c, False) for c in ed["sections"].get("mention", [])]
+    stories += [_story(c, True) for c in ed["urgent"]]
     for cat in CATEGORIES:
-        stories += [_story(c, False) for c in ed["sections"][cat]]
+        if cat != "mention":
+            stories += [_story(c, False) for c in ed["sections"][cat]]
     return {"key": ed["key"], "label": label, "generated": iso(now), "generated_ist": fmt_ist(iso(now)),
             "window": [iso(ed["since"]), iso(ed["until"])], "considered": len(ed["cands"]),
             "items": len(ed["ids"]), "summary": ed["summary"], "stories": stories}
@@ -570,7 +573,11 @@ header h1{font-size:19px;margin:0;line-height:1.2}header .sub{color:var(--dim);f
 .tools input[type=search]{flex:1 1 200px;min-height:44px;padding:8px 12px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
 .tools select{min-height:44px;padding:8px 10px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
 .callout{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:12px 16px;margin:10px 0}
-.callout h2{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin:0 0 6px}
+.callout h2{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin:0}
+.sumh{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;width:100%;min-height:44px;padding:0;border:0;background:transparent;font:inherit;color:inherit;text-align:left;cursor:pointer;letter-spacing:inherit;text-transform:inherit}
+.sumh>span{flex:1;white-space:nowrap}.sumh small{flex:0 0 100%;order:3;font-size:12px;letter-spacing:0;text-transform:none;color:var(--dim)}@media(min-width:600px){.sumh small{flex:1;order:0}}.sumh b{font-weight:500;font-size:12px;letter-spacing:0;text-transform:none;white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:4px 10px;color:var(--ink)}
+.sgwrap{display:grid;grid-template-rows:1fr;transition:grid-template-rows .25s ease}.sgwrap>div{overflow:hidden;min-height:0}.sgwrap.closed{grid-template-rows:0fr}
+#summary.closed{padding-bottom:12px}@media(prefers-reduced-motion:reduce){.sgwrap{transition:none}}
 .callout .sgs{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px 22px}
 .sg h3{font-size:14px;margin:6px 0 2px}.sg h3 a{color:var(--ink);text-decoration:none;display:inline-flex;align-items:center;min-height:32px}
 .sg h3 a span{color:var(--dim);margin-left:4px}.sg h3 a:hover{color:var(--accent)}.sg.urgent h3 a{color:var(--urgent)}
@@ -658,13 +665,13 @@ JS = r"""
 var DATA=JSON.parse(document.getElementById('data').textContent),EDS=JSON.parse(document.getElementById('editions').textContent);
 var FB=document.documentElement.getAttribute('data-feedback')||'';var MOVETOK='';try{MOVETOK=sessionStorage.getItem('movetoken')||''}catch(e){}if(MOVETOK&&FB)document.body.classList.add('editor');
 var MOVE_CATS=[['mention','🗣 Mentions'],['constituency','📍 Velachery'],['district','🏛 Thiruvallur'],['portfolio','💻 AI / IT'],['political','🏳 Political'],['opportunity','🎯 Opportunities']],MOVE_SENTS=[['positive','🟢 Positive'],['neutral','⚪ Neutral'],['critical','🔴 Critical']];
-var CATS=[['urgent','🚨','Urgent'],['mention','🗣','Mentions'],['constituency','📍','Velachery'],['district','🏛','Thiruvallur'],['portfolio','💻','AI / IT / Digital'],['political','🏳','Political'],['opportunity','🎯','Opportunities'],['added','📌','Added by the office']];
+var CATS=[['mention','🗣','Mentions'],['urgent','🚨','Urgent'],['constituency','📍','Velachery'],['district','🏛','Thiruvallur'],['portfolio','💻','AI / IT / Digital'],['political','🏳','Political'],['opportunity','🎯','Opportunities'],['added','📌','Added by the office']];
 var NAME={};CATS.forEach(function(c){NAME[c[0]]=c[2]});var SENT={positive:'🟢 Positive',neutral:'⚪ Neutral',critical:'🔴 Critical'};
 var REASONS=[['unrelated','Unrelated to constituency / portfolio'],['category','Wrong category'],['old','Duplicate / old'],['spam','Spam / noise']];
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return [].slice.call((r||document).querySelectorAll(s))};
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{}};
-try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off'}catch(e){}
+var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{},sumOpen:true};
+try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off';state.sumOpen=localStorage.getItem('sum')!=='closed'}catch(e){}
 function waText(s,withNotes){var t='*'+(s.urgent?'🚨 ':'')+s.title+'*\n';if(withNotes&&s.takeaways&&s.takeaways.length)t+='_AI summary_\n'+s.takeaways.map(function(b){return '• '+b}).join('\n')+'\n';return t+'🔗 '+s.url}
 function waLink(text){return 'https://wa.me/?text='+encodeURIComponent(text)}
 function story(id){return DATA.stories.filter(function(x){return String(x.id)===String(id)})[0]}
@@ -686,6 +693,7 @@ function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=b
  else if(d.summary&&d.summary.length){sum.hidden=false;$('.sgs',sum).innerHTML='<div class="sg"><ul>'+d.summary.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul></div>'}else{sum.hidden=true}
  $$('[data-jump]',sum).forEach(function(a){a.onclick=function(ev){ev.preventDefault();state.cat='';state.sent='';apply();var t=$('#sec-'+a.getAttribute('data-jump'));if(t)t.scrollIntoView({behavior:'smooth',block:'start'})}});
  $$('[data-story]',sum).forEach(function(a){a.onclick=function(ev){ev.preventDefault();jump(a.getAttribute('data-story'))}});
+ var nb=(d.summary||[]).reduce(function(n,g){return n+((g.bullets||[]).length||0)},0);setSummary(state.sumOpen,nb);
  var rows=CATS.filter(function(c){return by[c[0]]}).map(function(c){var l=by[c[0]],n={positive:0,neutral:0,critical:0};l.forEach(function(s){n[s.sentiment]++});
   return '<tr><td class="cat"><button type="button" data-cat="'+c[0]+'" data-sent="">'+c[1]+' '+esc(c[2])+'</button></td>'+['positive','neutral','critical'].map(function(k){return '<td class="'+(n[k]?'':'zero')+'"><button type="button" data-cat="'+c[0]+'" data-sent="'+k+'">'+n[k]+'</button></td>'}).join('')+'<td><button type="button" data-cat="'+c[0]+'" data-sent="">'+l.length+'</button></td></tr>'}).join('');
  var tot={positive:0,neutral:0,critical:0};d.stories.forEach(function(s){tot[s.sentiment]++});
@@ -730,6 +738,9 @@ var KEY=['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','
 $('#selshare').onclick=function(ev){ev.preventDefault();var ids=Object.keys(state.sel);if(!ids.length)return;var list=DATA.stories.filter(function(s){return state.sel[s.id]});
  var t='📢 *Selected News Updates — Office of Minister R. Kumar*\n_'+DATA.label+' · '+DATA.generated_ist+'_\n\n'+list.map(function(s,i){return (KEY[i]||(i+1)+'.')+' '+waText(s,state.withNotes).replace('🔗 ','🔗 Source: ')}).join('\n\n');
  if(list.length>25)toast('That is a long message — WhatsApp may cut it');window.open(waLink(t),'_blank','noopener')};
+function setSummary(open,nb){state.sumOpen=open;var w=$('#sgwrap'),b=$('#sumtog');if(!w)return;w.classList.toggle('closed',!open);$('#summary').classList.toggle('closed',!open);b.setAttribute('aria-expanded',open);
+ $('#sumarrow').textContent=open?'▾ Collapse':'▸ Expand';$('#sumhint').textContent=open?'· tap a line to open its story':'· '+(nb||'')+(nb?' takeaways':'')+' hidden — tap to read';try{localStorage.setItem('sum',open?'open':'closed')}catch(e){}}
+$('#sumtog').onclick=function(){setSummary(!state.sumOpen,(DATA.summary||[]).reduce(function(n,g){return n+((g.bullets||[]).length||0)},0))};
 function setView(v){state.view=v;$$('.grid').forEach(function(g){g.classList.toggle('list',v==='list')});$$('[data-view]').forEach(function(b){b.setAttribute('aria-pressed',b.getAttribute('data-view')===v)});try{localStorage.setItem('view',v)}catch(e){}}
 $$('[data-view]').forEach(function(b){b.onclick=function(){setView(b.getAttribute('data-view'))}});
 $('#q').addEventListener('input',function(){state.q=this.value;apply();allSearch()});
@@ -884,7 +895,7 @@ PAGE = """<!DOCTYPE html><html lang="en" data-feedback="__FEEDBACK__"><head><met
 <header><button type="button" class="icon" id="menu" aria-label="Menu">☰</button><div style="flex:1;min-width:0"><h1 id="title"></h1><div class="sub" id="sub"></div></div></header>
 <div class="tools"><input type="search" id="q" placeholder="Search headlines, summaries, outlets, categories" aria-label="Search"><label class="opt sm" title="Search every edition ever published, not only this one"><input type="checkbox" id="qall"> All editions</label>
 <select class="pick" aria-label="Edition"></select><button type="button" class="btn" data-view="cards">Cards</button><button type="button" class="btn" data-view="list">List</button><button type="button" class="btn" id="notes" aria-pressed="true">📝 Notes: ON</button><button type="button" class="btn" id="select" aria-pressed="false">☑ Select</button></div>
-<div class="callout" id="summary" hidden><h2>✨ 60-second AI briefing · tap a line to open its story</h2><div class="sgs"></div></div>
+<div class="callout" id="summary" hidden><h2><button type="button" class="sumh" id="sumtog" aria-expanded="true" aria-controls="sgwrap"><span>✨ 60-second AI briefing</span><small id="sumhint">· tap a line to open its story</small><b id="sumarrow">▾ Collapse</b></button></h2><div class="sgwrap" id="sgwrap"><div><div class="sgs"></div></div></div></div>
 <div class="dash" id="dashboard"><h2><span id="dashtitle">Today at a glance</span><span class="seg"><button type="button" class="btn sm" data-dash="today" aria-pressed="true">Today</button><button type="button" class="btn sm" data-dash="week" aria-pressed="false">7 days</button></span></h2>
 <div id="dash-today"><table><thead><tr><th>Category</th><th>🟢 Positive</th><th>⚪ Neutral</th><th>🔴 Critical</th><th>All</th></tr></thead><tbody id="dashbody"></tbody><tfoot id="dashfoot"></tfoot></table><p class="hint">Tap a number to filter the stories below.</p></div>
 <div id="dash-week" hidden><div class="seg" style="margin:0 0 8px"><button type="button" class="btn sm" data-mdays="7" aria-pressed="true">7 days</button><button type="button" class="btn sm" data-mdays="30" aria-pressed="false">30 days</button></div><div class="mwrap"><table class="matrix"><thead id="mhead"></thead><tbody id="mbody"></tbody></table></div><p class="hint">Each cell: 🟢 positive · ⚪ neutral · 🔴 critical. Tap a count to open that day and section; tap 🟢 ⚪ 🔴 for one sentiment only; tap the day to open all of it.</p></div></div>
