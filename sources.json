@@ -17,13 +17,34 @@
     "yt_thanthi is DISABLED: its channel id returned 0 entries on 20 Sep.",
     "  Run verify.py, pick a channel whose uploads are news, then re-enable.",
     "v2 (20 Sep lab run): never use bare 'IT' in a query -- Google is case-insensitive and it matches the word 'it'. Mention queries widened to 7d: one minister's name is low-volume. vel_flood stays at 1d; zero in dry weather is correct.",
-    "v3: GDELT disabled (zero at 7d). gn_en_mla disabled (covered by gn_en_name). Three slow queries at 14d/30min. political + opportunity keep near-zero on keywords by design -- they are AI-judged categories."
+    "v3: GDELT disabled (zero at 7d). gn_en_mla disabled (covered by gn_en_name). Three slow queries at 14d/30min. political + opportunity keep near-zero on keywords by design -- they are AI-judged categories.",
+    "v4: automotive review / price portals (bikewale, zigwheels, cardekho ...) in blocked_hosts -- they ride in on 'bus', 'metro' and 'road' queries and are never news. Add a host here (or in the BLOCKED_HOSTS repo variable) and run --init: existing items from it are dropped too."
   ],
   "blocked_hosts": [
     "theprint.in",
     "fuelcarmagazine.com",
     "tamil.getlokalapp.com",
-    "dailyhunt.in"
+    "dailyhunt.in",
+    "bikewale.com",
+    "zigwheels.com",
+    "cardekho.com",
+    "bikedekho.com",
+    "autocarindia.com",
+    "gaadiwaadi.com",
+    "motorbeam.com",
+    "carwale.com",
+    "rushlane.com",
+    "carandbike.com",
+    "91wheels.com",
+    "v3cars.com",
+    "team-bhp.com",
+    "overdrive.in",
+    "autocarpro.in",
+    "cartoq.com",
+    "drivespark.com",
+    "motoroids.com",
+    "acko.com",
+    "bikes4sale.in"
   ],
   "sources": [
     {

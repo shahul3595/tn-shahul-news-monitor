@@ -319,14 +319,18 @@ def host_in(host, suffixes):
 
 
 def blocked_hosts():
+    """sources.json's blocked_hosts, plus the BLOCKED_HOSTS variable (comma-separated), so a
+    site can be shut out from the repository settings without touching a file."""
+    hosts = list(DEFAULT_BLOCKED_HOSTS)
     try:
         cfg = json.loads(SOURCES_JSON.read_text(encoding="utf-8"))
-        hosts = cfg.get("blocked_hosts")
-        if isinstance(hosts, list) and hosts:
-            return tuple(h.strip().lower() for h in hosts if h.strip())
+        got = cfg.get("blocked_hosts")
+        if isinstance(got, list) and got:
+            hosts = [h.strip().lower() for h in got if h.strip()]
     except Exception:
         pass
-    return DEFAULT_BLOCKED_HOSTS
+    extra = [h.strip().lower().replace("www.", "") for h in re.split(r"[,\s]+", os.environ.get("BLOCKED_HOSTS", "")) if h.strip()]
+    return tuple(dict.fromkeys(hosts + extra))
 
 
 # --------------------------------------------------------------------------

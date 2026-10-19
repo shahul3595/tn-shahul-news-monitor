@@ -203,16 +203,25 @@ def five_per_category_then_the_balance_goes_elsewhere():
         add(con, t("Por", i))            # portfolio: 12
     for i in range(3):
         add(con, t("Non", i))            # none: never shown
+    for i in range(12):
+        add(con, t("Men", i))            # mentions: 12, and mentions are never capped
     cands, chosen, urgent, sections, left, st = build(con, FakeGemini(), total=15)
+    counts = {k: len(v) for k, v in sections.items() if v}
+    check(counts["mention"] == 12, f"all 12 mentions shown, cap or no cap: {counts}")
+    for c in list(cands):
+        if c["category"] == "mention":
+            cands.remove(c)
+    urgent, sections, left = digest.select(cands, 5, 15)
+    chosen = urgent + [c for cat in digest.CATEGORIES for c in sections[cat]]
     counts = {k: len(v) for k, v in sections.items() if v}
     check(len(chosen) == 15, f"total capped at 15, got {len(chosen)}")
     check(counts["district"] == 2, "district has only 2 -- its spare places move")
     check(counts["constituency"] + counts["portfolio"] == 13, f"the balance filled from the others: {counts}")
     check(counts["constituency"] >= 5 and counts["portfolio"] >= 5, "each got its 5 first")
     check(all(c["category"] != "none" for c in chosen), "no 'none' items")
-    # with the full 30 cap everything but 'none' fits
-    cands, chosen, *_ = build(con, FakeGemini(), total=30)
-    check(len(chosen) == 23, f"all 23 real stories fit under 30, got {len(chosen)}")
+    # with the full 30 cap: all 12 mentions, then the others fill the remaining 18 places
+    cands, chosen, urgent, sections, *_ = build(con, FakeGemini(), total=30)
+    check(len(chosen) == 30 and len(sections["mention"]) == 12, f"30 in all, every mention among them: {len(chosen)}, {len(sections['mention'])}")
 
 
 @test
@@ -608,6 +617,72 @@ def archive_status_and_admin_page():
     check('id="open-archive"' in (docs / "index.html").read_text(encoding="utf-8") and "admin" not in (docs / "index.html").read_text(encoding="utf-8").lower(), "the public page has the archive, no link to admin")
     web.write_admin(docs, {})
     check("Not configured" in (docs / "admin.html").read_text(encoding="utf-8"), "without ADMIN_PIN the page says so")
+
+
+@test
+def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
+    import web
+    import logging
+    before = list(logging.getLogger("collect").handlers)
+    import collect
+    for h in list(logging.getLogger("collect").handlers):
+        if h not in before:
+            logging.getLogger("collect").removeHandler(h)      # keep the test output clean
+    pairs = collect.parse_manual("https://www.dtnext.in/a/1 | district\nhttps://x.com/b/2, https://y.in/c/3 portfolio https://z.in/d/4; https://x.com/b/2 not a link")
+    check(pairs == [("https://www.dtnext.in/a/1", "district"), ("https://x.com/b/2", None), ("https://y.in/c/3", "portfolio"), ("https://z.in/d/4", None)],
+          f"commas, spaces, new lines and semicolons all separate links; a repeat is one: {pairs}")
+    con = make_db("manual.db")
+    # three hand-added links: one with a section asked for, one Gemini can place, one nobody can
+    a = add(con, "Velachery lake: encroachments removed after NGT order", band="AUTO_KEEP", score=7)
+    b = add(con, "Con story: Baby Nagar drain work starts", band="AUTO_KEEP", score=7)
+    c = add(con, "Non story: a page the office wanted on record", band="AUTO_KEEP", score=7)
+    for i, cat in ((a, "district"), (b, None), (c, None)):
+        con.execute("UPDATE items SET manual=1, source_id='manual', raw_payload=? WHERE id=?", (json.dumps({"manual": True, "category": cat}), i))
+    con.execute("INSERT INTO sources (source_id, name, kind) VALUES ('manual', 'Added by the office', 'manual')")
+    for i in range(12):
+        add(con, t("Con", i))                         # a full constituency section (10 on the page)
+    con.commit()
+    # a tiny page (1 per section, 3 in all): the three hand-added links are on it regardless
+    eds = web.publish(con, {"GEMINI_API_KEY": "x", "DIGEST_WEB_PER_CATEGORY": "1", "DIGEST_WEB_MAX": "3"}, T0, FakeGemini(), docs=TMP / "docs-manual")
+    by = {x["id"]: x for x in eds["latest"]["chosen"]}
+    check(all(i in by for i in (a, b, c)) and len(by) == 4, f"3 added links + the 1 the cap allows: {len(by)}")
+    check(by[a]["category"] == "district" and by[b]["category"] == "constituency" and by[c]["category"] == "added",
+          {i: by[i]["category"] for i in (a, b, c) if i in by})
+    data = json.loads((TMP / "docs-manual" / "data" / "latest.json").read_text(encoding="utf-8"))
+    st = next(x for x in data["stories"] if x["id"] == c)
+    check(st["manual"] and st["cat"] == "added" and "Added by the office" in (TMP / "docs-manual" / "index.html").read_text(encoding="utf-8"), "the 📌 section is on the page")
+    cands, *_ = digest.candidates(con, T0)
+    check(all(i in {x["id"] for x in cands} for i in (a, b, c)), "and all three go into the next brief")
+    # a link handed in twice is not re-sent: the second time it is 'already', nothing changes
+    con.execute("UPDATE items SET digested_at=? WHERE id=?", (alerts.iso(T0), a))
+    con.commit()
+    url_a = con.execute("SELECT resolved_url FROM items WHERE id=?", (a,)).fetchone()[0]
+    out = collect.add_links(con, [(url_a, None)], via="test")                                         # same url as item a
+    check(out and out[0][2] == "already" and con.execute("SELECT digested_at FROM items WHERE id=?", (a,)).fetchone()[0], f"handed in twice: {out}")
+    # a message to the bot: links + a section tag; who may send
+    msg = {"chat": {"id": 777, "type": "private"}, "from": {"id": 777}, "text": "see https://www.dtnext.in/x/9 and https://y.in/z #district"}
+    text, private, ok, pairs = collect.inbox_message(msg, "-1001", {"777"})
+    check(private and ok and pairs == [("https://www.dtnext.in/x/9", "district"), ("https://y.in/z", "district")], (ok, pairs))
+    check(not collect.inbox_message(msg, "-1001", set())[2], "an unknown sender is refused")
+    post = {"chat": {"id": -1001, "type": "channel"}, "text": "https://www.dinamani.com/p/1 #velachery"}
+    check(collect.inbox_message(post, "-1001", set())[2:] == (True, [("https://www.dinamani.com/p/1", "constituency")]), "a post in the brief's channel is taken")
+    # every mention is shown, whatever the caps
+    con2 = make_db("mentions.db")
+    for i in range(14):
+        add(con2, f"Men story {i}: {WORDS[3 * i]} {WORDS[3 * i + 1]} {WORDS[3 * i + 2]}")   # distinct words; the description carries his name (see add)
+    for i in range(3):
+        add(con2, t("Con", i))
+    cands2, chosen2, urgent2, sections2, left2, st2 = build(con2, FakeGemini(), per=5, total=8)
+    check(len(sections2["mention"]) == 14 and len(chosen2) == 14 + 3, f"14 mentions all shown above a cap of 5/8: {len(sections2['mention'])}, {len(chosen2)}")
+    # blocked hosts: sources.json plus the BLOCKED_HOSTS variable
+    import os
+    hosts = rules.blocked_hosts()
+    check("bikewale.com" in hosts and "zigwheels.com" in hosts and "cardekho.com" in hosts, hosts[:6])
+    os.environ["BLOCKED_HOSTS"] = "example-motors.com, www.another.in"
+    try:
+        check("example-motors.com" in rules.blocked_hosts() and "another.in" in rules.blocked_hosts(), "the variable adds hosts")
+    finally:
+        del os.environ["BLOCKED_HOSTS"]
 
 
 @test

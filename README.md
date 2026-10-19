@@ -10,7 +10,7 @@ twice a day.
 |---|---|---|
 | 1 - GitHub test run | by hand | checks that GitHub's servers can reach the feeds and sites; stores nothing |
 | 2 - Collect news | every 30 min | restores the database, collects and scores, saves the database again |
-| 3 - Telegram brief | ~07:00 and ~18:00 IST | ranks what was collected since the last brief (Gemini, or the keyword rules as fallback), posts up to 30 items to Telegram, and publishes the same brief as a web page in `docs/` |
+| 3 - Telegram brief | ~07:00 and ~18:00 IST | ranks what was collected since the last brief (Gemini, or the keyword rules as fallback), posts up to 30 items to Telegram (every *Mention* on top of that -- stories naming him are never capped), and publishes the same brief as a web page in `docs/` |
 
 ## The web page
 
@@ -109,9 +109,55 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `YOUTUBE_SHEET_CSV_URL` | optional | the sheet's *YouTube channels* tab, published as CSV (columns `name`, `channel_id`, `enabled`). When set, the channel list comes from there instead of `sources.json` |
 | `GEMINI_API_KEY` | recommended | Gemini free tier; ranks the brief. Without it the keyword rules rank |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | yes, for the brief | the bot and the private channel. Without them the brief is only printed on the run page |
+| `MANUAL_LINKS_CSV_URL` | optional | the sheet's *Add links* tab, published as CSV |
 | `ADMIN_PIN` | optional | unlocks `docs/admin.html`, the private status page (see below). Use a passphrase of 8+ characters, not a 4-digit PIN: the page can be downloaded and guessed at offline |
 
-Optional *variables* (Settings → Secrets and variables → Actions → Variables): `MINISTER_NAMES` (the forms of his name the guards accept, `|`-separated; default `R. Kumar|R Kumar|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|Minister Kumar` -- Tamil case endings are understood; the two generic forms count only next to a Tamil Nadu place or his portfolio), `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (24), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
+Optional *variables* (Settings → Secrets and variables → Actions → Variables): `TELEGRAM_ADMIN_IDS` (user ids allowed to send links to the bot), `BLOCKED_HOSTS` (extra hosts to drop, comma-separated), `MINISTER_NAMES` (the forms of his name the guards accept, `|`-separated; default `R. Kumar|R Kumar|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|Minister Kumar` -- Tamil case endings are understood; the two generic forms count only next to a Tamil Nadu place or his portfolio), `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (24), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
+
+## Adding news by hand
+
+Three ways in, all ending in the same place: the link is fetched at once, stored as kept
+whatever the keywords say, never dropped as a re-run, never squeezed out by the per-section
+caps, and shown with a 📌 chip. It goes to the section you name, else where Gemini puts it,
+else where the keyword rules put it, else the 📌 *Added by the office* section. The run that
+takes it in also rebuilds the web page (nothing is sent to Telegram); the next brief carries it.
+
+1. **The sheet** (best for the office, works from a phone): add a tab *Add links* to the
+   keyword Google Sheet with the header row `url, category, note`; paste a link per row,
+   with an optional section in *category* (`mention`, `constituency`, `district`,
+   `portfolio`, `political`, `opportunity`). Publish that tab as CSV (File → Share →
+   Publish to web → choose the tab → CSV) and put the link in the `MANUAL_LINKS_CSV_URL`
+   secret. Every half-hour run takes the rows it has not seen; old rows stay as a log.
+2. **The bot** (fastest): send the link to the Telegram bot in a direct message -- forward
+   it from any news app -- with `#district`, `#velachery`, `#portfolio` ... to pick the
+   section. The bot replies with what it did. It takes messages only from the user ids in the
+   `TELEGRAM_ADMIN_IDS` variable (comma-separated); message it once and the run log shows your
+   id (`link from chat ... ignored -- add the user id`). A link posted in the brief's own
+   channel is taken too, without a reply.
+3. **The run box**: Actions → *2 - Collect news* → *Run workflow* → paste links into
+   **manual_urls**. The box is one line, so separate links with spaces or commas; `url | district`
+   picks the section. Set **minutes** to 0 to add links without the normal poll.
+
+A link handed in twice is left alone (not re-sent). A page that refuses robots still appears,
+with its address as the headline, so the office can at least share it.
+
+## YouTube channels
+
+The *YouTube channels* tab of the sheet (`YOUTUBE_SHEET_CSV_URL`) has columns `name`,
+`channel_id`, `enabled`. The id is the `UC...` string (24 characters) from the channel's
+*About → Share channel → Copy channel ID*; from this version the column also takes `@handle`
+or the channel's address (`youtube.com/@newsglitztamil`) and looks the id up through the
+Data API. A channel whose id is wrong shows "playlist not found" in the collector log and
+"returning nothing" on the status page.
+
+## Sites that must never appear
+
+`sources.json` → `blocked_hosts` lists hosts whose items are dropped before they are even
+fetched (paywalls, aggregator stubs, and the automotive review and price portals -- bikewale,
+zigwheels, cardekho, carwale, rushlane ... -- that ride in on "bus", "metro" and "road"
+queries). Add a host there, or to the `BLOCKED_HOSTS` repository variable (comma-separated,
+no code change needed); the next run also drops what that host already delivered. A link the
+office adds by hand is exempt.
 
 ## Keeping the keyword list
 

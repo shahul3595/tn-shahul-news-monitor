@@ -183,6 +183,7 @@ def _story(c, urgent):
             "reports": [{"outlet": r["outlet"], "url": r["url"], "title": r["title"], "lang": r["lang"]}
                         for r in (c.get("reports") or []) if r["url"] != alerts.display_url(c)],
             "takeaways": c.get("takeaways") or [],
+            "manual": bool(c.get("manual")),
             "merged": [i for i in (c.get("merged") or []) if i != c["id"]],
             "cat": c["category"], "urgent": bool(urgent), "sentiment": c.get("sentiment") or "neutral",
             "priority": c["priority"], "impact": c.get("impact") or 5,
@@ -637,7 +638,7 @@ JS = r"""
 (function(){
 var DATA=JSON.parse(document.getElementById('data').textContent),EDS=JSON.parse(document.getElementById('editions').textContent);
 var FB=document.documentElement.getAttribute('data-feedback')||'';
-var CATS=[['urgent','🚨','Urgent'],['mention','🗣','Mentions'],['constituency','📍','Velachery'],['district','🏛','Thiruvallur'],['portfolio','💻','AI / IT / Digital'],['political','🏳','Political'],['opportunity','🎯','Opportunities']];
+var CATS=[['urgent','🚨','Urgent'],['mention','🗣','Mentions'],['constituency','📍','Velachery'],['district','🏛','Thiruvallur'],['portfolio','💻','AI / IT / Digital'],['political','🏳','Political'],['opportunity','🎯','Opportunities'],['added','📌','Added by the office']];
 var NAME={};CATS.forEach(function(c){NAME[c[0]]=c[2]});var SENT={positive:'🟢 Positive',neutral:'⚪ Neutral',critical:'🔴 Critical'};
 var REASONS=[['unrelated','Unrelated to constituency / portfolio'],['category','Wrong category'],['old','Duplicate / old'],['spam','Spam / noise']];
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return [].slice.call((r||document).querySelectorAll(s))};
@@ -654,7 +655,7 @@ function card(s){var g=group(s),notes=s.takeaways&&s.takeaways.length?'<div clas
  return '<article class="card" id="story-'+s.id+'" data-id="'+s.id+'" data-cat="'+g+'" data-sent="'+s.sentiment+'" data-text="'+esc((s.title+' '+(s.snippet||'')+' '+s.outlet+' '+(s.reports||[]).map(function(r){return r.outlet}).join(' ')+' '+NAME[s.cat]+' '+SENT[s.sentiment]+(s.urgent?' urgent':'')).toLowerCase())+'">'+
  (s.image?'<a href="'+esc(s.url)+'" target="_blank" rel="noopener"><img src="'+esc(s.image)+'" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>':'')+
  '<div class="body"><div class="hrow"><label class="tick" aria-label="Select this story"><input type="checkbox"'+(state.sel[s.id]?' checked':'')+'></label><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3></div>'+notes+
- '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
+ '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+(s.manual&&s.cat!=='added'?'<span class="chip" title="A link the office handed in">📌 Added by the office</span>':'')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
  (s.reports&&s.reports.length?'<ul class="outlets" hidden>'+s.reports.map(function(r){return '<li><a href="'+esc(r.url)+'" target="_blank" rel="noopener" title="'+esc(r.title)+'">'+esc(r.outlet)+' <small>('+esc(r.lang)+')</small> ↗</a></li>'}).join('')+'</ul>':'')+'</div>'+
  '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span><a class="wa" href="#" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
 function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=by[group(s)]||[]).push(s)});

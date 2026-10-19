@@ -368,6 +368,45 @@ def _slug(name):
     return s[:24] or "channel"
 
 
+_HANDLE_CACHE = {}
+
+
+def youtube_channel_id_of(value):
+    """UC... as is; '@handle', 'youtube.com/@handle', 'youtube.com/channel/UC...' or
+    'youtube.com/c/Name' resolved through the Data API (1 quota unit) when a key is set."""
+    v = (value or "").strip()
+    if re.fullmatch(r"UC[\w-]{22}", v):
+        return v
+    m = re.search(r"/channel/(UC[\w-]{22})", v)
+    if m:
+        return m.group(1)
+    m = re.search(r"@([\w.\-]+)", v) or re.search(r"youtube\.com/(?:c/|user/)?([\w.\-]+)/?$", v)
+    handle = m.group(1) if m else (v if re.fullmatch(r"[\w.\-]{3,}", v) else "")
+    if not handle:
+        return v
+    if handle in _HANDLE_CACHE:
+        return _HANDLE_CACHE[handle]
+    key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if not key:
+        log.warning(f"youtube sheet: '{value}' needs YOUTUBE_API_KEY to be looked up")
+        return v
+    try:
+        with httpx.Client(timeout=20.0) as c:
+            r = c.get("https://www.googleapis.com/youtube/v3/channels", params={"part": "id", "forHandle": handle, "key": key})
+            items = (r.json() if r.status_code == 200 else {}).get("items") or []
+            if not items:
+                r = c.get("https://www.googleapis.com/youtube/v3/channels", params={"part": "id", "forUsername": handle, "key": key})
+                items = (r.json() if r.status_code == 200 else {}).get("items") or []
+        cid = items[0]["id"] if items else ""
+        if cid:
+            log.info(f"youtube sheet: @{handle} is {cid}")
+        _HANDLE_CACHE[handle] = cid or v
+        return cid or v
+    except Exception as ex:
+        log.warning(f"youtube sheet: could not look up '{value}': {type(ex).__name__}")
+        return v
+
+
 def youtube_sources_from_sheet(url, existing):
     """The 'YouTube channels' tab: columns name, channel_id, enabled (poll_interval_s
     optional). Returns a list of source dicts in sources.json shape, or None when the
@@ -396,8 +435,10 @@ def youtube_sources_from_sheet(url, existing):
             cid, name = get("channel_id"), get("name")
             if not cid and not name:
                 continue
-            if not re.fullmatch(r"UC[\w-]{22}", cid):
-                log.warning(f"youtube sheet row {n}: '{cid}' is not a channel id (UC + 22 characters) -- skipped")
+            cid = youtube_channel_id_of(cid)          # '@handle' or a channel url -> UC...
+            if not re.fullmatch(r"UC[\w-]{22}", cid or ""):
+                log.warning(f"youtube sheet row {n}: '{get('channel_id')}' is not a channel id (UC + 22 characters, "
+                            f"or an @handle the API can look up) -- skipped")
                 continue
             if cid in seen:
                 continue
@@ -475,6 +516,21 @@ def cmd_init():
                                WHERE extract_status IN ('OK','THIN') AND extract_http >= 400""").rowcount
     if fixed:
         log.info(f"{fixed} error pages that had been stored as articles re-marked FAILED")
+
+    # A host added to blocked_hosts after its items were scored: drop those items too, so
+    # they leave the page at the next brief instead of lingering for a day.
+    try:
+        dropped = 0
+        for h in blocked_hosts():
+            dropped += con.execute("""UPDATE items SET band='DROP', score=0, urgent=0,
+                                        matched_terms=json_insert(coalesce(matched_terms,'[]'),'$[#]',?)
+                                      WHERE band IS NOT NULL AND band <> 'DROP' AND coalesce(manual,0)=0
+                                        AND (extract_host = ? OR extract_host LIKE ? OR publisher LIKE ?)""",
+                                   ("✖blocked-host:" + h, h, "%." + h, "%" + h.split(".")[0] + "%")).rowcount
+        if dropped:
+            log.info(f"{dropped} items from blocked hosts dropped")
+    except sqlite3.OperationalError:
+        pass
 
     # Videos collected through the API carry their thumbnail in the stored payload;
     # fill image_url from it for the ones that predate the column.
@@ -965,6 +1021,232 @@ def drain_extractor(con, client, budget_s, tick=None):
 # stats
 # --------------------------------------------------------------------------
 
+MANUAL_SOURCE = ("manual", "Added by the office", "manual")
+_URL_RE = re.compile(r"https?://[^\s<>\"'|,]+")
+_CATS = ("mention", "constituency", "district", "portfolio", "political", "opportunity")
+
+
+def parse_manual(text):
+    """Links separated by anything -- commas, spaces, new lines, semicolons -- each with an
+    optional section after it ('url | district', 'url district'). -> [(url, category|None)]"""
+    out, seen = [], set()
+    text = text or ""
+    hits = list(_URL_RE.finditer(text))
+    for i, m in enumerate(hits):
+        url = m.group(0).rstrip(".;)|,")
+        rest = text[m.end():hits[i + 1].start() if i + 1 < len(hits) else len(text)].lower()
+        cat = next((c for c in _CATS if re.search(r"\b" + c + r"\b", rest)), None)
+        if url not in seen:
+            seen.add(url)
+            out.append((url, cat))
+    return out
+
+
+def _page_title(html_text):
+    m = re.search(r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)", html_text, re.I) \
+        or re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    return html_unescape(re.sub(r"\s+", " ", m.group(1))).strip() if m else ""
+
+
+def add_links(con, pairs, via="run"):
+    """Articles the office hands in by link: fetched now, stored as kept (AUTO_KEEP) and
+    marked manual, so the brief and the page carry them whatever the keywords say. An
+    optional section ('url | district') is honoured by the digest. Returns a list of
+    (url, title, outcome) with outcome 'added', 'kept' (collected earlier, now marked) or
+    'already' (handed in before -- nothing changes, so it is not re-sent)."""
+    con.execute("INSERT OR IGNORE INTO sources (source_id, name, kind, enabled) VALUES (?, ?, ?, 1)", MANUAL_SOURCE)
+    client = httpx.Client(timeout=25.0, follow_redirects=True)
+    ts, out = now(), []
+    keep = getattr(rules, "AUTO_KEEP", 10)
+    for url, cat in pairs:
+        key = make_item_key(url)
+        ckey = rules.canonical_key(url)
+        row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual FROM items
+                             WHERE item_key=? OR (canonical_key IS NOT NULL AND canonical_key=?) OR resolved_url=? OR link=?
+                             ORDER BY manual DESC, id LIMIT 1""", (key, ckey, url, url)).fetchone()
+        if row and row["manual"]:
+            out.append((url, row["title"], "already"))
+            continue
+        host = (urlparse(url).hostname or "").replace("www.", "")
+        title, text_, status, http_status, image, chars = "", "", "FAILED", None, None, 0
+        try:
+            r = client.get(url, headers=BROWSER_HEADERS)
+            http_status = r.status_code
+            if http_status < 400:
+                title = _page_title(r.text)
+                if not host_in(host, VIDEO_HOSTS) and not host_in(host, SOCIAL_HOSTS):
+                    text_ = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
+                    chars = len(text_)
+                    status = "OK" if chars >= THIN_TEXT_CHARS else ("THIN" if chars else "FAILED")
+                else:
+                    status = "SKIPPED_VIDEO" if host_in(host, VIDEO_HOSTS) else "SKIPPED_SOCIAL"
+                image = og_image(r.text)
+        except Exception as ex:
+            log.warning(f"add-links: {url[:80]}: {type(ex).__name__}: {str(ex)[:80]}")
+        if not title:
+            title = (row["title"] if row and row["title"] else "") or \
+                re.sub(r"[-_]+", " ", urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]).strip() or url
+        publisher = host.split(".")[0].title() if host else "Link"
+        payload = json.dumps({"manual": True, "category": cat, "added_at": ts, "via": via})
+        if row:
+            con.execute("""UPDATE items SET manual=1, band='AUTO_KEEP', score=max(coalesce(score,0), ?), rules_at=coalesce(rules_at, ?),
+                           raw_payload=? WHERE id=?""", (keep, ts, payload, row["id"]))
+            try:
+                con.execute("UPDATE items SET digested_at=NULL WHERE id=?", (row["id"],))   # back into the next brief
+            except sqlite3.OperationalError:
+                pass
+            out.append((url, title, "kept"))
+            log.info(f"add-links: collected earlier, now kept and marked: {title[:60]}")
+        else:
+            con.execute("""INSERT INTO items (item_key, source_id, feed_url, link, title, description, publisher, published_raw,
+                                   published_at, discovered_at, language, raw_payload, resolve_status, resolved_url,
+                                   extract_status, extract_host, extract_http, extract_chars, extract_text, extract_attempts,
+                                   image_url, canonical_key, score, band, urgent, matched_terms, target_tags, rules_at, manual)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RESOLVED',?,?,?,?,?,?,1,?,?,?,'AUTO_KEEP',0,?,?,?,1)""",
+                        (key, MANUAL_SOURCE[0], "", url, title, "", publisher, "", ts, ts, "ta" if re.search(r"[\u0B80-\u0BFF]", title) else "en",
+                         payload, url, status, host, http_status, chars, text_ or None, image, ckey, keep,
+                         json.dumps(["📌added by the office"], ensure_ascii=False), json.dumps([cat] if cat in ("constituency", "district", "portfolio") else []), ts))
+            out.append((url, title, "added"))
+            log.info(f"add-links: {status:<6} {chars:>6}ch  {title[:70]}")
+    con.commit()
+    n = sum(1 for _, _, o in out if o != "already")
+    if out:
+        log.info(f"add-links ({via}): {n} stored, {len(out) - n} were in already")
+    _note_added(n)
+    return out
+
+
+def _note_added(n):
+    """Tell the workflow how many links went in, so it can rebuild the page in the same run."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path and n:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"added={n}\n")
+        except OSError:
+            pass
+
+
+def cmd_add_urls(text):
+    if alerts is None or rules is None:
+        log.error("add-urls needs rules.py and alerts.py next to collect.py")
+        return 0
+    pairs = parse_manual(text)
+    if not pairs:
+        log.info("add-urls: no links found in the input")
+        return 0
+    con = connect()
+    alerts.migrate(con)
+    return len(add_links(con, pairs, via="workflow"))
+
+
+def cmd_sheet_links(url):
+    """The sheet's 'Add links' tab, published as CSV: columns url (required), category
+    (optional). Every run takes the rows it has not seen; a row already handed in is left
+    alone, so the sheet can keep growing as a log of what the office added."""
+    if alerts is None or rules is None or not url:
+        return 0
+    import csv
+    import io
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": UA}) as c:
+            r = c.get(url)
+        if r.status_code != 200 or "<html" in r.text[:500].lower():
+            log.warning(f"links sheet: HTTP {r.status_code} or not CSV -- is the tab published as CSV?")
+            return 0
+        reader = csv.DictReader(io.StringIO(r.content.decode("utf-8-sig", errors="replace")))
+        fields = {(f or "").strip().lower().replace(" ", "_"): f for f in (reader.fieldnames or [])}
+        if "url" not in fields and "link" not in fields:
+            log.warning(f"links sheet: no 'url' column (got {reader.fieldnames})")
+            return 0
+        col = fields.get("url") or fields.get("link")
+        pairs = []
+        for row in reader:
+            raw = (row.get(col) or "").strip()
+            m = _URL_RE.search(raw)
+            if not m:
+                continue
+            cat = (row.get(fields.get("category", ""), "") or row.get(fields.get("section", ""), "") or "").strip().lower()
+            pairs.append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS else None))
+    except Exception as ex:
+        log.warning(f"links sheet: {type(ex).__name__}: {str(ex)[:80]}")
+        return 0
+    if not pairs:
+        return 0
+    con = connect()
+    alerts.migrate(con)
+    out = add_links(con, pairs, via="sheet")
+    return sum(1 for _, _, o in out if o != "already")
+
+
+def inbox_message(msg, chat_id, allowed):
+    """One Telegram message -> (text, is_private, allowed_sender, [(url, category)]). A
+    '#district' / '#velachery' / '#portfolio' tag in the message picks the section."""
+    chat = msg.get("chat") or {}
+    sender = str((msg.get("from") or {}).get("id") or "")
+    text = " ".join(x for x in (msg.get("text"), msg.get("caption")) if x)
+    for ent in (msg.get("entities") or []) + (msg.get("caption_entities") or []):
+        if ent.get("type") == "text_link" and ent.get("url"):
+            text += " " + ent["url"]
+    private = chat.get("type") == "private"
+    ok = (str(chat.get("id")) == str(chat_id)) or (private and sender in allowed)
+    pairs = parse_manual(text)
+    tag = re.search(r"#(mention|constituency|district|portfolio|political|opportunity|velachery|thiruvallur)\b", text.lower())
+    if tag:
+        cat = {"velachery": "constituency", "thiruvallur": "district"}.get(tag.group(1), tag.group(1))
+        pairs = [(u, c_ or cat) for u, c_ in pairs]
+    return text, private, ok, pairs
+
+
+def cmd_telegram_inbox(token, chat_id, admin_ids):
+    """Links sent to the bot: a direct message from an allowed user (TELEGRAM_ADMIN_IDS), or
+    a post in the brief's own channel. '#district' in the message picks the section. The
+    bot answers a direct message with what it did; channel posts get no reply (that is the
+    news channel). The update offset is remembered, so nothing is handled twice."""
+    if alerts is None or rules is None or not token:
+        return 0
+    con = connect()
+    alerts.migrate(con)
+    offset = int(rt_get(con, "tg_inbox_offset", 0) or 0)
+    allowed = {str(x).strip() for x in re.split(r"[,\s]+", admin_ids or "") if str(x).strip()}
+    api = f"https://api.telegram.org/bot{token}"
+    try:
+        with httpx.Client(timeout=30.0) as c:
+            r = c.get(f"{api}/getUpdates", params={"offset": offset + 1, "timeout": 0, "allowed_updates": json.dumps(["message", "channel_post"])})
+            data = r.json() if r.status_code == 200 else {}
+            if not data.get("ok"):
+                log.warning(f"telegram inbox: {r.status_code} {str(data.get('description') or r.text)[:100]}")
+                return 0
+            total = 0
+            for upd in data.get("result") or []:
+                offset = max(offset, int(upd.get("update_id", 0)))
+                msg = upd.get("message") or upd.get("channel_post") or {}
+                chat = msg.get("chat") or {}
+                sender = str((msg.get("from") or {}).get("id") or "")
+                text, private, ok, pairs = inbox_message(msg, chat_id, allowed)
+                if not pairs:
+                    if private and ok and text.strip().lower() in ("/start", "start", "help", "/help"):
+                        c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text": "Send me a news link (with #district, #velachery, #portfolio ... to pick the section). It goes on the page within half an hour and into the next brief."})
+                    continue
+                if not ok:
+                    log.warning(f"telegram inbox: link from chat {chat.get('id')} / user {sender or '?'} ignored -- "
+                                f"add the user id to TELEGRAM_ADMIN_IDS to accept links from them")
+                    if private:
+                        c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text": f"Sorry, I only take links from the office. Your id is {sender} -- the editor can add it."})
+                    continue
+                out = add_links(con, pairs, via=f"telegram:{sender or chat.get('id')}")
+                total += sum(1 for _, _, o in out if o != "already")
+                if private:
+                    lines = [("✅ " if o == "added" else "📎 " if o == "kept" else "↩️ ") + (t_[:80] or u) + ("" if o != "already" else " (already in)") for u, t_, o in out]
+                    c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text": "\n".join(lines)[:3900], "disable_web_page_preview": True})
+            rt_set(con, "tg_inbox_offset", offset)
+            con.commit()
+            return total
+    except Exception as ex:
+        log.warning(f"telegram inbox: {type(ex).__name__}: {str(ex)[:100]}")
+        return 0
+
+
 def cmd_health():
     """Small, pasteable summary of whether the collector has actually been up."""
     con = connect()
@@ -1277,6 +1559,9 @@ def main():
                     help="with --once: size the resolve/extract budgets to finish in about this long")
     ap.add_argument("--prune", type=int, metavar="DAYS",
                     help="forget items older than DAYS (minimum 15) and shrink the database")
+    ap.add_argument("--add-urls", metavar="TEXT", help="store these article links as kept, manual items (any separator; 'url | district' picks the section)")
+    ap.add_argument("--sheet-links", action="store_true", help="take new links from the sheet tab at MANUAL_LINKS_CSV_URL")
+    ap.add_argument("--telegram-inbox", action="store_true", help="take links sent to the Telegram bot")
     ap.add_argument("--check-keywords", action="store_true",
                     help="fetch the keyword sheet and report whether scoring can work; exit 1 if not")
     a = ap.parse_args()
@@ -1286,6 +1571,13 @@ def main():
 
     if a.init:
         return cmd_init()
+    if a.add_urls is not None:
+        return cmd_add_urls(a.add_urls)
+    if a.sheet_links:
+        return cmd_sheet_links(os.environ.get("MANUAL_LINKS_CSV_URL", "").strip())
+    if a.telegram_inbox:
+        return cmd_telegram_inbox(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
+                                  os.environ.get("TELEGRAM_ADMIN_IDS", ""))
     if a.stats:
         return cmd_stats()
     if a.health:

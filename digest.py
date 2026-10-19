@@ -21,10 +21,11 @@ What it does, in order:
      (a Tamil/English pair: when Gemini grouped them AND gave both the same category).
      Numbers and dates never link anything, links never chain, a card pools at most 8
      reports, one per outlet.
-  3. Selection: up to 5 per category first; if a category has fewer, its spare places
-     go to the next-best items from other categories, up to DIGEST_MAX in total
-     (default 5 x the number of categories = 30). Priority-1 civic items (floods,
-     deaths, protests) go in an URGENT block at the top.
+  3. Selection: every mention of him and every link the office added, uncapped; then up
+     to 5 per category; if a category has fewer, its spare places go to the next-best
+     items from other categories, up to DIGEST_MAX in total (default 5 x the number of
+     categories = 30). Priority-1 civic items (floods, deaths, protests) go in an URGENT
+     block at the top.
   4. One Telegram post, HTML, split only when longer than Telegram allows.
   5. Every candidate -- chosen or not -- is marked so it never appears again.
 
@@ -55,16 +56,20 @@ log = logging.getLogger("collect.digest")
 # settings
 # --------------------------------------------------------------------------
 
-CATEGORIES = ["mention", "constituency", "district", "portfolio", "political", "opportunity"]
+AI_CATEGORIES = ["mention", "constituency", "district", "portfolio", "political", "opportunity"]
+CATEGORIES = AI_CATEGORIES + ["added"]        # "added": links the office handed in that fit no section
 LABELS = {"mention": "MENTIONS", "constituency": "VELACHERY", "district": "THIRUVALLUR",
-          "portfolio": "AI / IT / DIGITAL", "political": "POLITICAL", "opportunity": "OPPORTUNITIES"}
+          "portfolio": "AI / IT / DIGITAL", "political": "POLITICAL", "opportunity": "OPPORTUNITIES",
+          "added": "ADDED BY THE OFFICE"}
 NICE = {"mention": "Mentions", "constituency": "Velachery", "district": "Thiruvallur",
-        "portfolio": "AI / IT / Digital", "political": "Political", "opportunity": "Opportunities"}
+        "portfolio": "AI / IT / Digital", "political": "Political", "opportunity": "Opportunities",
+        "added": "Added by the office"}
 ICONS = {"mention": "🗣", "constituency": "📍", "district": "🏛", "portfolio": "💻",
-         "political": "🏳", "opportunity": "🎯"}
+         "political": "🏳", "opportunity": "🎯", "added": "📌"}
 URGENT_CATEGORIES = ("constituency", "district")
 
 PER_CATEGORY = 5              # first pass
+MENTION_CAP = 40              # mentions are never capped by PER_CATEGORY or the total; this is the sanity ceiling
 MAX_TOTAL = PER_CATEGORY * len(CATEGORIES)
 PUBLISHED_WITHIN_H = 24       # a 14-day query can surface old stories; the brief is about now
 WEB_WINDOW_H = 24             # the web page is a rolling edition of everything kept this recently
@@ -86,7 +91,7 @@ SCHEMA = [
     "status TEXT, candidates INTEGER, chosen INTEGER, ai_calls INTEGER, message_ids TEXT, body TEXT)",
 ]
 ITEM_COLUMNS = [("digested_at", "TEXT"), ("digest_id", "INTEGER"), ("ai_sentiment", "TEXT"),
-                ("ai_impact", "INTEGER"), ("story_key", "TEXT"), ("ai_takeaways", "TEXT")]
+                ("ai_impact", "INTEGER"), ("story_key", "TEXT"), ("ai_takeaways", "TEXT"), ("manual", "INTEGER DEFAULT 0")]
 SENTIMENTS = ("positive", "neutral", "critical")
 
 
@@ -151,8 +156,9 @@ SELECT i.id, i.title, i.description, i.publisher, i.published_at, i.discovered_a
        i.resolve_status, i.resolved_url, i.link, i.extract_host, i.extract_status, i.extract_text,
        i.score, i.band, i.urgent, i.target_tags, i.matched_terms, i.event_id,
        i.ai_category, i.ai_priority, i.ai_reason, i.ai_processed_at, i.image_url,
-       i.ai_sentiment, i.ai_impact, i.story_key, i.ai_takeaways,
+       i.ai_sentiment, i.ai_impact, i.story_key, i.ai_takeaways, coalesce(i.manual, 0) AS manual,
        CASE WHEN i.raw_payload LIKE '%youtube_api%' THEN i.raw_payload END AS yt_payload,
+       CASE WHEN coalesce(i.manual, 0) = 1 THEN i.raw_payload END AS manual_payload,
        s.name AS source_name
 FROM items i LEFT JOIN sources s ON s.source_id = i.source_id
 WHERE {scope}
@@ -474,7 +480,7 @@ RESPONSE_SCHEMA = {
     "type": "ARRAY",
     "items": {"type": "OBJECT", "properties": {
         "n": {"type": "INTEGER"},
-        "category": {"type": "STRING", "enum": CATEGORIES + ["none"]},
+        "category": {"type": "STRING", "enum": AI_CATEGORIES + ["none"]},
         "priority": {"type": "INTEGER"},
         "reason": {"type": "STRING"},
         "story": {"type": "INTEGER"},
@@ -704,7 +710,7 @@ def _int(v, lo, hi, default):
 
 
 def _verdict(it, story_prefix):
-    cat = it.get("category") if it.get("category") in CATEGORIES + ["none"] else "none"
+    cat = it.get("category") if it.get("category") in AI_CATEGORIES + ["none"] else "none"
     story = _int(it.get("story"), 0, 10 ** 6, 0)
     return {"category": cat, "priority": _int(it.get("priority"), 1, 3, 2),
             "reason": str(it.get("reason", ""))[:200],
@@ -943,6 +949,19 @@ def guard(c):
     return why
 
 
+def _place_manual(c):
+    """A link the office handed in is shown whatever the verdict: in the category it asked
+    for ('url | district'), else Gemini's, else the rules', else the 📌 section."""
+    asked = (alerts._j(c.get("manual_payload"), {}) or {}).get("category")
+    if asked in AI_CATEGORIES:
+        c["category"] = asked
+    elif c.get("category") in (None, "none", "added"):
+        c["category"] = _refile(c, set())
+        if c["category"] == "none":
+            c["category"] = "added"
+    c["reason"] = (c.get("reason") or "") + " [added by the office]"
+
+
 def rank_all(con, cands, gemini, now):
     """Fills category, priority, reason, impact, sentiment, by. Reuses Gemini's stored verdict
     on an item when there is one (a re-run costs nothing). Every verdict, live or cached,
@@ -984,6 +1003,9 @@ def rank_all(con, cands, gemini, now):
         if why:
             st["guarded"] += 1
             st.setdefault("guards", Counter())[why] += 1
+        if c.get("manual"):
+            _place_manual(c)
+            st["manual"] += 1
     if gemini is not None and gemini.dead:
         log.warning(f"gemini: stopped -- {gemini.dead}; {st['rules']} items ranked by the rules")
     return st
@@ -1035,6 +1057,9 @@ def drop_reruns(con, cands, since, days=2):
                      frozenset(rules.sim_grams(body)) if len(body) >= 300 else frozenset()))
     kept, dropped = [], 0
     for c in cands:
+        if c.get("manual"):
+            kept.append(c)
+            continue
         body = (c["extract_text"] or "")[:rules.BODY_CAP] if c["extract_status"] == "OK" else ""
         bg = frozenset(rules.sim_grams(body)) if len(body) >= 300 else frozenset()
         stale = False
@@ -1063,13 +1088,23 @@ def _order(c):
             c["published_at"] or "")
 
 
+UNCAPPED = ("mention", "added")   # everything about him, and everything the office added, is shown
+
+
 def select(cands, per=PER_CATEGORY, total=MAX_TOTAL):
     """5 per category first (priority 1 and 2 only); then spare places go to the next-best
-    leftovers from any category, priority 3 included, until `total`. Returns
+    leftovers from any category, priority 3 included, until `total`. Mentions and the office's
+    own links are never capped: 15 reports naming him are 15 cards. Returns
     (urgent_block, {category: [items]}, leftovers)."""
     pool = [c for c in cands if c["category"] != "none"]
     by_cat = defaultdict(list)
     seen_story = {}                      # (category, story key) -> the card; one event, one card per category
+    # always on, never capped: the office's own links, and every mention of him -- a day he
+    # is in the news 15 times is a day the office wants all 15 (MENTION_CAP is a sanity ceiling)
+    manual = [c for c in pool if c.get("manual")]
+    mentions = sorted([c for c in pool if c["category"] == "mention" and not c.get("manual")], key=_order)[:MENTION_CAP]
+    forced = manual + mentions
+    pool = [c for c in pool if c not in forced]
     for c in sorted(pool, key=_order):
         k = (c["category"], c.get("story")) if c.get("story") and "@" in c["story"] else None
         if k in seen_story:
@@ -1082,9 +1117,9 @@ def select(cands, per=PER_CATEGORY, total=MAX_TOTAL):
         if k:
             seen_story[k] = c
         by_cat[c["category"]].append(c)
-    chosen, leftovers = [], []
+    chosen, leftovers = list(forced), []
     for cat in CATEGORIES:
-        head = [c for c in by_cat.get(cat, []) if c["priority"] <= 2][:per]
+        head = list(by_cat.get(cat, [])) if cat in UNCAPPED else [c for c in by_cat.get(cat, []) if c["priority"] <= 2][:per]
         chosen += head
         leftovers += [c for c in by_cat.get(cat, []) if c not in head]
     leftovers.sort(key=_order)
@@ -1275,6 +1310,18 @@ def _pages(con, env, slot, now, b):
         log.exception("digest: could not write the web page (the brief itself is unaffected)")
 
 
+def cmd_pages(con, env, now=None):
+    """Rebuild the web editions and the page without sending or marking anything -- after
+    the office adds links, or to republish after a settings change."""
+    now = now or utcnow()
+    migrate(con)
+    b = build(con, env, now, slot_for(now))
+    _pages(con, env, slot_for(now), now, b)
+    log.info(f"pages: rebuilt; next brief would carry {len(b['chosen'])} of {len(b['cands'])} stories"
+             + (f"; gemini note: {b['ai_note']}" if b["ai_note"] else ""))
+    return b
+
+
 def cmd_backfill(con, env, days, now=None):
     """Dated web editions for the past `days` days from what the database already holds."""
     import web
@@ -1386,6 +1433,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="build and print; send nothing, mark nothing")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--backfill", type=int, metavar="DAYS", help="write web editions for the past DAYS days")
+    ap.add_argument("--pages", action="store_true", help="rebuild the web page only; send nothing, mark nothing")
     a = ap.parse_args()
     if not DB.exists():
         print("no corpus.db -- run 'python collect.py --init' first")
@@ -1406,6 +1454,13 @@ def main():
                 with open(summary, "a", encoding="utf-8") as f:
                     f.write("### Backfill\n\n" + "\n".join(f"- {k}: {len(v['chosen'])} stories from {len(v['ids'])} items"
                                                             for k, v in eds.items()) + "\n")
+            return 0
+        if a.pages:
+            b = cmd_pages(con, env)
+            summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary:
+                with open(summary, "a", encoding="utf-8") as f:
+                    f.write("### Web page rebuilt (nothing sent)\n\n" + diagnostics(b) + "\n")
             return 0
         b = run(con, env, slot=None if a.slot == "auto" else a.slot, dry_run=a.dry_run)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
