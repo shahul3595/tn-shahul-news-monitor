@@ -17,7 +17,11 @@ header h1{font-size:19px;margin:0;line-height:1.2}header .sub{color:var(--dim);f
 .tools input[type=search]{flex:1 1 200px;min-height:44px;padding:8px 12px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
 .tools select{min-height:44px;padding:8px 10px;font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
 .callout{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:12px 16px;margin:10px 0}
-.callout h2{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin:0 0 6px}
+.callout h2{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin:0}
+.sumh{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;width:100%;min-height:44px;padding:0;border:0;background:transparent;font:inherit;color:inherit;text-align:left;cursor:pointer;letter-spacing:inherit;text-transform:inherit}
+.sumh>span{flex:1;white-space:nowrap}.sumh small{flex:0 0 100%;order:3;font-size:12px;letter-spacing:0;text-transform:none;color:var(--dim)}@media(min-width:600px){.sumh small{flex:1;order:0}}.sumh b{font-weight:500;font-size:12px;letter-spacing:0;text-transform:none;white-space:nowrap;border:1px solid var(--line);border-radius:999px;padding:4px 10px;color:var(--ink)}
+.sgwrap{display:grid;grid-template-rows:1fr;transition:grid-template-rows .25s ease}.sgwrap>div{overflow:hidden;min-height:0}.sgwrap.closed{grid-template-rows:0fr}
+#summary.closed{padding-bottom:12px}@media(prefers-reduced-motion:reduce){.sgwrap{transition:none}}
 .callout .sgs{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px 22px}
 .sg h3{font-size:14px;margin:6px 0 2px}.sg h3 a{color:var(--ink);text-decoration:none;display:inline-flex;align-items:center;min-height:32px}
 .sg h3 a span{color:var(--dim);margin-left:4px}.sg h3 a:hover{color:var(--accent)}.sg.urgent h3 a{color:var(--urgent)}
@@ -127,7 +131,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 <div class="mwrap"><table id="m-table" style="width:100%;font-size:13px"><thead><tr><th style="text-align:left">Story</th><th>Section</th><th>Tag</th><th>Added</th><th>Via</th></tr></thead><tbody></tbody></table></div></div>
 <div class="kcard runs" id="runs-card"><h2>Recent runs <small id="runs-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2><div id="runs">–</div></div>
 </div><p class="hint" id="gen"></p></div>
-<script id="sealed" type="application/json">{"v": 1, "iters": 120000, "salt": "C2Ehbuj+e3PizxQRuMZ3sw==", "nonce": "S+3uL8oKf37ac5fwHlKiPA==", "ct": "w9r/hUI0RjTcZgJBhV4vf/sgpUiN0Pn9u87RteH2HWS/aznAp6M9VWpO/R33qryLIbsX3JMRQZIooansBYMHL+EKCZ5LFOd1BbT3xG/RsZSg2/JyAwInOmMJ/w0MgRBKvEb6RIpOEWOVKA8eei7Hnucj2K2X+UFdNLy/tLgTd5LSyU0ADqB+O9tNxlPysnzZ/nUZcEXw1sMqWjekgAjcc+7cf0b7u3G1s2mpl31mH4hUHGFJ/DvVQYTe1tgGvsEbKxSQPqFUIXtnBJvdIFeZaAraJNr8G4qMGSS0XdWbMDrYEbhcxGRxGzq0avpYEkK4EpwEHzl+wg==", "tag": "5TqxFujKP9ANUSo+trUPryuSmkF0KgR+Qq3LSAM8MRQ="}</script>
+<script id="sealed" type="application/json">{"v": 1, "iters": 120000, "salt": "jvNXGsyMUitEb/NRb4mjBg==", "nonce": "HvXxRYc+UwI4GR71eMYsOA==", "ct": "PiQllRpaqW8GFOdtGTOyXXACW52RTTsixh9TqjGBZNyE9Euv2DvCmDKldJPQId+aR9kfVHAxn4hYwA0mclmvL2DJC6vif3vsHgammdR6hJHq3UN31QTyn92vn1vnqV7sxLG1WzM+fqXZKmlKdomJK7Mt90DSI7H+cV7Mt3Hpm4cCbvFnazTGuFkRHRTgbH4pocIkZDuvcpLf8F+Fl6Z9UGRj+Gt/XotfO47P1xDPM8CNgP49zyLhw6aV3eZwY5H0shtIvaMN8aSNPRKqTgPROZxNyykCuK6u7f8rDNpDMBsi6YovjPsz7ESuFoTF4XS0QUdJclFGZQ==", "tag": "xTjQOKtTwbBx4zPhMaYNq4IttCQap5+ymt74mzSUR0g="}</script>
 <script>
 (function(){
 var S=JSON.parse(document.getElementById('sealed').textContent),$=function(s){return document.querySelector(s)};
