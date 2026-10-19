@@ -86,13 +86,20 @@ jobs:
           BLOCKED_HOSTS: ${{ vars.BLOCKED_HOSTS }}
           MANUAL_URLS: ${{ github.event.inputs.manual_urls }}
           MINUTES: ${{ github.event.inputs.minutes || '17' }}
+          MANUAL_LINKS_CSV_URL: ${{ secrets.MANUAL_LINKS_CSV_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ADMIN_IDS: ${{ vars.TELEGRAM_ADMIN_IDS }}
         run: |
           python collect.py --init
           # stop here, loudly, if nothing can be scored -- collecting unscored items is pointless
           python collect.py --check-keywords
+          # links the office hands in: the run box, the sheet's 'Add links' tab, messages to the bot
           if [ -n "$MANUAL_URLS" ]; then
             python collect.py --add-urls "$MANUAL_URLS"
           fi
+          python collect.py --sheet-links || true
+          python collect.py --telegram-inbox || true
           if [ "$MINUTES" != "0" ]; then
             python collect.py --once --minutes "$MINUTES"
             python collect.py --prune 21
@@ -102,7 +109,7 @@ jobs:
       # Links added by hand should be on the page in minutes, not at the next brief: rebuild
       # the web editions now (nothing is sent to Telegram, nothing is marked as covered).
       - name: Rebuild the web page for the added links
-        if: github.event.inputs.manual_urls != ''
+        if: steps.collect.outputs.added != ''
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
