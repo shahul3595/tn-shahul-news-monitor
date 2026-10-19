@@ -77,6 +77,7 @@ jobs:
         env:
           KEYWORDS_CSV_URL: ${{ secrets.KEYWORDS_CSV_URL }}
           YOUTUBE_SHEET_CSV_URL: ${{ secrets.YOUTUBE_SHEET_CSV_URL }}
+          SETTINGS_CSV_URL: ${{ secrets.SETTINGS_CSV_URL }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_DRY_RUN: "1"     # instant alerts stay off; the digest is step 3
