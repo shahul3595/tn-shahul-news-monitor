@@ -533,9 +533,17 @@ def guards_refile_what_the_article_cannot_support():
     # generic politics
     add(con, "TVK celebrates Madurantakam by-election win, cadres in Dharapuram", tags=["party"], ai=("political", 3))
     add(con, "DMK slams TVK govt over Velachery drain delays", tags=["party"], ai=("political", 2))
+    # names him -> a mention, however Gemini filed it, and never the urgent block
+    u1 = add(con, "வேளச்சேரியில் மழையால் தேங்கிய மழை நீர்.. அமைச்சர் Dr. குமார்.ரா துரித நடவடிக்கையால் நிகழ்ந்த மாற்றம்", urgent=1, ai=("constituency", 1))
+    u2 = add(con, "அமைச்சரின் முன்னெச்சரிக்கை நடவடிக்கையால் வேளச்சேரியில் தண்ணீர் தேங்கவில்லை#kumarr #tvk", urgent=1, ai=("constituency", 1))
+    u3 = add(con, "கனமழை.. வேளச்சேரிக்கு கொண்டுவரப்பட்ட பைபர் படகுகள்", urgent=1, ai=("constituency", 1))
     con.commit()
     g = FakeGemini()
     eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=TMP / "docs-guards")
+    urgent_ids = {c["id"] for c in eds["latest"]["urgent"]}
+    mention_ids = {c["id"] for c in eds["latest"]["sections"]["mention"]}
+    check(u1 in mention_ids and u2 in mention_ids and u1 not in urgent_ids and u2 not in urgent_ids, "Dr. குமார்.ரா and #kumarr are mentions, not urgent civic items")
+    check(u3 in urgent_ids, "the boats story names nobody: it stays an urgent Velachery item")
     def cat(prefix):
         c = next(x for x in eds["latest"]["cands"] if x["title"].startswith(prefix))
         return c["category"], c.get("guard")
@@ -660,6 +668,17 @@ def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
     url_a = con.execute("SELECT resolved_url FROM items WHERE id=?", (a,)).fetchone()[0]
     out = collect.add_links(con, [(url_a, None)], via="test")                                         # same url as item a
     check(out and out[0][2] == "already" and con.execute("SELECT digested_at FROM items WHERE id=?", (a,)).fetchone()[0], f"handed in twice: {out}")
+    # a re-filed link (an on-page move): the section changes, nothing is re-sent
+    out = collect.add_links(con, [(url_a, "portfolio", None)], via="move")
+    check(out[0][2] == "updated" and con.execute("SELECT digested_at FROM items WHERE id=?", (a,)).fetchone()[0], f"re-filed, still marked as sent: {out}")
+    eds2 = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, FakeGemini(), docs=TMP / "docs-manual")
+    check(next(x for x in eds2["latest"]["chosen"] if x["id"] == a)["category"] == "portfolio", "and the page shows the new section")
+    st = json.loads((TMP / "docs-manual" / "data" / "status.json").read_text(encoding="utf-8"))
+    rec = next(x for x in st["manual"]["recent"] if x["id"] == a)
+    check(rec["cat"] == "portfolio" and rec["moved"] and rec["via"] == "on-page move", rec)
+    page = (TMP / "docs-manual" / "index.html").read_text(encoding="utf-8")
+    check("moveStory(" in page and "type:'move'" in page and "movetoken" in page, "the Move menu is on the page, behind the token")
+    check("MOVE_TOKEN" in (TMP / "docs-manual" / "admin.html").read_text(encoding="utf-8") and 'id="m-table"' in (TMP / "docs-manual" / "admin.html").read_text(encoding="utf-8"), "the admin page shows the token and the tracker")
     # a message to the bot: links + a section tag; who may send
     msg = {"chat": {"id": 777, "type": "private"}, "from": {"id": 777}, "text": "see https://www.dtnext.in/x/9 and https://y.in/z #district #positive"}
     text, private, ok, pairs = collect.inbox_message(msg, "-1001", {"777"})

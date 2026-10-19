@@ -772,9 +772,12 @@ def _apply(c, v, by):
 # 2a. guards -- what Gemini may not decide on its own
 # --------------------------------------------------------------------------
 
-MINISTER_NAMES_DEFAULT = ("R. Kumar|R Kumar|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|"
-                          "அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|Minister Kumar")
-GENERIC_FORMS = ("அமைச்சர் குமார்", "minister kumar")   # other states have ministers called Kumar
+MINISTER_NAMES_DEFAULT = ("R. Kumar|R Kumar|Kumar.R|Kumar. R|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|குமார்.ரா|குமார் ரா|"
+                          "Dr. குமார்.ரா|Dr. Kumar.R|kumarr|"
+                          "அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|அமைச்சர் Dr. குமார்|Dr. குமார்|டாக்டர் குமார்|Dr. Kumar|Minister Kumar")
+# forms other people share (another state's Minister Kumar, any Dr Kumar): they count only
+# next to a Tamil Nadu anchor
+GENERIC_FORMS = ("அமைச்சர் குமார்", "minister kumar", "dr. குமார்", "டாக்டர் குமார்", "dr. kumar", "அமைச்சர் dr. குமார்")
 _TN_ANCHOR = re.compile(r"tamil ?nadu|chennai|velachery|thiruvallur|tiruvallur|elcot|tidel|startuptn|"
                         r"தமிழக|தமிழ்நாடு|சென்னை|வேளச்சேரி|திருவள்ளூர்", re.I)
 _LATIN_RE = re.compile(r"[A-Za-z]")
@@ -817,17 +820,20 @@ _NAME_CACHE = {}
 def _form_re(form):
     """One name form -> a regex that also takes Tamil case endings (குமாரின், குமாருக்கு) and
     optional dots/spaces between the parts; never a longer name (Kumaraswamy, குமாரசாமி)."""
-    parts = []
-    for tok in re.split(r"[.\s]+", form):
-        if not tok:
-            continue
-        if _TAMIL.search(tok):
+    pieces = [p for p in re.split(r"([.\s]+)", form.strip()) if p]
+    pat = ""
+    for p in pieces:
+        if re.fullmatch(r"[.\s]+", p):
+            # a dot in the form is required ("Kumar.R" never matches "Praveen Kumar R"); a
+            # space may be any amount of space
+            pat += r"\.\s*" if "." in p else r"\s+"
+        elif _TAMIL.search(p):
             # a final pulli may be any case sign (குமார் / குமாரின் / குமாருக்கு); a consonant
-            # there is another name (குமாரசாமி, குமாரன்) and does not match
-            parts.append(re.escape(tok.rstrip("\u0BCD")) + (rules._TA_END if tok.endswith("\u0BCD") else ""))
+            # there is another name (குமாரசாமி, குமாரன்) and does not match; a token without
+            # a pulli (ரா) must end there, so குமார் ரா is not குமார் ராஜன்
+            pat += re.escape(p.rstrip("\u0BCD")) + (rules._TA_END if p.endswith("\u0BCD") else r"(?![\u0B80-\u0BE5])")
         else:
-            parts.append(re.escape(tok.lower()))
-    pat = r"\.?\s*".join(parts)
+            pat += re.escape(p.lower())
     if not _TAMIL.search(form):
         pat = r"(?<![a-z0-9])" + pat + r"(?![a-z0-9])"
     else:
@@ -956,6 +962,8 @@ def guard(c):
             cat, why = _refile(c, {"constituency"}), "no Velachery locality in article"
     elif cat == "political" and not _anchored(c):
         cat, why = _refile(c, {"political"}), "generic politics"
+    elif cat not in ("mention", "none") and names_in(text, tags):
+        cat, why = "mention", "names him"          # mention outranks every other section, urgent included
     if why:
         c["category"], c["guard"] = cat, why
         c["reason"] = f"{c.get('reason', '')} [guard: {why} -> {cat}]"[:240]

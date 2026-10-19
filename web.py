@@ -401,6 +401,22 @@ def status_snapshot(con, env, now, editions, brief=None, gemini=None):
             grouping["refused"].append(dict(rf, edition=key))
     grouping["refused"] = grouping["refused"][:12]
     last_brief = con.execute("SELECT slot, sent_at, chosen, status FROM digests ORDER BY id DESC LIMIT 1").fetchone()
+    manual = {"sheet": bool((env.get("MANUAL_LINKS_CSV_URL") or "").strip()),
+              "bot": bool((env.get("TELEGRAM_ADMIN_IDS") or "").strip()), "recent": []}
+    try:
+        for r in con.execute("""SELECT id, title, publisher, raw_payload, ai_category, ai_sentiment, discovered_at, resolved_url, link
+                                FROM items WHERE coalesce(manual, 0) = 1 ORDER BY id DESC LIMIT 30"""):
+            pl = alerts._j(r["raw_payload"], {}) or {}
+            via = str(pl.get("moved_via") or pl.get("via") or "")
+            manual["recent"].append({"id": r["id"], "title": r["title"] or "", "outlet": r["publisher"] or "",
+                                     "cat": pl.get("category") or r["ai_category"] or "added",
+                                     "sentiment": pl.get("sentiment") or r["ai_sentiment"] or "neutral",
+                                     "added": fmt_ist(pl.get("added_at") or r["discovered_at"] or ""),
+                                     "via": {"workflow": "run box", "sheet": "sheet", "move": "on-page move"}.get(via.split(":")[0], via.split(":")[0] or "?")
+                                     + (" (bot)" if via.startswith("telegram") else ""),
+                                     "url": r["resolved_url"] or r["link"] or "", "moved": bool(pl.get("moved_at"))})
+    except Exception:
+        pass
     adir = Path(DOCS) / "archive"
     try:
         arch = json.loads((adir / "index.json").read_text(encoding="utf-8")).get("days", [])
@@ -414,7 +430,7 @@ def status_snapshot(con, env, now, editions, brief=None, gemini=None):
                           "pending_resolve": pending_resolve, "pending_extract": pending_extract, "youtube_failing": yt_failing},
             "brief": {"slot": last_brief["slot"], "sent": fmt_ist(last_brief["sent_at"] or ""), "chosen": last_brief["chosen"],
                       "status": last_brief["status"]} if last_brief else {},
-            "grouping": grouping,
+            "grouping": grouping, "manual": manual,
             "editions": {"stories_latest": len((editions or {}).get("latest", {}).get("chosen", [])),
                          "dated": len(list((Path(DOCS) / "data").glob("????-??-??.json"))), "archive_days": len(arch)},
             "feedback": _feedback_counts(env, now)}
@@ -610,6 +626,9 @@ body.nonotes .card .notes,body.nonotes .card p,body.nonotes .card img{display:no
 .acts button:hover,.acts a.wa:hover{background:var(--chip)}.acts .sp{flex:1}
 .acts .why{display:none;flex-wrap:wrap;gap:6px}.acts.open .why{display:flex}.acts.open>button,.acts.open>a{display:none}
 .acts .why button{font-size:13px;border:1px solid var(--line);padding:6px 10px;min-height:44px}.acts .done{font-size:13px;color:var(--ok);padding:0 6px}
+.mvm{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);width:min(380px,calc(100% - 32px));max-height:70vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 28px rgba(0,0,0,.3);padding:8px;z-index:25;display:grid;gap:2px}
+.mvm[hidden]{display:none}.mvm .mvt{font-size:13px;font-weight:600;padding:4px 8px 6px;border-bottom:1px solid var(--line);margin-bottom:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.mvh{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);padding:6px 8px 2px}.acts .mvm button{font:inherit;font-size:14px;text-align:left;justify-content:flex-start;min-height:40px;min-width:0;padding:4px 10px;border:0;border-radius:8px;background:transparent;color:var(--ink);cursor:pointer}
+.mvm button:hover{background:var(--chip)}.mvm button.on{background:var(--chip);font-weight:600}
 .grid.list{display:block}.grid.list .card{flex-direction:row;align-items:center;border-radius:0;border-width:0 0 1px;background:transparent}
 .grid.list .card img,.grid.list .card p{display:none}.grid.list .card .body{padding:8px 4px;gap:2px}
 .grid.list .card h3{font-size:15px;font-weight:500}.grid.list .meta{padding-top:0}.grid.list .acts{border:0;padding:0 0 0 6px}
@@ -637,7 +656,8 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 JS = r"""
 (function(){
 var DATA=JSON.parse(document.getElementById('data').textContent),EDS=JSON.parse(document.getElementById('editions').textContent);
-var FB=document.documentElement.getAttribute('data-feedback')||'';
+var FB=document.documentElement.getAttribute('data-feedback')||'';var MOVETOK='';try{MOVETOK=sessionStorage.getItem('movetoken')||''}catch(e){}if(MOVETOK&&FB)document.body.classList.add('editor');
+var MOVE_CATS=[['mention','🗣 Mentions'],['constituency','📍 Velachery'],['district','🏛 Thiruvallur'],['portfolio','💻 AI / IT'],['political','🏳 Political'],['opportunity','🎯 Opportunities']],MOVE_SENTS=[['positive','🟢 Positive'],['neutral','⚪ Neutral'],['critical','🔴 Critical']];
 var CATS=[['urgent','🚨','Urgent'],['mention','🗣','Mentions'],['constituency','📍','Velachery'],['district','🏛','Thiruvallur'],['portfolio','💻','AI / IT / Digital'],['political','🏳','Political'],['opportunity','🎯','Opportunities'],['added','📌','Added by the office']];
 var NAME={};CATS.forEach(function(c){NAME[c[0]]=c[2]});var SENT={positive:'🟢 Positive',neutral:'⚪ Neutral',critical:'🔴 Critical'};
 var REASONS=[['unrelated','Unrelated to constituency / portfolio'],['category','Wrong category'],['old','Duplicate / old'],['spam','Spam / noise']];
@@ -657,7 +677,7 @@ function card(s){var g=group(s),notes=s.takeaways&&s.takeaways.length?'<div clas
  '<div class="body"><div class="hrow"><label class="tick" aria-label="Select this story"><input type="checkbox"'+(state.sel[s.id]?' checked':'')+'></label><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3></div>'+notes+
  '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+(s.manual&&s.cat!=='added'?'<span class="chip" title="A link the office handed in">📌 Added by the office</span>':'')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
  (s.reports&&s.reports.length?'<ul class="outlets" hidden>'+s.reports.map(function(r){return '<li><a href="'+esc(r.url)+'" target="_blank" rel="noopener" title="'+esc(r.title)+'">'+esc(r.outlet)+' <small>('+esc(r.lang)+')</small> ↗</a></li>'}).join('')+'</ul>':'')+'</div>'+
- '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span><a class="wa" href="#" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
+ '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span>'+(MOVETOK&&FB?'<div class="mv"><button type="button" class="btn sm mvb" aria-haspopup="true" aria-expanded="false">🏷️ Move ▾</button><div class="mvm" hidden><div class="mvt">🏷️ '+esc(s.title)+'</div><div class="mvh">Section</div>'+MOVE_CATS.map(function(c){return '<button type="button" data-mcat="'+c[0]+'"'+(c[0]===s.cat?' class="on"':'')+'>'+c[1]+'</button>'}).join('')+'<div class="mvh">Tag</div>'+MOVE_SENTS.map(function(c){return '<button type="button" data-msent="'+c[0]+'"'+(c[0]===s.sentiment?' class="on"':'')+'>'+c[1]+'</button>'}).join('')+'</div></div>':'')+'<a class="wa" href="#" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
 function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=by[group(s)]||[]).push(s)});
  $('#title').textContent=d.label+(d.key==='latest'?' · '+d.stories.length+' stories':'');
  $('#sub').textContent=d.stories.length+' stories · '+d.considered+' considered · updated '+d.generated_ist;
@@ -684,7 +704,14 @@ function apply(){var q=state.q.toLowerCase().normalize('NFC').trim(),n=0;
 function jump(id){var c=$('#story-'+id);if(!c)return;if(c.hidden){state.cat='';state.sent='';state.q='';$('#q').value='';apply()}
  c.scrollIntoView({behavior:'smooth',block:'center'});c.classList.remove('flash');void c.offsetWidth;c.classList.add('flash');setTimeout(function(){c.classList.remove('flash')},2600);try{history.replaceState(null,'',location.search+'#story-'+id)}catch(e){}}
 function send(p){if(!FB)return;p.page=DATA.key;p.ua=navigator.userAgent.slice(0,120);fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){})}
-function wire(){$$('.card a.wa').forEach(function(a){a.onclick=function(){var s=story(a.closest('.card').getAttribute('data-id'));if(s)a.href=waLink(waText(s,state.withNotes))}});
+function moveStory(id,cat,sent){var s=story(id);if(!s)return;if(cat){s.cat=cat;s.urgent=false}if(sent)s.sentiment=sent;
+ var p={type:'move',url:s.url,id:s.id,title:s.title,category:cat||'',sentiment:sent||'',token:MOVETOK,page:DATA.key};
+ fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){});
+ render();setTimeout(function(){jump(id)},50);toast((cat?'Moved to '+NAME[cat]:'Tagged '+SENT[sent])+' — permanent after the next run')}
+function wire(){$$('.card .mvb').forEach(function(b){b.onclick=function(ev){ev.stopPropagation();var m=b.nextElementSibling,o=m.hidden;$$('.mvm').forEach(function(x){x.hidden=true});m.hidden=!o;b.setAttribute('aria-expanded',o)}});
+ $$('.card .mvm button').forEach(function(b){b.onclick=function(){var id=b.closest('.card').getAttribute('data-id');moveStory(id,b.getAttribute('data-mcat'),b.getAttribute('data-msent'))}});
+ document.addEventListener('click',function(ev){if(!ev.target.closest('.mv'))$$('.mvm').forEach(function(x){x.hidden=true})});
+ $$('.card a.wa').forEach(function(a){a.onclick=function(){var s=story(a.closest('.card').getAttribute('data-id'));if(s)a.href=waLink(waText(s,state.withNotes))}});
  $$('.card .tick input').forEach(function(i){i.onchange=function(){var id=i.closest('.card').getAttribute('data-id');if(i.checked)state.sel[id]=1;else delete state.sel[id];selbar()}});
  $$('.more').forEach(function(b){b.onclick=function(){var u=b.closest('.card').querySelector('.outlets'),o=u.hidden;u.hidden=!o;b.setAttribute('aria-expanded',o);b.textContent=b.textContent.replace(o?'▾':'▴',o?'▴':'▾')}});
  $$('.acts').forEach(function(f){var c=f.closest('.card'),id=c.getAttribute('data-id');function item(){var s=DATA.stories.filter(function(x){return String(x.id)===id})[0]||{};return {id:id,title:s.title,url:s.url,category:s.cat,outlet:s.outlet}}
@@ -781,6 +808,9 @@ ADMIN_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <div class="kcard"><h2>Last brief</h2><div class="row"><span>Sent</span><span id="b-sent">–</span></div><div class="row"><span>Stories</span><span id="b-chosen">–</span></div><div class="row"><span>Status</span><span id="b-status">–</span></div><div class="row"><span>Latest edition</span><span id="e-latest">–</span></div><div class="row"><span>Dated editions / archive days</span><span id="e-days">–</span></div></div>
 <div class="kcard"><h2>Grouping (this run)</h2><div class="row"><span>Story groups kept</span><span id="r-clusters">–</span></div><div class="row"><span>Re-runs dropped</span><span id="r-reruns">–</span></div><div id="r-guards"></div><ul class="refused" id="r-refused"></ul></div>
 <div class="kcard"><h2>Reader feedback</h2><div id="fb"></div></div>
+<div class="kcard" style="grid-column:1/-1"><h2>📌 Manually added stories</h2><div id="m-conn" class="row"></div>
+<div class="row" style="display:block"><b>On-page moves</b> — once the token below is saved in the feedback script (Project Settings → Script properties → <code>MOVE_TOKEN</code>), every card on the brief page shows <b>🏷️ Move</b> for this browser session. <span id="m-tok" style="font-family:monospace;word-break:break-all"></span> <button type="button" class="btn sm" id="m-copy">Copy token</button> <a class="btn sm" href="index.html">Open the brief with Move on ↗</a></div>
+<div class="mwrap"><table id="m-table" style="width:100%;font-size:13px"><thead><tr><th style="text-align:left">Story</th><th>Section</th><th>Tag</th><th>Added</th><th>Via</th></tr></thead><tbody></tbody></table></div></div>
 <div class="kcard runs" id="runs-card"><h2>Recent runs <small id="runs-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2><div id="runs">–</div></div>
 </div><p class="hint" id="gen"></p></div>
 <script id="sealed" type="application/json">__SEALED__</script>
@@ -803,7 +833,10 @@ async function open(pin){
  for(var i=0;i*32<ct.length;i++){var blk=new Uint8Array(await crypto.subtle.sign('HMAC',encKey,cat(nonce,be32(i))));for(var j=0;j<32&&i*32+j<ct.length;j++)out[i*32+j]=ct[i*32+j]^blk[j]}
  return JSON.parse(new TextDecoder().decode(out))}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.editions||{},r=st.grouping||{},fb=st.feedback||{};
+var CAT={mention:'🗣 Mentions',constituency:'📍 Velachery',district:'🏛 Thiruvallur',portfolio:'💻 AI / IT',political:'🏳 Political',opportunity:'🎯 Opportunities',added:'📌 Added'},SENT={positive:'🟢 Positive',neutral:'⚪ Neutral',critical:'🔴 Critical'};
+function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.editions||{},r=st.grouping||{},fb=st.feedback||{},m=st.manual||{};
+ $('#m-conn').innerHTML='<span>Links sheet</span><span>'+(m.sheet?'<span class="ok">connected</span>':'not configured (MANUAL_LINKS_CSV_URL)')+' · bot '+(m.bot?'<span class="ok">on</span>':'off (TELEGRAM_ADMIN_IDS)')+'</span>';
+ $('#m-table tbody').innerHTML=(m.recent||[]).map(function(x){return '<tr><td style="text-align:left"><a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.title||x.url)+'</a><br><small class="run">'+esc(x.outlet)+'</small></td><td>'+esc(CAT[x.cat]||x.cat)+(x.moved?' ✎':'')+'</td><td>'+esc(SENT[x.sentiment]||x.sentiment)+'</td><td>'+esc(x.added)+'</td><td>'+esc(x.via)+'</td></tr>'}).join('')||'<tr><td colspan="5" class="run">none yet</td></tr>';
  $('#g-calls').textContent=g.calls_today;$('#g-limit').textContent=g.limit;$('#g-bar').style.width=Math.min(100,100*g.calls_today/(g.limit||80))+'%';
  var p=$('#g-state');p.textContent=(g.state||'').replace(/^./,function(x){return x.toUpperCase()});p.className='pill '+g.state;$('#g-model').textContent=g.model||'';
  if(g.note){$('#g-note-row').hidden=false;$('#g-note').textContent=g.note}
@@ -822,14 +855,17 @@ async function runs(cfg){if(!cfg.runs){$('#runs-card').hidden=true;return}
   $('#runs').innerHTML=(j.workflow_runs||[]).map(function(x){var ok=x.conclusion==='success',live=x.status!=='completed';var when=new Date(x.updated_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
    return '<div class="row"><span>'+(live?'<span class="run">⏳</span>':ok?'<span class="ok">✅</span>':'<span class="bad">❌</span>')+' '+esc(x.name)+'</span><span>'+esc(when)+' · <a href="'+esc(cfg.web+x.id)+'" target="_blank" rel="noopener">log ↗</a></span></div>'}).join('')||'no runs yet';
   $('#runs-note').textContent='· live'}catch(e){$('#runs').innerHTML='<span class="bad">could not reach the run list ('+esc(e.message)+')</span>'}}
+async function moveToken(pin){var b=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode('move:'+pin)));return Array.prototype.map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join('').slice(0,40)}
 async function unlocked(cfg){$('#lock').hidden=true;$('#panel').hidden=false;
+ var tok='';try{tok=sessionStorage.getItem('movetoken')||''}catch(e){}$('#m-tok').textContent=tok||'(unlock with the PIN to see the token)';
+ $('#m-copy').onclick=function(){if(!tok)return;navigator.clipboard.writeText(tok).then(function(){$('#m-copy').textContent='Copied'})};
  try{var st=await (await fetch(cfg.status,{cache:'no-store'})).json();show(st)}catch(e){$('#gen').textContent='status snapshot not available yet — it is written at each brief'}
  runs(cfg)}
 if(!S){$('#f').hidden=true;$('#err').textContent='Not configured: set the ADMIN_PIN secret and run a brief.'}
 try{var saved=sessionStorage.getItem('admin');if(saved&&S){unlocked(JSON.parse(saved))}}catch(e){}
 $('#f').onsubmit=async function(ev){ev.preventDefault();$('#err').textContent='';var pin=$('#pin').value;if(!pin)return;
  try{var cfg=await open(pin);if(!cfg){$('#err').textContent='Wrong PIN';$('#pin').value='';return}
-  try{sessionStorage.setItem('admin',JSON.stringify(cfg))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
+  try{sessionStorage.setItem('admin',JSON.stringify(cfg));sessionStorage.setItem('movetoken',await moveToken(pin))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
 })();
 </script></body></html>"""
 

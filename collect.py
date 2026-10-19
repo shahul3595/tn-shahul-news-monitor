@@ -1158,11 +1158,21 @@ def add_links(con, pairs, via="run"):
     for url, cat, sent in [(p[0], p[1], p[2] if len(p) > 2 else None) for p in pairs]:
         key = make_item_key(url)
         ckey = rules.canonical_key(url)
-        row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual FROM items
+        row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual, raw_payload FROM items
                              WHERE item_key=? OR (canonical_key IS NOT NULL AND canonical_key=?) OR resolved_url=? OR link=?
                              ORDER BY manual DESC, id LIMIT 1""", (key, ckey, url, url)).fetchone()
         if row and row["manual"]:
-            out.append((url, row["title"], "already"))
+            # handed in before: a new section or tag is an update (an on-page move lands here);
+            # the same again is nothing, and nothing is re-sent either way
+            cur = alerts._j(row["raw_payload"], {}) or {}
+            if (cat and cat != cur.get("category")) or (sent and sent != cur.get("sentiment")):
+                cur.update({"category": cat or cur.get("category"), "sentiment": sent or cur.get("sentiment"),
+                            "moved_at": ts, "moved_via": via})
+                con.execute("UPDATE items SET raw_payload=? WHERE id=?", (json.dumps(cur, ensure_ascii=False), row["id"]))
+                out.append((url, row["title"], "updated"))
+                log.info(f"add-links: re-filed {cat or ''} {sent or ''}: {(row['title'] or url)[:60]}")
+            else:
+                out.append((url, row["title"], "already"))
             continue
         host = (urlparse(url).hostname or "").replace("www.", "")
         title, desc, text_, status, http_status, image, chars, pub, channel = "", "", "", "FAILED", None, None, 0, None, ""
@@ -1193,10 +1203,11 @@ def add_links(con, pairs, via="run"):
             con.execute("""UPDATE items SET manual=1, band='AUTO_KEEP', score=max(coalesce(score,0), ?), rules_at=coalesce(rules_at, ?),
                            raw_payload=?, description=CASE WHEN coalesce(description,'')='' THEN ? ELSE description END WHERE id=?""",
                         (keep, ts, payload, desc, row["id"]))
-            try:
-                con.execute("UPDATE items SET digested_at=NULL WHERE id=?", (row["id"],))   # back into the next brief
-            except sqlite3.OperationalError:
-                pass
+            if not via.startswith("move"):                 # a move re-files a card; it does not re-send it
+                try:
+                    con.execute("UPDATE items SET digested_at=NULL WHERE id=?", (row["id"],))   # back into the next brief
+                except sqlite3.OperationalError:
+                    pass
             out.append((url, title, "kept"))
             log.info(f"add-links: collected earlier, now kept and marked: {title[:60]}")
         else:
@@ -1213,7 +1224,7 @@ def add_links(con, pairs, via="run"):
     con.commit()
     n = sum(1 for _, _, o in out if o != "already")
     if out:
-        log.info(f"add-links ({via}): {n} stored, {len(out) - n} were in already")
+        log.info(f"add-links ({via}): {n} stored or re-filed, {len(out) - n} unchanged")
     _note_added(n)
     return out
 
@@ -1262,7 +1273,7 @@ def cmd_sheet_links(url):
             log.warning(f"links sheet: no 'url' column (got {reader.fieldnames})")
             return 0
         col = fields.get("url") or fields.get("link")
-        pairs = []
+        pairs, moves = [], []
         for row in reader:
             raw = (row.get(col) or "").strip()
             m = _URL_RE.search(raw)
@@ -1271,15 +1282,17 @@ def cmd_sheet_links(url):
             cat = (row.get(fields.get("category", ""), "") or row.get(fields.get("section", ""), "") or "").strip().lower()
             sent = (row.get(fields.get("sentiment", ""), "") or "").strip().lower()
             sent = sent if sent in _SENTS else _SENT_ALIAS.get(sent)
-            pairs.append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS else None, sent))
+            note = (row.get(fields.get("note", ""), "") or "").strip().lower()
+            (moves if note.startswith("on-page move") else pairs).append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS else None, sent))
     except Exception as ex:
         log.warning(f"links sheet: {type(ex).__name__}: {str(ex)[:80]}")
         return 0
-    if not pairs:
+    if not pairs and not moves:
         return 0
     con = connect()
     alerts.migrate(con)
-    out = add_links(con, pairs, via="sheet")
+    out = add_links(con, pairs, via="sheet") if pairs else []
+    out += add_links(con, moves, via="move") if moves else []
     return sum(1 for _, _, o in out if o != "already")
 
 

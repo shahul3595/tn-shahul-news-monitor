@@ -17,9 +17,17 @@
  *
  * Columns written: when, type (up | down | missing), item id, title, url, category, outlet,
  * reason, notes, page, browser. Nothing identifies the reader.
+ *
+ * ON-PAGE MOVES (optional): the brief page can re-file a card from the page itself. That
+ * writes a row into the "Add links" tab, which the collector reads back. It is allowed
+ * only with the move token: open admin.html, unlock it, copy the token shown there, then
+ * here: Project Settings (gear) -> Script properties -> Add property: MOVE_TOKEN = that
+ * token. Re-deploy after pasting a new version of this file.
  */
 
 var TAB = "Feedback";
+var LINKS_TAB = "Add links";
+var LINKS_HEADER = ["url", "category", "sentiment", "note", "added"];
 var HEADER = ["when", "type", "item_id", "title", "url", "category", "outlet", "reason", "notes", "page", "browser"];
 
 function sheet_() {
@@ -33,10 +41,36 @@ function sheet_() {
   return sh;
 }
 
+function links_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(LINKS_TAB);
+  if (!sh) {
+    sh = ss.insertSheet(LINKS_TAB);
+    sh.appendRow(LINKS_HEADER);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
 function doPost(e) {
   try {
     var d = JSON.parse((e && e.postData && e.postData.contents) || "{}");
     var type = String(d.type || "").slice(0, 10);
+    if (type === "move") {
+      var want = PropertiesService.getScriptProperties().getProperty("MOVE_TOKEN") || "";
+      if (!want || String(d.token || "") !== want) {
+        return ContentService.createTextOutput("denied");
+      }
+      var cat = String(d.category || "").slice(0, 20), sent = String(d.sentiment || "").slice(0, 10);
+      if (!d.url || (!cat && !sent)) {
+        return ContentService.createTextOutput("ignored");
+      }
+      var lk = LockService.getScriptLock();
+      lk.waitLock(5000);
+      links_().appendRow([String(d.url).slice(0, 500), cat, sent, "on-page move: " + String(d.title || "").slice(0, 120), new Date()]);
+      lk.releaseLock();
+      return ContentService.createTextOutput("ok");
+    }
     if (["up", "down", "missing"].indexOf(type) < 0) {
       return ContentService.createTextOutput("ignored");
     }

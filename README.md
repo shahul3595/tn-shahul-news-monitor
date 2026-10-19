@@ -38,8 +38,12 @@ before it reaches a page or the brief; a rejected verdict is re-filed by the key
 (constituency / district / portfolio / political when their own evidence is in the article),
 else `none`. Each correction is counted on the run page and the status page.
 
-- **Mentions** only when the article literally names him (`MINISTER_NAMES`). Minister
-  Rajkumar, Minister Rajeev, Ramesh Kumar and every other Kumar are not him. A note or
+- **Mentions** only when the article literally names him (`MINISTER_NAMES`: R. Kumar,
+  Kumar.R, ஆர். குமார், குமார்.ரா, Dr. குமார்.ரா, #kumarr, and -- next to a Tamil Nadu
+  anchor -- Minister Kumar, Dr. Kumar, டாக்டர் குமார்). Minister Rajkumar, Minister Rajeev,
+  Ramesh Kumar, Praveen Kumar R and every other Kumar are not him. The rule runs both ways:
+  an article that names him is a **mention whatever else it is** -- a Velachery flood he
+  acted on files under Mentions, never under the urgent block. A note or
   briefing line that puts his name into an article that does not carry it is thrown away
   and written again with the article marked.
 - **Velachery** only for AC-26: a headline naming Velachery, Taramani, Adyar, Besant Nagar,
@@ -147,6 +151,15 @@ takes it in also rebuilds the web page (nothing is sent to Telegram); the next b
 Both workflows take the links in: *2 - Collect news* puts them on the page (nothing to
 Telegram); *3 - Telegram brief* puts them on the page **and** into the brief it sends. So to
 see them now, run 2 with minutes = 0; to send them now, run 3.
+
+**Re-filing from the page.** Unlock `admin.html` once in a browser and every card on the
+brief page shows **🏷️ Move** for that browser session: pick a section or a tag and the card
+moves at once. The move is written to the *Add links* tab through the feedback script and
+becomes permanent at the next run (the collector re-files the story; it is not re-sent to
+Telegram). One-time setup: the token shown on `admin.html` goes into the feedback script's
+properties as `MOVE_TOKEN` (Apps Script → Project Settings → Script properties); without it
+the script refuses moves. A row in *Add links* whose note starts with "on-page move" is
+treated the same way, so moves can also be made by hand in the sheet.
 
 A link handed in twice is left alone (not re-sent). A page that refuses robots still appears,
 with its address as the headline, so the office can at least share it.
