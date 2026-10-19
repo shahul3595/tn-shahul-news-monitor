@@ -127,9 +127,68 @@ def env():
             out = rules.load_env()
         except Exception:
             out = {}
-    for k in ("YOUTUBE_API_KEY", "YOUTUBE_SHEET_CSV_URL", "KEEP_FAILED_HTML", "NODE_NAME"):
+    for k in ("YOUTUBE_API_KEY", "YOUTUBE_SHEET_CSV_URL", "SETTINGS_CSV_URL", "KEEP_FAILED_HTML", "NODE_NAME"):
         if k not in out and os.environ.get(k):
             out[k] = os.environ[k]
+    return out
+
+
+# Settings the office may change from the sheet's 'Settings' tab (key, value). Only these;
+# keys and secrets never come from a sheet. The sheet wins over the repository variable.
+SHEET_SETTINGS = ("MINISTER_NAMES", "BLOCKED_HOSTS", "TELEGRAM_ADMIN_IDS", "GEMINI_MODEL", "DIGEST_PER_CATEGORY",
+                  "DIGEST_MAX", "DIGEST_WEB_PER_CATEGORY", "DIGEST_WEB_MAX", "DIGEST_WEB_HOURS", "FEEDBACK_URL")
+
+
+def load_sheet_settings(con, url):
+    """Fetch the 'Settings' tab (columns key, value), keep it in the database for the digest
+    to read, and apply it to this process. Returns the dict applied."""
+    if not url:
+        return {}
+    import csv
+    import io
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": UA}) as c:
+            r = c.get(url)
+        if r.status_code != 200 or "<html" in r.text[:500].lower():
+            log.warning(f"settings sheet: HTTP {r.status_code} or not CSV -- is the tab published as CSV?")
+            return {}
+        reader = csv.reader(io.StringIO(r.content.decode("utf-8-sig", errors="replace")))
+        got = {}
+        for row in reader:
+            if len(row) < 2:
+                continue
+            k, v = row[0].strip().upper().replace(" ", "_"), row[1].strip()
+            if k in SHEET_SETTINGS:
+                got[k] = v
+    except Exception as ex:
+        log.warning(f"settings sheet: {type(ex).__name__}: {str(ex)[:80]}")
+        return {}
+    for k in SHEET_SETTINGS:                       # a key removed from the sheet falls back to the variable
+        con.execute("DELETE FROM runtime WHERE k=?", ("cfg:" + k,))
+    for k, v in got.items():
+        rt_set(con, "cfg:" + k, v)
+        if v:
+            os.environ[k] = v
+    con.commit()
+    if got:
+        log.info("settings sheet: " + ", ".join(f"{k}={v[:40]}" for k, v in got.items()))
+    return got
+
+
+def apply_sheet_settings(con, into=None):
+    """What the collector stored from the Settings tab -> os.environ (and `into`, a dict)."""
+    out = {}
+    try:
+        rows = con.execute("SELECT k, v FROM runtime WHERE k LIKE 'cfg:%'").fetchall()
+    except sqlite3.OperationalError:
+        return out
+    for k, v in rows:
+        key = k[4:]
+        if key in SHEET_SETTINGS and v:
+            os.environ[key] = v
+            out[key] = v
+            if into is not None:
+                into[key] = v
     return out
 
 
@@ -471,6 +530,9 @@ def cmd_init():
         log.error("sources.json not found next to this script")
         return
     cfg = json.loads(SOURCES_JSON.read_text(encoding="utf-8"))
+
+    # the office's settings tab, if any, before anything that reads BLOCKED_HOSTS etc.
+    load_sheet_settings(con, (env().get("SETTINGS_CSV_URL") or "").strip())
 
     # YouTube channels may come from the sheet's second tab instead of sources.json
     yt_url = (env().get("YOUTUBE_SHEET_CSV_URL") or "").strip()
@@ -1045,7 +1107,13 @@ def parse_manual(text):
 def _page_title(html_text):
     m = re.search(r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)", html_text, re.I) \
         or re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
-    return html_unescape(re.sub(r"\s+", " ", m.group(1))).strip() if m else ""
+    t = html_unescape(re.sub(r"\s+", " ", m.group(1))).strip() if m else ""
+    return re.sub(r"\s*[-|]\s*YouTube$", "", t).strip()
+
+
+def _page_description(html_text):
+    m = re.search(r"<meta[^>]+(?:property=[\"']og:description[\"']|name=[\"']description[\"'])[^>]+content=[\"']([^\"']+)", html_text, re.I)
+    return html_unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:1500] if m else ""
 
 
 def add_links(con, pairs, via="run"):
@@ -1068,12 +1136,12 @@ def add_links(con, pairs, via="run"):
             out.append((url, row["title"], "already"))
             continue
         host = (urlparse(url).hostname or "").replace("www.", "")
-        title, text_, status, http_status, image, chars = "", "", "FAILED", None, None, 0
+        title, desc, text_, status, http_status, image, chars = "", "", "", "FAILED", None, None, 0
         try:
             r = client.get(url, headers=BROWSER_HEADERS)
             http_status = r.status_code
             if http_status < 400:
-                title = _page_title(r.text)
+                title, desc = _page_title(r.text), _page_description(r.text)
                 if not host_in(host, VIDEO_HOSTS) and not host_in(host, SOCIAL_HOSTS):
                     text_ = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
                     chars = len(text_)
@@ -1086,11 +1154,12 @@ def add_links(con, pairs, via="run"):
         if not title:
             title = (row["title"] if row and row["title"] else "") or \
                 re.sub(r"[-_]+", " ", urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]).strip() or url
-        publisher = host.split(".")[0].title() if host else "Link"
+        publisher = {"youtube": "YouTube", "youtu": "YouTube", "facebook": "Facebook", "x": "X", "twitter": "X"}.get(host.split(".")[0], host.split(".")[0].title()) if host else "Link"
         payload = json.dumps({"manual": True, "category": cat, "added_at": ts, "via": via})
         if row:
             con.execute("""UPDATE items SET manual=1, band='AUTO_KEEP', score=max(coalesce(score,0), ?), rules_at=coalesce(rules_at, ?),
-                           raw_payload=? WHERE id=?""", (keep, ts, payload, row["id"]))
+                           raw_payload=?, description=CASE WHEN coalesce(description,'')='' THEN ? ELSE description END WHERE id=?""",
+                        (keep, ts, payload, desc, row["id"]))
             try:
                 con.execute("UPDATE items SET digested_at=NULL WHERE id=?", (row["id"],))   # back into the next brief
             except sqlite3.OperationalError:
@@ -1103,7 +1172,7 @@ def add_links(con, pairs, via="run"):
                                    extract_status, extract_host, extract_http, extract_chars, extract_text, extract_attempts,
                                    image_url, canonical_key, score, band, urgent, matched_terms, target_tags, rules_at, manual)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RESOLVED',?,?,?,?,?,?,1,?,?,?,'AUTO_KEEP',0,?,?,?,1)""",
-                        (key, MANUAL_SOURCE[0], "", url, title, "", publisher, "", ts, ts, "ta" if re.search(r"[\u0B80-\u0BFF]", title) else "en",
+                        (key, MANUAL_SOURCE[0], "", url, title, desc, publisher, "", ts, ts, "ta" if re.search(r"[\u0B80-\u0BFF]", title) else "en",
                          payload, url, status, host, http_status, chars, text_ or None, image, ckey, keep,
                          json.dumps(["📌added by the office"], ensure_ascii=False), json.dumps([cat] if cat in ("constituency", "district", "portfolio") else []), ts))
             out.append((url, title, "added"))
@@ -1224,15 +1293,21 @@ def cmd_telegram_inbox(token, chat_id, admin_ids):
                 chat = msg.get("chat") or {}
                 sender = str((msg.get("from") or {}).get("id") or "")
                 text, private, ok, pairs = inbox_message(msg, chat_id, allowed)
+                if private and not ok:
+                    # anyone can find the bot; only listed ids are heard. Tell them their id so
+                    # the editor can add it (TELEGRAM_ADMIN_IDS) -- nothing else is revealed.
+                    log.warning(f"telegram inbox: message from user {sender or '?'} ignored -- add the id to "
+                                f"TELEGRAM_ADMIN_IDS to accept links from them")
+                    c.post(f"{api}/sendMessage", json={"chat_id": chat["id"],
+                          "text": f"I only take links from the office. Your Telegram id is {sender} -- ask the editor to add it, then send the link again."})
+                    continue
                 if not pairs:
-                    if private and ok and text.strip().lower() in ("/start", "start", "help", "/help"):
-                        c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text": "Send me a news link (with #district, #velachery, #portfolio ... to pick the section). It goes on the page within half an hour and into the next brief."})
+                    if private and text.strip().lower() in ("/start", "start", "help", "/help", "hi"):
+                        c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text":
+                               "Send me a news or video link. Add #mention, #velachery, #district, #portfolio, #political or "
+                               "#opportunity to pick the section. It is on the page within about half an hour and in the next brief."})
                     continue
                 if not ok:
-                    log.warning(f"telegram inbox: link from chat {chat.get('id')} / user {sender or '?'} ignored -- "
-                                f"add the user id to TELEGRAM_ADMIN_IDS to accept links from them")
-                    if private:
-                        c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text": f"Sorry, I only take links from the office. Your id is {sender} -- the editor can add it."})
                     continue
                 out = add_links(con, pairs, via=f"telegram:{sender or chat.get('id')}")
                 total += sum(1 for _, _, o in out if o != "already")
@@ -1576,6 +1651,8 @@ def main():
     if a.sheet_links:
         return cmd_sheet_links(os.environ.get("MANUAL_LINKS_CSV_URL", "").strip())
     if a.telegram_inbox:
+        if DB.exists():
+            apply_sheet_settings(connect())
         return cmd_telegram_inbox(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
                                   os.environ.get("TELEGRAM_ADMIN_IDS", ""))
     if a.stats:
@@ -1591,6 +1668,7 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint)
     con = connect()
+    apply_sheet_settings(con)                     # BLOCKED_HOSTS and friends from the Settings tab
     client = httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True,
                           headers={"User-Agent": UA})
     phase1_setup(con)

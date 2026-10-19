@@ -110,6 +110,7 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `GEMINI_API_KEY` | recommended | Gemini free tier; ranks the brief. Without it the keyword rules rank |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | yes, for the brief | the bot and the private channel. Without them the brief is only printed on the run page |
 | `MANUAL_LINKS_CSV_URL` | optional | the sheet's *Add links* tab, published as CSV |
+| `SETTINGS_CSV_URL` | optional | the sheet's *Settings* tab (`key, value`), published as CSV |
 | `ADMIN_PIN` | optional | unlocks `docs/admin.html`, the private status page (see below). Use a passphrase of 8+ characters, not a 4-digit PIN: the page can be downloaded and guessed at offline |
 
 Optional *variables* (Settings → Secrets and variables → Actions → Variables): `TELEGRAM_ADMIN_IDS` (user ids allowed to send links to the bot), `BLOCKED_HOSTS` (extra hosts to drop, comma-separated), `MINISTER_NAMES` (the forms of his name the guards accept, `|`-separated; default `R. Kumar|R Kumar|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|Minister Kumar` -- Tamil case endings are understood; the two generic forms count only next to a Tamil Nadu place or his portfolio), `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (24), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
@@ -123,23 +124,38 @@ else where the keyword rules put it, else the 📌 *Added by the office* section
 takes it in also rebuilds the web page (nothing is sent to Telegram); the next brief carries it.
 
 1. **The sheet** (best for the office, works from a phone): add a tab *Add links* to the
-   keyword Google Sheet with the header row `url, category, note`; paste a link per row,
-   with an optional section in *category* (`mention`, `constituency`, `district`,
+   same Google Sheet that holds the keywords and the YouTube channels, with the header row
+   `url, category, note`; paste a link per row -- an article, a YouTube video, a Facebook
+   post -- with an optional section in *category* (`mention`, `constituency`, `district`,
    `portfolio`, `political`, `opportunity`). Publish that tab as CSV (File → Share →
-   Publish to web → choose the tab → CSV) and put the link in the `MANUAL_LINKS_CSV_URL`
+   Publish to web → in the first dropdown pick the tab, in the second *Comma-separated
+   values (.csv)* → Publish → copy the link) and put the link in the `MANUAL_LINKS_CSV_URL`
    secret. Every half-hour run takes the rows it has not seen; old rows stay as a log.
 2. **The bot** (fastest): send the link to the Telegram bot in a direct message -- forward
-   it from any news app -- with `#district`, `#velachery`, `#portfolio` ... to pick the
-   section. The bot replies with what it did. It takes messages only from the user ids in the
-   `TELEGRAM_ADMIN_IDS` variable (comma-separated); message it once and the run log shows your
-   id (`link from chat ... ignored -- add the user id`). A link posted in the brief's own
-   channel is taken too, without a reply.
+   it from any news or YouTube app -- with `#mention`, `#velachery`, `#district`,
+   `#portfolio`, `#political` or `#opportunity` to pick the section. The bot replies with what
+   it did. It takes messages only from the user ids in the `TELEGRAM_ADMIN_IDS` variable
+   (comma-separated); message it once and it answers with your id, which the editor adds to
+   the variable. A link posted in the brief's own channel is taken too, without a reply. The
+   bot does not run anything itself: the collector reads its inbox every half hour (or when
+   you run *2 - Collect news* by hand), stores the link and rebuilds the page in that run.
 3. **The run box**: Actions → *2 - Collect news* → *Run workflow* → paste links into
    **manual_urls**. The box is one line, so separate links with spaces or commas; `url | district`
    picks the section. Set **minutes** to 0 to add links without the normal poll.
 
 A link handed in twice is left alone (not re-sent). A page that refuses robots still appears,
 with its address as the headline, so the office can at least share it.
+
+## The Settings tab
+
+One more tab in the same sheet, *Settings*, with two columns `key, value`, lets the office
+change these without touching GitHub: `MINISTER_NAMES`, `BLOCKED_HOSTS`, `TELEGRAM_ADMIN_IDS`,
+`GEMINI_MODEL`, `DIGEST_PER_CATEGORY`, `DIGEST_MAX`, `DIGEST_WEB_PER_CATEGORY`,
+`DIGEST_WEB_MAX`, `DIGEST_WEB_HOURS`, `FEEDBACK_URL`. Publish it as CSV like the others and put
+the link in the `SETTINGS_CSV_URL` secret. A value in the sheet wins over the repository
+variable of the same name; a row removed from the sheet falls back to the variable, then the
+built-in default. Keys and tokens never come from a sheet. Nothing in this tab is required:
+the defaults already cover R. Kumar / ஆர். குமார் and the automotive portals.
 
 ## YouTube channels
 

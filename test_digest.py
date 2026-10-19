@@ -674,6 +674,18 @@ def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
         add(con2, t("Con", i))
     cands2, chosen2, urgent2, sections2, left2, st2 = build(con2, FakeGemini(), per=5, total=8)
     check(len(sections2["mention"]) == 14 and len(chosen2) == 14 + 3, f"14 mentions all shown above a cap of 5/8: {len(sections2['mention'])}, {len(chosen2)}")
+    # the Settings tab: what the collector stored is applied by the digest and the collector alike
+    con.execute("INSERT OR REPLACE INTO runtime (k, v) VALUES ('cfg:MINISTER_NAMES', 'R. Kumar|ஆர். குமார்|Kumar Anna'), ('cfg:DIGEST_WEB_HOURS', '36'), ('cfg:GEMINI_API_KEY', 'never')")
+    con.commit()
+    env = {}
+    got = digest.sheet_settings(con, env)
+    check(got == {"MINISTER_NAMES": "R. Kumar|ஆர். குமார்|Kumar Anna", "DIGEST_WEB_HOURS": "36"} and env["DIGEST_WEB_HOURS"] == "36", f"sheet settings applied, secrets never: {got}")
+    check(digest.names_in("Kumar Anna spoke at Velachery"), "a name form added in the sheet counts")
+    check(digest.settings(env)["web_hours"] == 36, "and the digest sizes follow it")
+    import os
+    for k in ("MINISTER_NAMES", "DIGEST_WEB_HOURS"):
+        os.environ.pop(k, None)
+    digest._NAME_CACHE.clear()
     # blocked hosts: sources.json plus the BLOCKED_HOSTS variable
     import os
     hosts = rules.blocked_hosts()

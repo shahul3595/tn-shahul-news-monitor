@@ -124,6 +124,25 @@ def load_env():
     return env
 
 
+def sheet_settings(con, env):
+    """The office's 'Settings' tab, as the collector stored it (cfg:KEY rows in runtime):
+    MINISTER_NAMES, DIGEST_* sizes, GEMINI_MODEL, FEEDBACK_URL. The sheet wins over the
+    repository variable, so there is one place to look."""
+    try:
+        rows = con.execute("SELECT k, v FROM runtime WHERE k LIKE 'cfg:%'").fetchall()
+    except Exception:
+        return {}
+    out = {}
+    for k, v in rows:
+        key = k[4:]
+        if v and key in ("MINISTER_NAMES", "GEMINI_MODEL", "DIGEST_PER_CATEGORY", "DIGEST_MAX", "DIGEST_WEB_PER_CATEGORY",
+                         "DIGEST_WEB_MAX", "DIGEST_WEB_HOURS", "FEEDBACK_URL", "BLOCKED_HOSTS", "TELEGRAM_ADMIN_IDS"):
+            env[key] = v
+            os.environ[key] = v
+            out[key] = v
+    return out
+
+
 def migrate(con):
     alerts.ensure_migrated(con)
     for ddl in SCHEMA:
@@ -1443,6 +1462,7 @@ def main():
     con = alerts._connect(DB)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=10000")
+    sheet_settings(con, env)
     try:
         if a.status:
             print("\n".join(status_lines(con, env)))
