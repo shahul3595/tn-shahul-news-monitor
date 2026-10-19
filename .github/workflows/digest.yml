@@ -79,8 +79,14 @@ jobs:
           FEEDBACK_CSV_URL: ${{ secrets.FEEDBACK_CSV_URL }}
           MINISTER_NAMES: ${{ vars.MINISTER_NAMES }}
           ADMIN_PIN: ${{ secrets.ADMIN_PIN }}
+          MANUAL_LINKS_CSV_URL: ${{ secrets.MANUAL_LINKS_CSV_URL }}
+          TELEGRAM_ADMIN_IDS: ${{ vars.TELEGRAM_ADMIN_IDS }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           python collect.py --init
+          # links the office handed in since the last collector run go into this brief too
+          python collect.py --sheet-links || true
+          python collect.py --telegram-inbox || true
           if [ "${{ github.event.inputs.backfill_days || '0' }}" != "0" ]; then
             python digest.py --backfill "${{ github.event.inputs.backfill_days }}"
           else
