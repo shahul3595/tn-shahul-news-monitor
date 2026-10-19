@@ -133,15 +133,20 @@ takes it in also rebuilds the web page (nothing is sent to Telegram); the next b
    secret. Every half-hour run takes the rows it has not seen; old rows stay as a log.
 2. **The bot** (fastest): send the link to the Telegram bot in a direct message -- forward
    it from any news or YouTube app -- with `#mention`, `#velachery`, `#district`,
-   `#portfolio`, `#political` or `#opportunity` to pick the section. The bot replies with what
-   it did. It takes messages only from the user ids in the `TELEGRAM_ADMIN_IDS` variable
+   `#portfolio`, `#political` or `#opportunity` to pick the section, `#positive` or
+   `#critical` for the tag. The bot replies with what it did. It takes messages only from the user ids in the `TELEGRAM_ADMIN_IDS` variable
    (comma-separated); message it once and it answers with your id, which the editor adds to
    the variable. A link posted in the brief's own channel is taken too, without a reply. The
    bot does not run anything itself: the collector reads its inbox every half hour (or when
    you run *2 - Collect news* by hand), stores the link and rebuilds the page in that run.
 3. **The run box**: Actions → *2 - Collect news* → *Run workflow* → paste links into
-   **manual_urls**. The box is one line, so separate links with spaces or commas; `url | district`
-   picks the section. Set **minutes** to 0 to add links without the normal poll.
+   **manual_urls**. The box is one line, so separate links with spaces or commas;
+   `url | mention | positive` picks the section and the tag. Set **minutes** to 0 to add
+   links without the normal poll.
+
+Both workflows take the links in: *2 - Collect news* puts them on the page (nothing to
+Telegram); *3 - Telegram brief* puts them on the page **and** into the brief it sends. So to
+see them now, run 2 with minutes = 0; to send them now, run 3.
 
 A link handed in twice is left alone (not re-sent). A page that refuses robots still appears,
 with its address as the headline, so the office can at least share it.

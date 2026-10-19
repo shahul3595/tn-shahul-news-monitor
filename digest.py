@@ -971,13 +971,15 @@ def guard(c):
 def _place_manual(c):
     """A link the office handed in is shown whatever the verdict: in the category it asked
     for ('url | district'), else Gemini's, else the rules', else the 📌 section."""
-    asked = (alerts._j(c.get("manual_payload"), {}) or {}).get("category")
-    if asked in AI_CATEGORIES:
-        c["category"] = asked
+    asked = alerts._j(c.get("manual_payload"), {}) or {}
+    if asked.get("category") in AI_CATEGORIES:
+        c["category"] = asked["category"]
     elif c.get("category") in (None, "none", "added"):
         c["category"] = _refile(c, set())
         if c["category"] == "none":
             c["category"] = "added"
+    if asked.get("sentiment") in SENTIMENTS:
+        c["sentiment"] = asked["sentiment"]
     c["reason"] = (c.get("reason") or "") + " [added by the office]"
 
 

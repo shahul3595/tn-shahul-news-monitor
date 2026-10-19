@@ -639,9 +639,9 @@ def cmd_init():
 def make_item_key(link):
     if "news.google.com/rss/articles/" in link:
         return "gn:" + link.split("/articles/", 1)[1].split("?")[0][:120]
-    m = re.search(r"(?:v=|youtu\.be/|video:)([\w-]{11})", link)
+    m = re.search(r"(?:v=|youtu\.be/|video:|/shorts/|/live/|/embed/)([\w-]{11})", link)
     if m:
-        return "yt:" + m.group(1)
+        return "yt:" + m.group(1)                  # a Short and its watch?v= form are one video
     return "u:" + hashlib.sha256(link.encode("utf-8")).hexdigest()[:32]
 
 
@@ -1088,9 +1088,14 @@ _URL_RE = re.compile(r"https?://[^\s<>\"'|,]+")
 _CATS = ("mention", "constituency", "district", "portfolio", "political", "opportunity")
 
 
+_SENTS = ("positive", "neutral", "critical")
+_SENT_ALIAS = {"good": "positive", "praise": "positive", "negative": "critical", "bad": "critical", "critical": "critical"}
+
+
 def parse_manual(text):
     """Links separated by anything -- commas, spaces, new lines, semicolons -- each with an
-    optional section after it ('url | district', 'url district'). -> [(url, category|None)]"""
+    optional section and sentiment after it ('url | mention | positive', 'url district').
+    -> [(url, category|None, sentiment|None)]"""
     out, seen = [], set()
     text = text or ""
     hits = list(_URL_RE.finditer(text))
@@ -1098,10 +1103,34 @@ def parse_manual(text):
         url = m.group(0).rstrip(".;)|,")
         rest = text[m.end():hits[i + 1].start() if i + 1 < len(hits) else len(text)].lower()
         cat = next((c for c in _CATS if re.search(r"\b" + c + r"\b", rest)), None)
+        sent = next((s for s in _SENTS if re.search(r"\b" + s + r"\b", rest)), None) \
+            or next((v for k, v in _SENT_ALIAS.items() if re.search(r"\b" + k + r"\b", rest)), None)
         if url not in seen:
             seen.add(url)
-            out.append((url, cat))
+            out.append((url, cat, sent))
     return out
+
+
+def youtube_video_lookup(url):
+    """A YouTube link through the Data API: (title, description, channel, published_iso,
+    thumbnail), or None without a key or on any failure (the page is scraped instead)."""
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([\w-]{11})", url)
+    key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if not m or not key:
+        return None
+    try:
+        with httpx.Client(timeout=20.0) as c:
+            r = c.get("https://www.googleapis.com/youtube/v3/videos", params={"part": "snippet", "id": m.group(1), "key": key})
+        items = (r.json() if r.status_code == 200 else {}).get("items") or []
+        if not items:
+            return None
+        sn = items[0]["snippet"]
+        thumbs = sn.get("thumbnails") or {}
+        thumb = (thumbs.get("maxres") or thumbs.get("standard") or thumbs.get("high") or thumbs.get("medium") or {}).get("url")
+        return (sn.get("title", ""), (sn.get("description") or "")[:1500], sn.get("channelTitle", ""), sn.get("publishedAt"), thumb)
+    except Exception as ex:
+        log.warning(f"youtube lookup: {type(ex).__name__}: {str(ex)[:60]}")
+        return None
 
 
 def _page_title(html_text):
@@ -1126,7 +1155,7 @@ def add_links(con, pairs, via="run"):
     client = httpx.Client(timeout=25.0, follow_redirects=True)
     ts, out = now(), []
     keep = getattr(rules, "AUTO_KEEP", 10)
-    for url, cat in pairs:
+    for url, cat, sent in [(p[0], p[1], p[2] if len(p) > 2 else None) for p in pairs]:
         key = make_item_key(url)
         ckey = rules.canonical_key(url)
         row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual FROM items
@@ -1136,11 +1165,15 @@ def add_links(con, pairs, via="run"):
             out.append((url, row["title"], "already"))
             continue
         host = (urlparse(url).hostname or "").replace("www.", "")
-        title, desc, text_, status, http_status, image, chars = "", "", "", "FAILED", None, None, 0
+        title, desc, text_, status, http_status, image, chars, pub, channel = "", "", "", "FAILED", None, None, 0, None, ""
+        yt = youtube_video_lookup(url) if host_in(host, VIDEO_HOSTS) else None
+        if yt:
+            title, desc, channel, pub, image = yt
+            status, http_status = "SKIPPED_VIDEO", 200
         try:
-            r = client.get(url, headers=BROWSER_HEADERS)
-            http_status = r.status_code
-            if http_status < 400:
+            r = client.get(url, headers=BROWSER_HEADERS) if not yt else None
+            http_status = r.status_code if r is not None else http_status
+            if r is not None and http_status < 400:
                 title, desc = _page_title(r.text), _page_description(r.text)
                 if not host_in(host, VIDEO_HOSTS) and not host_in(host, SOCIAL_HOSTS):
                     text_ = trafilatura.extract(r.text, include_comments=False, include_tables=False) or ""
@@ -1154,8 +1187,8 @@ def add_links(con, pairs, via="run"):
         if not title:
             title = (row["title"] if row and row["title"] else "") or \
                 re.sub(r"[-_]+", " ", urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]).strip() or url
-        publisher = {"youtube": "YouTube", "youtu": "YouTube", "facebook": "Facebook", "x": "X", "twitter": "X"}.get(host.split(".")[0], host.split(".")[0].title()) if host else "Link"
-        payload = json.dumps({"manual": True, "category": cat, "added_at": ts, "via": via})
+        publisher = channel or ({"youtube": "YouTube", "youtu": "YouTube", "facebook": "Facebook", "x": "X", "twitter": "X"}.get(host.split(".")[0], host.split(".")[0].title()) if host else "Link")
+        payload = json.dumps({"manual": True, "category": cat, "sentiment": sent, "added_at": ts, "via": via})
         if row:
             con.execute("""UPDATE items SET manual=1, band='AUTO_KEEP', score=max(coalesce(score,0), ?), rules_at=coalesce(rules_at, ?),
                            raw_payload=?, description=CASE WHEN coalesce(description,'')='' THEN ? ELSE description END WHERE id=?""",
@@ -1172,7 +1205,7 @@ def add_links(con, pairs, via="run"):
                                    extract_status, extract_host, extract_http, extract_chars, extract_text, extract_attempts,
                                    image_url, canonical_key, score, band, urgent, matched_terms, target_tags, rules_at, manual)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RESOLVED',?,?,?,?,?,?,1,?,?,?,'AUTO_KEEP',0,?,?,?,1)""",
-                        (key, MANUAL_SOURCE[0], "", url, title, desc, publisher, "", ts, ts, "ta" if re.search(r"[\u0B80-\u0BFF]", title) else "en",
+                        (key, MANUAL_SOURCE[0], "", url, title, desc, publisher, pub or "", ts, ts, "ta" if re.search(r"[\u0B80-\u0BFF]", title) else "en",
                          payload, url, status, host, http_status, chars, text_ or None, image, ckey, keep,
                          json.dumps(["📌added by the office"], ensure_ascii=False), json.dumps([cat] if cat in ("constituency", "district", "portfolio") else []), ts))
             out.append((url, title, "added"))
@@ -1236,7 +1269,9 @@ def cmd_sheet_links(url):
             if not m:
                 continue
             cat = (row.get(fields.get("category", ""), "") or row.get(fields.get("section", ""), "") or "").strip().lower()
-            pairs.append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS else None))
+            sent = (row.get(fields.get("sentiment", ""), "") or "").strip().lower()
+            sent = sent if sent in _SENTS else _SENT_ALIAS.get(sent)
+            pairs.append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS else None, sent))
     except Exception as ex:
         log.warning(f"links sheet: {type(ex).__name__}: {str(ex)[:80]}")
         return 0
@@ -1261,9 +1296,10 @@ def inbox_message(msg, chat_id, allowed):
     ok = (str(chat.get("id")) == str(chat_id)) or (private and sender in allowed)
     pairs = parse_manual(text)
     tag = re.search(r"#(mention|constituency|district|portfolio|political|opportunity|velachery|thiruvallur)\b", text.lower())
-    if tag:
-        cat = {"velachery": "constituency", "thiruvallur": "district"}.get(tag.group(1), tag.group(1))
-        pairs = [(u, c_ or cat) for u, c_ in pairs]
+    stag = re.search(r"#(positive|neutral|critical|negative|good|bad)\b", text.lower())
+    cat = {"velachery": "constituency", "thiruvallur": "district"}.get(tag.group(1), tag.group(1)) if tag else None
+    sent = (_SENT_ALIAS.get(stag.group(1)) or stag.group(1)) if stag else None
+    pairs = [(u, c_ or cat, s_ or sent) for u, c_, s_ in pairs]
     return text, private, ok, pairs
 
 
@@ -1305,7 +1341,8 @@ def cmd_telegram_inbox(token, chat_id, admin_ids):
                     if private and text.strip().lower() in ("/start", "start", "help", "/help", "hi"):
                         c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text":
                                "Send me a news or video link. Add #mention, #velachery, #district, #portfolio, #political or "
-                               "#opportunity to pick the section. It is on the page within about half an hour and in the next brief."})
+                               "#opportunity to pick the section, #positive or #critical for the tag. It is on the page within "
+                               "about half an hour and in the next brief."})
                     continue
                 if not ok:
                     continue

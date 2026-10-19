@@ -628,16 +628,16 @@ def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
     for h in list(logging.getLogger("collect").handlers):
         if h not in before:
             logging.getLogger("collect").removeHandler(h)      # keep the test output clean
-    pairs = collect.parse_manual("https://www.dtnext.in/a/1 | district\nhttps://x.com/b/2, https://y.in/c/3 portfolio https://z.in/d/4; https://x.com/b/2 not a link")
-    check(pairs == [("https://www.dtnext.in/a/1", "district"), ("https://x.com/b/2", None), ("https://y.in/c/3", "portfolio"), ("https://z.in/d/4", None)],
-          f"commas, spaces, new lines and semicolons all separate links; a repeat is one: {pairs}")
+    pairs = collect.parse_manual("https://www.dtnext.in/a/1 | district | positive\nhttps://x.com/b/2, https://y.in/c/3 portfolio negative https://z.in/d/4; https://x.com/b/2 not a link")
+    check(pairs == [("https://www.dtnext.in/a/1", "district", "positive"), ("https://x.com/b/2", None, None), ("https://y.in/c/3", "portfolio", "critical"), ("https://z.in/d/4", None, None)],
+          f"commas, spaces, new lines and semicolons all separate links; a repeat is one; section and tag follow each link: {pairs}")
     con = make_db("manual.db")
     # three hand-added links: one with a section asked for, one Gemini can place, one nobody can
     a = add(con, "Velachery lake: encroachments removed after NGT order", band="AUTO_KEEP", score=7)
     b = add(con, "Con story: Baby Nagar drain work starts", band="AUTO_KEEP", score=7)
     c = add(con, "Non story: a page the office wanted on record", band="AUTO_KEEP", score=7)
-    for i, cat in ((a, "district"), (b, None), (c, None)):
-        con.execute("UPDATE items SET manual=1, source_id='manual', raw_payload=? WHERE id=?", (json.dumps({"manual": True, "category": cat}), i))
+    for i, cat, sent in ((a, "district", "positive"), (b, None, None), (c, None, "critical")):
+        con.execute("UPDATE items SET manual=1, source_id='manual', raw_payload=? WHERE id=?", (json.dumps({"manual": True, "category": cat, "sentiment": sent}), i))
     con.execute("INSERT INTO sources (source_id, name, kind) VALUES ('manual', 'Added by the office', 'manual')")
     for i in range(12):
         add(con, t("Con", i))                         # a full constituency section (10 on the page)
@@ -648,6 +648,7 @@ def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
     check(all(i in by for i in (a, b, c)) and len(by) == 4, f"3 added links + the 1 the cap allows: {len(by)}")
     check(by[a]["category"] == "district" and by[b]["category"] == "constituency" and by[c]["category"] == "added",
           {i: by[i]["category"] for i in (a, b, c) if i in by})
+    check(by[a]["sentiment"] == "positive" and by[c]["sentiment"] == "critical" and by[b]["sentiment"] == "neutral", "the asked-for tag wins; otherwise Gemini's")
     data = json.loads((TMP / "docs-manual" / "data" / "latest.json").read_text(encoding="utf-8"))
     st = next(x for x in data["stories"] if x["id"] == c)
     check(st["manual"] and st["cat"] == "added" and "Added by the office" in (TMP / "docs-manual" / "index.html").read_text(encoding="utf-8"), "the 📌 section is on the page")
@@ -660,12 +661,12 @@ def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
     out = collect.add_links(con, [(url_a, None)], via="test")                                         # same url as item a
     check(out and out[0][2] == "already" and con.execute("SELECT digested_at FROM items WHERE id=?", (a,)).fetchone()[0], f"handed in twice: {out}")
     # a message to the bot: links + a section tag; who may send
-    msg = {"chat": {"id": 777, "type": "private"}, "from": {"id": 777}, "text": "see https://www.dtnext.in/x/9 and https://y.in/z #district"}
+    msg = {"chat": {"id": 777, "type": "private"}, "from": {"id": 777}, "text": "see https://www.dtnext.in/x/9 and https://y.in/z #district #positive"}
     text, private, ok, pairs = collect.inbox_message(msg, "-1001", {"777"})
-    check(private and ok and pairs == [("https://www.dtnext.in/x/9", "district"), ("https://y.in/z", "district")], (ok, pairs))
+    check(private and ok and pairs == [("https://www.dtnext.in/x/9", "district", "positive"), ("https://y.in/z", "district", "positive")], (ok, pairs))
     check(not collect.inbox_message(msg, "-1001", set())[2], "an unknown sender is refused")
     post = {"chat": {"id": -1001, "type": "channel"}, "text": "https://www.dinamani.com/p/1 #velachery"}
-    check(collect.inbox_message(post, "-1001", set())[2:] == (True, [("https://www.dinamani.com/p/1", "constituency")]), "a post in the brief's channel is taken")
+    check(collect.inbox_message(post, "-1001", set())[2:] == (True, [("https://www.dinamani.com/p/1", "constituency", None)]), "a post in the brief's channel is taken")
     # every mention is shown, whatever the caps
     con2 = make_db("mentions.db")
     for i in range(14):
