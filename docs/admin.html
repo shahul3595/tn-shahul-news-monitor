@@ -146,7 +146,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 <p>Counts leave out crawlers, link previews and this page's own opens. A "visitor" is one address + one browser; phone networks share addresses, so that is a floor, not a census. Rows older than 90 days are trimmed.</p></details></div>
 <div class="kcard runs" id="runs-card"><h2>Recent runs <small id="runs-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2><div id="runs">–</div></div>
 </div><p class="hint" id="gen"></p></div>
-<script id="sealed" type="application/json">{"v": 1, "iters": 120000, "salt": "LPAIyu06uIDfvHrJCoEQ0g==", "nonce": "FZls7Ros9y6QGkK3wh2Zrg==", "ct": "MkbeI5ccGOwf8DT3wqhwewR+7XhvYZW198iRMJkfA5DI8JP9Hf4i62tuSXFQBGLNGE/AQ5Ll/r7C2TCcUIYoMkc+ViS6AJUDWfEOaqG3b7+IY4Smhov6p54B23xsb7yvkn4i8z8S5Dz9rH0D2hN1haWCx1PbfBp7DcbypInu8EpI8UZtBjIXj1YPg4uF1utYXYkG+EY85xpZPXeSx7JtJL90FL6ET+7UJjmlsCTlhBT76P6E5h2GMvKFuzt4iIzG3MHo0+1qPz9vYlECq5ieRShpUzRryDCkuY9GcvjvbRke3PnqhPQfgZTNiugqTisNLhq+ukEzGW1w3VDBqQi0wGM6470wACQa1+XQo/bE4Yu+qmtqtPlViTLMcuw5DRuOGReSf3QWaB78X5B2mr+PW4j1rNDxtIi/4fIsXGEHxsy9eXuMvuiG9+Tz3qBO+sqCxfMEv48qUI60oW0QndH20dhG0PnbLROdp3ObFsPiOCB9hwixYr1CZDb61Nd5lhyTscR/zFRBTGNmg+k5i7+U", "tag": "f4cQ0nBanGdPLJgKsW0hZ8I84zqI398KnfaehjiCdeY="}</script>
+<script id="sealed" type="application/json">{"v": 1, "iters": 120000, "salt": "WP5eF5jEFaoR8OcRVaSR0g==", "nonce": "AG64/gTLntifkQxfTur8SQ==", "ct": "1AXEJJ36hcPLVkX2aoxUe/CSvlpqrpFv4pqXewyBY9lyC5pgi6jhoRuHjafnPbyxxCEd30U5C8agvyJ9rdzisZi6Nc3WDR08Jf/vjlpRcvLn41VMTDjeEgR/1j34N3FfdXk5NJvCnJ7kkuHL1/SB+r+dNU6IuUpZHCvPDaNEjGIOuFjIuzr59/9hhdkCMmS2u3UuCSuHE2Cws5sV+nq0Tqrps505jEU1kZRCHlDwXjCLQAlu2nGUxeDGuHMb2h54dSqoAaO1++xaOSexBd+7WRfzI+/coGR4BMdfloJWPrtT8Aw918hVGdMeXK8cWDgbiEmbYOmQcw496LfqH/47MzjLB0ieZlJq3+5FMQMvXzpJt1CYhX7A4V1srckWf/HhSORPrD9FcEa2uUAv9truJU9XHzSUuAqOOJ+2ytEkW4gBGA1OGnCBbyigeSYdSmUVwnzEIzVXw9EPwDFU/FRed+TP5sT5xvoYzp8oWRt9qEE0nsqgz1N1KhVVLtFHQhb0mc2XUlqDhGpT9FclBIKn", "tag": "GD950FA+kLqtu73ic9urJ5jcyIBGqtAsL3c2IK+qBuI="}</script>
 <script>
 (function(){
 var S=JSON.parse(document.getElementById('sealed').textContent),$=function(s){return document.querySelector(s)};
@@ -177,7 +177,7 @@ function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.edi
  Array.prototype.forEach.call(document.querySelectorAll('#m-table .rowact'),function(bt){bt.onclick=function(){var x=(m.recent||[])[+bt.getAttribute('data-i')],hide=bt.getAttribute('data-act')==='hide';if(!x)return;
   if(hide&&!confirm('Hide this story from the page for every reader?\n\n'+(x.title||x.url)))return;
   var back=x.from&&CAT[x.from]&&x.from!=='added'?x.from:'restore';
-  if(post({type:'move',url:x.url,id:x.id,title:x.title,category:hide?'hidden':back,sentiment:''})){bt.disabled=true;bt.textContent=hide?'queued: hidden after the next run':'queued: back after the next run'}}});
+  if(post({type:'move',url:x.url||('item:'+x.id),id:x.id,title:x.title,category:hide?'hidden':back,sentiment:''})){bt.disabled=true;bt.textContent=hide?'queued: hidden after the next run':'queued: back after the next run'}}});
  $('#g-calls').textContent=g.calls_today;$('#g-limit').textContent=g.limit;$('#g-bar').style.width=Math.min(100,100*g.calls_today/(g.limit||80))+'%';
  var p=$('#g-state');p.textContent=(g.state||'').replace(/^./,function(x){return x.toUpperCase()});p.className='pill '+g.state;$('#g-model').textContent=g.model||'';
  if(g.note){$('#g-note-row').hidden=false;$('#g-note').textContent=g.note}
