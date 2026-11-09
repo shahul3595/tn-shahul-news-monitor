@@ -718,6 +718,146 @@ def links_added_by_hand_are_always_shown_and_blocked_hosts_are_configurable():
 
 
 @test
+def handed_in_links_are_never_pruned_and_never_come_back_as_new():
+    """18 Oct links, 9 Nov page: the 21-day prune forgot the rows, the sheet still had them,
+    and they were ingested again as today's news. Now a handed-in row is kept for good."""
+    import collect
+    import web
+    con = make_db("prune.db")
+    old = add(con, "Con story: very old scheme launched", hours_ago=24 * 30)                 # 30 days old, regular
+    kept = add(con, "Dis story: old link the office handed in", hours_ago=24 * 30)
+    hid = add(con, "Pol story: old story the office hid", hours_ago=24 * 30)
+    fresh = add(con, "Con story: this week's road work", hours_ago=5)
+    con.execute("UPDATE items SET discovered_at=? WHERE id=?", (collect.now(), fresh))     # prune runs on the real clock
+    con.execute("UPDATE items SET manual=1, manual_at=published_at, raw_payload=? WHERE id=?", (json.dumps({"manual": True, "category": "district", "added_at": "x"}), kept))
+    con.execute("UPDATE items SET hidden=1, raw_payload=? WHERE id=?", (json.dumps({"manual": True, "category": "hidden"}), hid))
+    con.commit()
+    con.close()
+    saved = collect.DB
+    collect.DB = TMP / "prune.db"
+    try:
+        collect.cmd_prune(21)
+    finally:
+        collect.DB = saved
+    con = sqlite3.connect(TMP / "prune.db")
+    con.row_factory = sqlite3.Row
+    left = {r[0] for r in con.execute("SELECT id FROM items")}
+    check(left == {kept, hid, fresh}, f"the regular old item is forgotten; the handed-in and the hidden ones stay: {sorted(left)}")
+    check(any("1 handed-in or hidden items kept" in m or "2 handed-in or hidden items kept" in m for m in LOGS), "the log says what was kept")
+    # the sheet row read again next month: 'already', nothing re-dated, nothing re-sent
+    con.execute("UPDATE items SET digested_at='2026-10-18T06:00:00+00:00' WHERE id=?", (kept,))
+    con.commit()
+    url = con.execute("SELECT resolved_url, published_at FROM items WHERE id=?", (kept,)).fetchone()
+    out = collect.add_links(con, [(url["resolved_url"], "district", None)], via="sheet")
+    row = con.execute("SELECT published_at, manual_at, digested_at FROM items WHERE id=?", (kept,)).fetchone()
+    check(out[0][2] == "already" and row["published_at"] == url["published_at"] and row["digested_at"], f"read again: {out[0][2]}, dates untouched")
+    check(not any(c["id"] == kept for c in digest.candidates(con, T0)[0]), "and it is not a candidate for the next brief")
+    # a link for an article published a week ago, handed in today: today's news, once
+    con2 = make_db("intake.db")
+    week = add(con2, "Dis story: a week-old article the office wants shown", hours_ago=24 * 7)
+    url2 = con2.execute("SELECT resolved_url FROM items WHERE id=?", (week,)).fetchone()[0]
+    check(not any(c["id"] == week for c in digest.edition(con2, T0)[0]), "a week old: not on today's page by itself")
+    import os
+    os.environ["GITHUB_OUTPUT"] = str(TMP / "gh_out.txt")
+    try:
+        out = collect.add_links(con2, [(url2, "district", "positive")], via="sheet")
+    finally:
+        del os.environ["GITHUB_OUTPUT"]
+    check(out[0][2] == "kept" and "added=1" in (TMP / "gh_out.txt").read_text(), f"handed in: {out}")
+    row = con2.execute("SELECT published_at, manual_at, digested_at FROM items WHERE id=?", (week,)).fetchone()
+    check(row["manual_at"] and row["published_at"] == alerts.iso(T0 - timedelta(hours=24 * 7)) and row["digested_at"] is None,
+          "its intake time is recorded; its publication date is not rewritten")
+    now = datetime.fromisoformat(row["manual_at"])
+    check(any(c["id"] == week for c in digest.edition(con2, now)[0]) and any(c["id"] == week for c in digest.candidates(con2, now)[0]),
+          "now it is on the page and in the next brief")
+    check(not any(c["id"] == week for c in digest.edition(con2, now + timedelta(hours=30))[0]), "and off the rolling page after the window, like any story")
+    eds = web.publish(con2, {}, now, None, docs=TMP / "docs-intake")
+    day = now.astimezone(alerts.IST).strftime("%Y-%m-%d")
+    today = json.loads((TMP / "docs-intake" / "data" / f"{day}.json").read_text(encoding="utf-8"))
+    check(any(s["id"] == week for s in today["stories"]), "it belongs to the day it was handed in")
+
+
+@test
+def a_hidden_story_leaves_every_page_and_can_be_restored():
+    import collect
+    import web
+    con = make_db("hide.db")
+    docs = TMP / "docs-hide"
+    a = add(con, "Con story: Baby Nagar drain work starts", host="dinamalar.com")
+    a2 = add(con, "Con story: Baby Nagar drain work starts", host="dtnext.in")          # another outlet, same headline: one card
+    b = add(con, "Dis story: Avadi lake fencing done")
+    c = add(con, "Pol story: party meeting in Velachery", hours_ago=30)                 # yesterday's edition
+    g = FakeGemini()
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=docs)
+    ids = {s["id"] for s in eds["latest"]["chosen"]}
+    check(a in ids and b in ids and a2 not in ids, f"two outlets, one card: {sorted(ids)}")
+    yday = (T0.astimezone(alerts.IST).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    check(any(s["id"] == c for s in json.loads((docs / "data" / f"{yday}.json").read_text(encoding="utf-8"))["stories"]), "yesterday's story is in yesterday's file")
+    # the page's own hide: a row in the links tab, read back as a move
+    url_a = con.execute("SELECT resolved_url FROM items WHERE id=?", (a,)).fetchone()[0]     # the card's own link
+    out = collect.add_links(con, [(url_a, "hidden", None)], via="move")
+    check(out[0][2] == "hidden", out)
+    row = con.execute("SELECT hidden, manual, raw_payload FROM items WHERE id=?", (a,)).fetchone()
+    check(row["hidden"] == 1 and row["manual"] == 1 and json.loads(row["raw_payload"])["hidden_from"] == "constituency", dict(row))
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=docs)
+    ids = {s["id"] for s in eds["latest"]["chosen"]}
+    check(a not in ids and a2 not in ids and b in ids, f"the story is gone with every outlet's copy, not re-carded under another outlet: {sorted(ids)}")
+    check(not any(x["id"] == a for x in digest.candidates(con, T0)[0]), "and it is not offered to the brief")
+    # hiding yesterday's story (which publish no longer rebuilds) scrubs the published file
+    con.execute("UPDATE items SET digested_at=? WHERE id=?", (alerts.iso(T0), c))
+    con.commit()
+    url_c = con.execute("SELECT resolved_url FROM items WHERE id=?", (c,)).fetchone()[0]
+    collect.add_links(con, [(url_c, "hidden", None)], via="telegram:1")
+    con.execute("UPDATE items SET digested_at=? WHERE id=?", (alerts.iso(T0), c))      # a hide never re-sends
+    con.commit()
+    web.publish(con, {"GEMINI_API_KEY": "x"}, T0 + timedelta(days=3), g, docs=docs)      # three days on: yesterday is not rebuilt
+    old = json.loads((docs / "data" / f"{yday}.json").read_text(encoding="utf-8"))
+    check(not any(s["id"] == c for s in old["stories"]), "scrubbed from the old edition file")
+    idx = json.loads((docs / "data" / "index.json").read_text(encoding="utf-8"))
+    e = next(x for x in idx["editions"] if x["key"] == yday)
+    check(e["total"] == len(old["stories"]), "the matrix counts follow")
+    st = json.loads((docs / "data" / "status.json").read_text(encoding="utf-8"))
+    rec = {x["id"]: x for x in st["manual"]["recent"]}
+    check(st["manual"]["hidden"] == 2 and rec[c]["hidden"] and rec[c]["cat"] == "hidden" and rec[c]["from"] == "political" and "(bot)" in rec[c]["via"], rec.get(c))
+    # restore: a row with a section, or 'restore' for the section it had
+    out = collect.add_links(con, [(url_c, "restore", None)], via="move")
+    check(out[0][2] == "restored" and json.loads(con.execute("SELECT raw_payload FROM items WHERE id=?", (c,)).fetchone()[0])["category"] == "political", out)
+    check(con.execute("SELECT hidden FROM items WHERE id=?", (c,)).fetchone()[0] == 0, "no longer hidden")
+    out = collect.add_links(con, [(url_a, "district", None)], via="move")
+    check(out[0][2] == "restored", out)
+    eds = web.publish(con, {"GEMINI_API_KEY": "x"}, T0, g, docs=docs)
+    by = {s["id"]: s for s in eds["latest"]["chosen"]}
+    check(a in by and by[a]["category"] == "district" and a2 not in by, "the story is back on the page, in the section asked for, still one card")
+    # the sheet: every row acts once, in order, so a hide and a later restore both stand and
+    # nothing flaps between runs
+    url_b = con.execute("SELECT resolved_url FROM items WHERE id=?", (b,)).fetchone()[0]
+    csv1 = "url,category,sentiment,note,added\n" + url_b + ",district,positive,,\n"
+    rows = collect.parse_links_csv(csv1)
+    check(rows == [(url_b, "district", "positive", "sheet")], rows)
+    n1 = collect.apply_sheet_rows(con, rows)
+    n2 = collect.apply_sheet_rows(con, rows)
+    check(n1 == 1 and n2 == 0, f"the office's row: handled once ({n1}), then remembered ({n2})")
+    csv2 = csv1 + url_b + ",hidden,,on-page hide: Avadi lake,2026-11-09 07:40:00\n"
+    check(collect.apply_sheet_rows(con, collect.parse_links_csv(csv2)) == 1 and con.execute("SELECT hidden FROM items WHERE id=?", (b,)).fetchone()[0] == 1, "the page's hide row hides it")
+    check(collect.apply_sheet_rows(con, collect.parse_links_csv(csv2)) == 0 and con.execute("SELECT hidden FROM items WHERE id=?", (b,)).fetchone()[0] == 1, "read again: still hidden, nothing re-done")
+    csv3 = csv2 + url_b + ",district,,on-page move: Avadi lake,2026-11-09 08:10:00\n"
+    check(collect.apply_sheet_rows(con, collect.parse_links_csv(csv3)) == 1 and con.execute("SELECT hidden FROM items WHERE id=?", (b,)).fetchone()[0] == 0, "a later restore row restores it")
+    check(collect.apply_sheet_rows(con, collect.parse_links_csv(csv3)) == 0 and con.execute("SELECT hidden FROM items WHERE id=?", (b,)).fetchone()[0] == 0, "and the old hide row does not hide it again")
+    check(collect.apply_sheet_rows(con, collect.parse_links_csv(csv1)) == 0, "rows deleted by hand: nothing happens")
+    check(collect.parse_links_csv("name,channel_id\nx,UC1\n") is None, "another tab is refused")
+    # the words the office may type
+    pairs = collect.parse_manual("https://x.in/1 hide\nhttps://x.in/2 | remove\nhttps://x.in/3 | restore\nhttps://x.in/4 | district")
+    check([p[1] for p in pairs] == ["hidden", "hidden", "restore", "district"], pairs)
+    msg = {"chat": {"id": 7, "type": "private"}, "from": {"id": 7}, "text": "https://x.in/5 #hide"}
+    check(collect.inbox_message(msg, "-1", {"7"})[3] == [("https://x.in/5", "hidden", None)], "the bot takes #hide")
+    page = (docs / "index.html").read_text(encoding="utf-8")
+    check("hideStory(" in page and 'class="hide"' in page and "category:'hidden'" in page and "localStorage.getItem('hid')" in page, "the page has the hide button, behind the token, and remembers the hide locally")
+    admin = (docs / "admin.html").read_text(encoding="utf-8")
+    check("Visitor analytics" in admin and 'id="va-card"' in admin and "visittoken" in admin and "Restore" in admin and "github" not in admin.lower(), "the admin page has the analytics card and Restore, and still names no host")
+    check((docs / "_routes.json").exists() and json.loads((docs / "_routes.json").read_text())["include"] == ["/", "/index.html", "/admin.html", "/api/*"], "the routes file limits the functions to the pages")
+
+
+@test
 def summary_is_cached_until_the_top_stories_change():
     import web
     con = make_db("summary.db")

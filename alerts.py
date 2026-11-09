@@ -79,7 +79,7 @@ LIVE = ("PENDING", "SENDING", "SENT", "DRY_RUN")      # delivered, or will be
 # office's response. To take suicide out of the urgent path entirely, set its sheet rows'
 # role to "context": they still reach the briefing.
 QUIET_GROUPS = ("suicide",)
-SCHEMA_VERSION = "phase1-v3"          # v2: items.image_url; v3: items.manual
+SCHEMA_VERSION = "phase1-v4"          # v2: items.image_url; v3: items.manual; v4: manual_at, hidden
 
 # --------------------------------------------------------------------------
 # schema -- all additive; BUILD_PHASE1 section 1 plus the columns delivery needs
@@ -91,6 +91,8 @@ ITEM_COLUMNS = [
     ("ai_category", "TEXT"), ("ai_priority", "INTEGER"), ("ai_summary", "TEXT"),
     ("ai_reason", "TEXT"), ("ai_model", "TEXT"), ("ai_processed_at", "TEXT"),
     ("event_id", "INTEGER"), ("rules_at", "TEXT"), ("image_url", "TEXT"), ("manual", "INTEGER DEFAULT 0"),
+    ("manual_at", "TEXT"),            # when the office handed the link in: that, not the article's date, is its day on the page
+    ("hidden", "INTEGER DEFAULT 0"),  # taken off the page by the office; never a candidate again
 ]
 EVENT_COLUMNS = [
     ("first_seen_at", "TEXT"), ("last_seen_at", "TEXT"), ("status", "TEXT DEFAULT 'OPEN'"),

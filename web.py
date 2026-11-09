@@ -87,8 +87,7 @@ def migrate(con):
 def _load_window(con, since, until):
     """Kept items published in [since, until). The rules_at bound is generous so that a
     story scored late still belongs to the day it was published."""
-    reps, ids = digest._load(con, f"coalesce(i.published_at, i.discovered_at) < '{iso(until)}'",
-                             since - timedelta(days=2), since)
+    reps, ids = digest._load(con, f"{digest.WHEN_SQL} < '{iso(until)}'", since - timedelta(days=2), since)
     return reps, ids
 
 
@@ -246,10 +245,51 @@ def write_edition(docs, ed, label, now):
     return payload
 
 
+def scrub_hidden(con, docs):
+    """Stories the office hid, taken out of every edition file already published (publish
+    rebuilds only the last two days) and out of the archive files. Returns files changed."""
+    docs = Path(docs)
+    try:
+        hidden = {r[0] for r in con.execute("SELECT id FROM items WHERE coalesce(hidden, 0) = 1")}
+    except Exception:
+        return 0
+    if not hidden:
+        return 0
+    changed = 0
+    files = list((docs / "data").glob("????-??-??.json")) + [docs / "data" / "latest.json"] + list((docs / "archive").glob("????-??-??.json"))
+    for p in files:
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        key = "stories" if isinstance(d.get("stories"), list) else "items" if isinstance(d.get("items"), list) else None
+        if not key:
+            continue
+        keep = [x for x in d[key] if x.get("id") not in hidden and not (set(x.get("merged") or []) & hidden)]
+        if len(keep) == len(d[key]):
+            continue
+        d[key] = keep
+        if key == "items":                            # an archive day: its counts
+            d["stories"], d["shown"] = len(keep), sum(1 for x in keep if x.get("shown"))
+        if isinstance(d.get("summary"), list) and d["summary"] and isinstance(d["summary"][0], dict):
+            for g in d["summary"]:
+                g["bullets"] = [b for b in (g.get("bullets") or []) if not (isinstance(b, dict) and b.get("id") in hidden)]
+            d["summary"] = [g for g in d["summary"] if g.get("bullets")]
+        p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        changed += 1
+    return changed
+
+
+# Pages Functions (functions/ at the repository root) run only for these paths; every other
+# file is served as a plain static asset. Harmless where no Functions are deployed.
+ROUTES = {"version": 1, "include": ["/", "/index.html", "/admin.html", "/api/*"], "exclude": []}
+
+
 def write_page(docs, latest_payload, entries, feedback_url=""):
     docs = Path(docs)
     docs.mkdir(parents=True, exist_ok=True)
     (docs / ".nojekyll").touch()
+    (docs / "_routes.json").write_text(json.dumps(ROUTES), encoding="utf-8")
     html = PAGE.replace("__DATA__", json.dumps(latest_payload, ensure_ascii=False).replace("</", "<\\/")) \
                .replace("__EDITIONS__", json.dumps(entries, ensure_ascii=False).replace("</", "<\\/")) \
                .replace("__FEEDBACK__", esc(feedback_url)).replace("__CSS__", CSS).replace("__JS__", JS)
@@ -296,8 +336,7 @@ def write_archive(con, docs, now, env=None, force_days=()):
             except (OSError, ValueError):
                 pass
         since, until = _day_bounds(day)
-        cands, ids = digest._load(con, f"coalesce(i.published_at, i.discovered_at) < '{iso(until)}'",
-                                  since - timedelta(days=2), since)
+        cands, ids = digest._load(con, f"{digest.WHEN_SQL} < '{iso(until)}'", since - timedelta(days=2), since)
         if not ids and not path.exists():
             continue
         digest.rank_all(con, cands, None, now)          # stored verdicts and the rules; no Gemini calls
@@ -405,19 +444,22 @@ def status_snapshot(con, env, now, editions, brief=None, gemini=None):
     grouping["refused"] = grouping["refused"][:12]
     last_brief = con.execute("SELECT slot, sent_at, chosen, status FROM digests ORDER BY id DESC LIMIT 1").fetchone()
     manual = {"sheet": bool((env.get("MANUAL_LINKS_CSV_URL") or "").strip()),
-              "bot": bool((env.get("TELEGRAM_ADMIN_IDS") or "").strip()), "recent": []}
+              "bot": bool((env.get("TELEGRAM_ADMIN_IDS") or "").strip()), "recent": [], "hidden": 0}
     try:
-        for r in con.execute("""SELECT id, title, publisher, raw_payload, ai_category, ai_sentiment, discovered_at, resolved_url, link
-                                FROM items WHERE coalesce(manual, 0) = 1 ORDER BY id DESC LIMIT 30"""):
+        manual["hidden"] = con.execute("SELECT count(*) FROM items WHERE coalesce(hidden, 0) = 1").fetchone()[0]
+        for r in con.execute("""SELECT id, title, publisher, raw_payload, ai_category, ai_sentiment, discovered_at, resolved_url, link,
+                                       coalesce(hidden, 0) AS hidden, manual_at
+                                FROM items WHERE coalesce(manual, 0) = 1 OR coalesce(hidden, 0) = 1 ORDER BY id DESC LIMIT 40"""):
             pl = alerts._j(r["raw_payload"], {}) or {}
             via = str(pl.get("moved_via") or pl.get("via") or "")
             manual["recent"].append({"id": r["id"], "title": r["title"] or "", "outlet": r["publisher"] or "",
-                                     "cat": pl.get("category") or r["ai_category"] or "added",
+                                     "cat": "hidden" if r["hidden"] else (pl.get("category") or r["ai_category"] or "added"),
+                                     "from": pl.get("hidden_from") or "",
                                      "sentiment": pl.get("sentiment") or r["ai_sentiment"] or "neutral",
-                                     "added": fmt_ist(pl.get("added_at") or r["discovered_at"] or ""),
-                                     "via": {"workflow": "run box", "sheet": "sheet", "move": "on-page move"}.get(via.split(":")[0], via.split(":")[0] or "?")
+                                     "added": fmt_ist(pl.get("hidden_at") if r["hidden"] else (pl.get("added_at") or r["manual_at"] or r["discovered_at"] or "")),
+                                     "via": {"workflow": "run box", "sheet": "sheet", "move": "on-page hide" if r["hidden"] else "on-page move"}.get(via.split(":")[0], via.split(":")[0] or "?")
                                      + (" (bot)" if via.startswith("telegram") else ""),
-                                     "url": r["resolved_url"] or r["link"] or "", "moved": bool(pl.get("moved_at"))})
+                                     "url": r["resolved_url"] or r["link"] or "", "moved": bool(pl.get("moved_at")), "hidden": bool(r["hidden"])})
     except Exception:
         pass
     adir = Path(DOCS) / "archive"
@@ -483,7 +525,7 @@ def write_admin(docs, env):
     repo = (env.get("GITHUB_REPOSITORY") or os.environ.get("GITHUB_REPOSITORY") or "").strip()
     sealed = "null"
     if pin:
-        cfg = {"status": "data/status.json"}
+        cfg = {"status": "data/status.json", "feedback": digest.settings(env)["feedback_url"], "visits": "api/visits"}
         if repo:
             cfg["runs"] = f"https://api.github.com/repos/{repo}/actions/runs?per_page=12"
             cfg["web"] = f"https://github.com/{repo}/actions/runs/"
@@ -518,6 +560,12 @@ def publish(con, env, now, gemini=None, docs=None, days_back=1, brief=None):
         ed = build(con, env, now, f"{day:%Y-%m-%d}", since, until, gemini)
         write_edition(docs, ed, day.strftime("%A %d %B %Y"), now)
         out[f"{day:%Y-%m-%d}"] = ed
+    try:
+        scrubbed = scrub_hidden(con, docs)
+        if scrubbed:
+            log.info(f"hidden: {scrubbed} published file(s) scrubbed")
+    except Exception:
+        log.exception("hidden: could not scrub the published files")
     entries = _index(docs / "data", now)
     write_page(docs, latest_payload, entries, cfg["feedback_url"])
     try:
@@ -655,7 +703,9 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .month{margin:10px 0 4px;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim)}.arow{display:flex;align-items:center;gap:8px;min-height:44px;border-top:1px solid var(--line)}.arow b{flex:1;font-weight:500}.arow button{font:inherit;font-size:13px;min-height:36px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);padding:4px 10px;cursor:pointer}
 .architems{max-height:60vh;overflow:auto;font-size:14px}.architems div{padding:6px 0;border-top:1px solid var(--line)}.architems a{color:var(--ink);text-decoration:none}.architems small{color:var(--dim)}.architems .dim{opacity:.6}.drawer label.opt{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 8px;font-size:15px;cursor:pointer}.drawer label.opt input{width:20px;height:20px;accent-color:var(--accent)}
 #top{position:fixed;right:16px;bottom:16px;display:none;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.2)}#top.on{display:inline-flex}
-.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30}
+.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30;display:flex;align-items:center;gap:12px;width:max-content;max-width:calc(100vw - 32px);text-align:left}
+.toast button{background:transparent;border:1px solid var(--bg);color:var(--bg);border-radius:999px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;min-height:32px;white-space:nowrap}
+.acts button.hide{color:var(--crit)}
 .empty{color:var(--dim);padding:20px 0}footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
 @media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:17px}.dash td,.dash th{padding:5px 4px}.mlab{display:none}.matrix{min-width:520px}}
 """
@@ -671,6 +721,10 @@ var REASONS=[['unrelated','Unrelated to constituency / portfolio'],['category','
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return [].slice.call((r||document).querySelectorAll(s))};
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{},sumOpen:true};
+var HID={};try{HID=JSON.parse(localStorage.getItem('hid')||'{}')}catch(e){}
+(function(){var cut=Date.now()-72*3600e3,ch=false;Object.keys(HID).forEach(function(k){if(!(HID[k]>cut)){delete HID[k];ch=true}});if(ch)saveHid()})();
+function saveHid(){try{localStorage.setItem('hid',JSON.stringify(HID))}catch(e){}}
+function visible(list){return (list||[]).filter(function(s){return !HID[s.id]&&!(s.merged||[]).some(function(m){return HID[m]})})}
 try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off';state.sumOpen=localStorage.getItem('sum')!=='closed'}catch(e){}
 function waText(s,withNotes){var t='*'+(s.urgent?'🚨 ':'')+s.title+'*\n';if(withNotes&&s.takeaways&&s.takeaways.length)t+='_AI summary_\n'+s.takeaways.map(function(b){return '• '+b}).join('\n')+'\n';return t+'🔗 '+s.url}
 function waLink(text){return 'https://wa.me/?text='+encodeURIComponent(text)}
@@ -684,20 +738,20 @@ function card(s){var g=group(s),notes=s.takeaways&&s.takeaways.length?'<div clas
  '<div class="body"><div class="hrow"><label class="tick" aria-label="Select this story"><input type="checkbox"'+(state.sel[s.id]?' checked':'')+'></label><h3><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title)+'</a></h3></div>'+notes+
  '<div class="meta">'+(s.urgent?'<span class="chip u">URGENT</span>':'<span class="chip">'+esc(NAME[s.cat])+'</span>')+(s.manual&&s.cat!=='added'?'<span class="chip" title="A link the office handed in">📌 Added by the office</span>':'')+'<span class="sent '+s.sentiment+'">'+SENT[s.sentiment]+'</span><span class="chip src">'+esc(s.outlet)+'</span><span>'+esc(s.time)+'</span>'+(s.reports&&s.reports.length?'<button type="button" class="more" aria-expanded="false">+'+s.reports.length+' more outlet'+(s.reports.length>1?'s':'')+' ▾</button>':'')+'</div>'+
  (s.reports&&s.reports.length?'<ul class="outlets" hidden>'+s.reports.map(function(r){return '<li><a href="'+esc(r.url)+'" target="_blank" rel="noopener" title="'+esc(r.title)+'">'+esc(r.outlet)+' <small>('+esc(r.lang)+')</small> ↗</a></li>'}).join('')+'</ul>':'')+'</div>'+
- '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span>'+(MOVETOK&&FB?'<div class="mv"><button type="button" class="btn sm mvb" aria-haspopup="true" aria-expanded="false">🏷️ Move ▾</button><div class="mvm" hidden><div class="mvt">🏷️ '+esc(s.title)+'</div><div class="mvh">Section</div>'+MOVE_CATS.map(function(c){return '<button type="button" data-mcat="'+c[0]+'"'+(c[0]===s.cat?' class="on"':'')+'>'+c[1]+'</button>'}).join('')+'<div class="mvh">Tag</div>'+MOVE_SENTS.map(function(c){return '<button type="button" data-msent="'+c[0]+'"'+(c[0]===s.sentiment?' class="on"':'')+'>'+c[1]+'</button>'}).join('')+'</div></div>':'')+'<a class="wa" href="#" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
-function render(){var d=DATA,by={};d.stories.forEach(function(s){(by[group(s)]=by[group(s)]||[]).push(s)});
- $('#title').textContent=d.label+(d.key==='latest'?' · '+d.stories.length+' stories':'');
- $('#sub').textContent=d.stories.length+' stories · '+d.considered+' considered · updated '+d.generated_ist;
+ '<div class="acts">'+(FB?acts:'')+'<span class="sp"></span>'+(MOVETOK&&FB?'<div class="mv"><button type="button" class="btn sm mvb" aria-haspopup="true" aria-expanded="false">🏷️ Move ▾</button><div class="mvm" hidden><div class="mvt">🏷️ '+esc(s.title)+'</div><div class="mvh">Section</div>'+MOVE_CATS.map(function(c){return '<button type="button" data-mcat="'+c[0]+'"'+(c[0]===s.cat?' class="on"':'')+'>'+c[1]+'</button>'}).join('')+'<div class="mvh">Tag</div>'+MOVE_SENTS.map(function(c){return '<button type="button" data-msent="'+c[0]+'"'+(c[0]===s.sentiment?' class="on"':'')+'>'+c[1]+'</button>'}).join('')+'</div></div><button type="button" class="hide" aria-label="Hide this story from the page" title="Hide from the page">🗑</button>':'')+'<a class="wa" href="#" target="_blank" rel="noopener" aria-label="Share on WhatsApp" title="Share on WhatsApp">📲</a></div></article>'}
+function render(){var d=DATA,all=visible(d.stories),by={};all.forEach(function(s){(by[group(s)]=by[group(s)]||[]).push(s)});
+ $('#title').textContent=d.label+(d.key==='latest'?' · '+all.length+' stories':'');
+ $('#sub').textContent=all.length+' stories · '+d.considered+' considered · updated '+d.generated_ist;
  var sum=$('#summary'),ICO={};CATS.forEach(function(c){ICO[c[0]]=c[1]});
- if(d.summary&&d.summary.length&&typeof d.summary[0]==='object'){sum.hidden=false;$('.sgs',sum).innerHTML=d.summary.map(function(g){return '<div class="sg'+(g.cat==='urgent'?' urgent':'')+'"><h3><a href="#sec-'+g.cat+'" data-jump="'+g.cat+'">'+(ICO[g.cat]||'')+' '+esc(NAME[g.cat]||g.cat)+' <span>›</span></a></h3><ul>'+g.bullets.map(function(b){var t=typeof b==='object'?b.text:b,id=typeof b==='object'?b.id:null;return '<li>'+(id?'<a href="#story-'+id+'" data-story="'+id+'">'+esc(t)+'</a>':esc(t))+'</li>'}).join('')+'</ul></div>'}).join('')}
+ if(d.summary&&d.summary.length&&typeof d.summary[0]==='object'){sum.hidden=false;$('.sgs',sum).innerHTML=d.summary.map(function(g){return '<div class="sg'+(g.cat==='urgent'?' urgent':'')+'"><h3><a href="#sec-'+g.cat+'" data-jump="'+g.cat+'">'+(ICO[g.cat]||'')+' '+esc(NAME[g.cat]||g.cat)+' <span>›</span></a></h3><ul>'+g.bullets.map(function(b){var t=typeof b==='object'?b.text:b,id=typeof b==='object'?b.id:null;return HID[id]?'':'<li>'+(id?'<a href="#story-'+id+'" data-story="'+id+'">'+esc(t)+'</a>':esc(t))+'</li>'}).join('')+'</ul></div>'}).join('')}
  else if(d.summary&&d.summary.length){sum.hidden=false;$('.sgs',sum).innerHTML='<div class="sg"><ul>'+d.summary.map(function(b){return '<li>'+esc(b)+'</li>'}).join('')+'</ul></div>'}else{sum.hidden=true}
  $$('[data-jump]',sum).forEach(function(a){a.onclick=function(ev){ev.preventDefault();state.cat='';state.sent='';apply();var t=$('#sec-'+a.getAttribute('data-jump'));if(t)t.scrollIntoView({behavior:'smooth',block:'start'})}});
  $$('[data-story]',sum).forEach(function(a){a.onclick=function(ev){ev.preventDefault();jump(a.getAttribute('data-story'))}});
  var nb=(d.summary||[]).reduce(function(n,g){return n+((g.bullets||[]).length||0)},0);setSummary(state.sumOpen,nb);
  var rows=CATS.filter(function(c){return by[c[0]]}).map(function(c){var l=by[c[0]],n={positive:0,neutral:0,critical:0};l.forEach(function(s){n[s.sentiment]++});
   return '<tr><td class="cat"><button type="button" data-cat="'+c[0]+'" data-sent="">'+c[1]+' '+esc(c[2])+'</button></td>'+['positive','neutral','critical'].map(function(k){return '<td class="'+(n[k]?'':'zero')+'"><button type="button" data-cat="'+c[0]+'" data-sent="'+k+'">'+n[k]+'</button></td>'}).join('')+'<td><button type="button" data-cat="'+c[0]+'" data-sent="">'+l.length+'</button></td></tr>'}).join('');
- var tot={positive:0,neutral:0,critical:0};d.stories.forEach(function(s){tot[s.sentiment]++});
- $('#dashbody').innerHTML=rows;$('#dashfoot').innerHTML='<tr><td>All</td>'+['positive','neutral','critical'].map(function(k){return '<td><button type="button" data-cat="" data-sent="'+k+'">'+tot[k]+'</button></td>'}).join('')+'<td><button type="button" data-cat="" data-sent="">'+d.stories.length+'</button></td></tr>';
+ var tot={positive:0,neutral:0,critical:0};all.forEach(function(s){tot[s.sentiment]++});
+ $('#dashbody').innerHTML=rows;$('#dashfoot').innerHTML='<tr><td>All</td>'+['positive','neutral','critical'].map(function(k){return '<td><button type="button" data-cat="" data-sent="'+k+'">'+tot[k]+'</button></td>'}).join('')+'<td><button type="button" data-cat="" data-sent="">'+all.length+'</button></td></tr>';
  $('#chips').innerHTML=CATS.filter(function(c){return by[c[0]]}).map(function(c){return '<a href="#sec-'+c[0]+'">'+c[1]+' '+esc(c[2])+'<b>'+by[c[0]].length+'</b></a>'}).join('');
  $('#drawer-cats').innerHTML=CATS.filter(function(c){return by[c[0]]}).map(function(c){return '<a href="#sec-'+c[0]+'">'+c[1]+' '+esc(c[2])+' ('+by[c[0]].length+')</a>'}).join('');
  $('#content').innerHTML=CATS.filter(function(c){return by[c[0]]}).map(function(c){return '<section id="sec-'+c[0]+'" data-cat="'+c[0]+'"'+(c[0]==='urgent'?' class="urgent"':'')+'><h2>'+c[1]+' '+esc(c[2])+'</h2><div class="grid'+(state.view==='list'?' list':'')+'">'+by[c[0]].map(card).join('')+'</div></section>'}).join('')||'<p class="empty">Nothing kept for this edition.</p>';
@@ -716,7 +770,12 @@ function moveStory(id,cat,sent){var s=story(id);if(!s)return;if(cat){s.cat=cat;s
  var p={type:'move',url:s.url,id:s.id,title:s.title,category:cat||'',sentiment:sent||'',token:MOVETOK,page:DATA.key};
  fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){});
  render();setTimeout(function(){jump(id)},50);toast((cat?'Moved to '+NAME[cat]:'Tagged '+SENT[sent])+' — permanent after the next run')}
-function wire(){$$('.card .mvb').forEach(function(b){b.onclick=function(ev){ev.stopPropagation();var m=b.nextElementSibling,o=m.hidden;$$('.mvm').forEach(function(x){x.hidden=true});m.hidden=!o;b.setAttribute('aria-expanded',o)}});
+function hideStory(id){var s=story(id);if(!s)return;if(!confirm('Hide this story from the page?\n\n'+s.title+'\n\nIt goes now on this device, and for every reader after the next run (about half an hour). You can undo for a few seconds, or restore it later from the status page.'))return;
+ HID[id]=Date.now();saveHid();send({type:'move',url:s.url,id:s.id,title:s.title,category:'hidden',sentiment:'',token:MOVETOK});render();
+ toast('Hidden — permanent after the next run',{label:'Undo',fn:function(){delete HID[id];saveHid();var back=MOVE_CATS.some(function(c){return c[0]===s.cat})?s.cat:'restore';
+  send({type:'move',url:s.url,id:s.id,title:s.title,category:back,sentiment:'',token:MOVETOK});render();setTimeout(function(){jump(id)},50)}})}
+function wire(){$$('.card .hide').forEach(function(b){b.onclick=function(){hideStory(b.closest('.card').getAttribute('data-id'))}});
+ $$('.card .mvb').forEach(function(b){b.onclick=function(ev){ev.stopPropagation();var m=b.nextElementSibling,o=m.hidden;$$('.mvm').forEach(function(x){x.hidden=true});m.hidden=!o;b.setAttribute('aria-expanded',o)}});
  $$('.card .mvm button').forEach(function(b){b.onclick=function(){var id=b.closest('.card').getAttribute('data-id');moveStory(id,b.getAttribute('data-mcat'),b.getAttribute('data-msent'))}});
  document.addEventListener('click',function(ev){if(!ev.target.closest('.mv'))$$('.mvm').forEach(function(x){x.hidden=true})});
  $$('.card a.wa').forEach(function(a){a.onclick=function(){var s=story(a.closest('.card').getAttribute('data-id'));if(s)a.href=waLink(waText(s,state.withNotes))}});
@@ -786,7 +845,7 @@ drawer.addEventListener('click',function(ev){if(ev.target.closest('a'))openD(fal
 var top=$('#top');window.addEventListener('scroll',function(){top.classList.toggle('on',window.scrollY>600)},{passive:true});top.onclick=function(){window.scrollTo({top:0,behavior:'smooth'})};
 var dlg=$('#missing');$('#open-missing').onclick=function(){openD(false);dlg.showModal()};$('#cancel-missing').onclick=function(){dlg.close()};
 $('#send-missing').onclick=function(ev){ev.preventDefault();var u=$('#m-url').value.trim(),n=$('#m-notes').value.trim();if(!u&&!n)return;send({type:'missing',url:u,notes:n.slice(0,500)});dlg.close();$('#m-url').value='';$('#m-notes').value='';toast('Thank you — sent for review.')};
-function toast(m){var t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(function(){t.remove()},3500)}
+function toast(m,act){var t=document.createElement('div');t.className='toast';t.textContent=m;if(act){var b=document.createElement('button');b.type='button';b.textContent=act.label;b.onclick=function(){t.remove();act.fn()};t.appendChild(b)}document.body.appendChild(t);setTimeout(function(){t.remove()},act?8000:3500)}
 if(!FB){$('#open-missing').hidden=true}
 fillPickers();render();matrix();setView(state.view);setNotes(state.notes);setWithNotes(state.withNotes);
 var h=location.hash.match(/^#story-(\d+)$/);if(h)setTimeout(function(){jump(h[1])},300);
@@ -806,6 +865,12 @@ ADMIN_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 .meter{height:8px;background:var(--chip);border-radius:4px;overflow:hidden;margin:8px 0}.meter i{display:block;height:100%;background:var(--accent)}
 .runs .row span:first-child{flex:1}.runs a{color:var(--accent);text-decoration:none}.ok{color:var(--pos)}.bad{color:var(--crit)}.run{color:var(--dim)}
 .refused{font-size:13px;color:var(--dim)}.refused li{margin:4px 0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:4px 0 10px}.tile{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}.tile b{display:block;font-size:24px;line-height:1.1}.tile span{font-size:12px;color:var(--dim)}
+.days{display:flex;gap:6px;align-items:flex-end;height:64px;margin:6px 0 12px}.days div{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;font-size:11px;color:var(--dim);height:100%}.days i{display:block;width:100%;max-width:40px;background:var(--accent);border-radius:4px 4px 0 0;min-height:2px}
+#va-table{min-width:620px}#m-table{min-width:640px}#va-table td:first-child,#va-table td.ip,#va-table td:nth-child(4){white-space:nowrap}
+#va-table td,#va-table th,#m-table td,#m-table th{padding:5px 6px;border-top:1px solid var(--line);text-align:left;vertical-align:top}#va-table th,#m-table th{border-top:0;color:var(--dim);font-weight:500;font-size:12px}#va-table td.ip{font-family:monospace;font-size:12px}
+.kcard details{font-size:13px;color:var(--dim);margin-top:8px}.kcard summary{cursor:pointer;min-height:36px;display:flex;align-items:center}.kcard code{background:var(--chip);padding:1px 5px;border-radius:4px}
+.rowact{font:inherit;font-size:12px;min-height:32px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);padding:2px 10px;cursor:pointer;white-space:nowrap}
 </style></head><body><div class="wrap">
 <header><div style="flex:1"><h1 id="title">System status</h1><div class="sub" id="sub">private page</div></div><a class="btn" href="index.html">← Brief</a></header>
 <div class="lock" id="lock"><h2 style="margin:0 0 4px">Enter the PIN</h2><p class="sub" style="margin:0">Nothing loads until the PIN is right.</p>
@@ -821,7 +886,14 @@ ADMIN_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <div class="kcard"><h2>Reader feedback</h2><div id="fb"></div></div>
 <div class="kcard" style="grid-column:1/-1"><h2>📌 Manually added stories</h2><div id="m-conn" class="row"></div>
 <div class="row" style="display:block"><b>On-page moves</b> — once the token below is saved in the feedback script (Project Settings → Script properties → <code>MOVE_TOKEN</code>), every card on the brief page shows <b>🏷️ Move</b> for this browser session. <span id="m-tok" style="font-family:monospace;word-break:break-all"></span> <button type="button" class="btn sm" id="m-copy">Copy token</button> <a class="btn sm" href="index.html">Open the brief with Move on ↗</a></div>
-<div class="mwrap"><table id="m-table" style="width:100%;font-size:13px"><thead><tr><th style="text-align:left">Story</th><th>Section</th><th>Tag</th><th>Added</th><th>Via</th></tr></thead><tbody></tbody></table></div></div>
+<div class="mwrap"><table id="m-table" style="width:100%;font-size:13px"><thead><tr><th>Story</th><th>Section</th><th>Tag</th><th>Added / hidden</th><th>Via</th><th></th></tr></thead><tbody></tbody></table></div>
+<p class="hint" id="m-hint">🗑 on any card of the brief page (with Move on) hides that story for every reader after the next run; <b>Restore</b> here brings one back. <span id="m-hidden"></span></p></div>
+<div class="kcard" style="grid-column:1/-1" id="va-card"><h2>📊 Visitor analytics <small id="va-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2>
+<div class="tiles" id="va-tiles"></div><div class="days" id="va-days" hidden></div>
+<div class="mwrap"><table id="va-table" style="width:100%;font-size:13px"><thead><tr><th>When (IST)</th><th>IP</th><th>Location</th><th>Device</th><th>Page</th></tr></thead><tbody></tbody></table></div>
+<details id="va-setup"><summary>Setup &amp; token</summary><p>Visits are logged by a small function in front of the page (<code>functions/</code> in the repository) into a <b>Visits</b> tab of the sheet, through the feedback script. It needs this token in two places: the feedback script's properties as <code>VISIT_TOKEN</code>, and the site host's environment variables as <code>VISIT_TOKEN</code> (with <code>FEEDBACK_URL</code>). The README has the click-by-click steps.</p>
+<p><span id="va-tok" style="font-family:monospace;word-break:break-all"></span> <button type="button" class="btn sm" id="va-copy">Copy token</button></p>
+<p>Counts leave out crawlers, link previews and this page's own opens. A "visitor" is one address + one browser; phone networks share addresses, so that is a floor, not a census. Rows older than 90 days are trimmed.</p></details></div>
 <div class="kcard runs" id="runs-card"><h2>Recent runs <small id="runs-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2><div id="runs">–</div></div>
 </div><p class="hint" id="gen"></p></div>
 <script id="sealed" type="application/json">__SEALED__</script>
@@ -845,9 +917,17 @@ async function open(pin){
  return JSON.parse(new TextDecoder().decode(out))}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 var CAT={mention:'🗣 Mentions',constituency:'📍 Velachery',district:'🏛 Thiruvallur',portfolio:'💻 AI / IT',political:'🏳 Political',opportunity:'🎯 Opportunities',added:'📌 Added'},SENT={positive:'🟢 Positive',neutral:'⚪ Neutral',critical:'🔴 Critical'};
+var CFG=null;
+function post(p){if(!CFG||!CFG.feedback)return false;var tok='';try{tok=sessionStorage.getItem('movetoken')||''}catch(e){}p.token=tok;p.page='admin';fetch(CFG.feedback,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){});return true}
 function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.editions||{},r=st.grouping||{},fb=st.feedback||{},m=st.manual||{};
  $('#m-conn').innerHTML='<span>Links sheet</span><span>'+(m.sheet?'<span class="ok">connected</span>':'not configured (MANUAL_LINKS_CSV_URL)')+' · bot '+(m.bot?'<span class="ok">on</span>':'off (TELEGRAM_ADMIN_IDS)')+'</span>';
- $('#m-table tbody').innerHTML=(m.recent||[]).map(function(x){return '<tr><td style="text-align:left"><a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.title||x.url)+'</a><br><small class="run">'+esc(x.outlet)+'</small></td><td>'+esc(CAT[x.cat]||x.cat)+(x.moved?' ✎':'')+'</td><td>'+esc(SENT[x.sentiment]||x.sentiment)+'</td><td>'+esc(x.added)+'</td><td>'+esc(x.via)+'</td></tr>'}).join('')||'<tr><td colspan="5" class="run">none yet</td></tr>';
+ $('#m-hidden').textContent=m.hidden?m.hidden+' hidden in all.':'';
+ $('#m-table tbody').innerHTML=(m.recent||[]).map(function(x,i){var act=x.hidden?'<button type="button" class="rowact" data-i="'+i+'" data-act="restore">♻️ Restore</button>':'<button type="button" class="rowact" data-i="'+i+'" data-act="hide">🚫 Hide</button>';
+  return '<tr'+(x.hidden?' style="opacity:.7"':'')+'><td><a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.title||x.url)+'</a><br><small class="run">'+esc(x.outlet)+'</small></td><td>'+(x.hidden?'🚫 Hidden'+(x.from&&CAT[x.from]?'<br><small class="run">was '+esc(CAT[x.from])+'</small>':''):esc(CAT[x.cat]||x.cat)+(x.moved?' ✎':''))+'</td><td>'+(x.hidden?'':esc(SENT[x.sentiment]||x.sentiment))+'</td><td>'+esc(x.added)+'</td><td>'+esc(x.via)+'</td><td>'+(CFG&&CFG.feedback?act:'')+'</td></tr>'}).join('')||'<tr><td colspan="6" class="run">none yet</td></tr>';
+ Array.prototype.forEach.call(document.querySelectorAll('#m-table .rowact'),function(bt){bt.onclick=function(){var x=(m.recent||[])[+bt.getAttribute('data-i')],hide=bt.getAttribute('data-act')==='hide';if(!x)return;
+  if(hide&&!confirm('Hide this story from the page for every reader?\\n\\n'+(x.title||x.url)))return;
+  var back=x.from&&CAT[x.from]&&x.from!=='added'?x.from:'restore';
+  if(post({type:'move',url:x.url,id:x.id,title:x.title,category:hide?'hidden':back,sentiment:''})){bt.disabled=true;bt.textContent=hide?'queued: hidden after the next run':'queued: back after the next run'}}});
  $('#g-calls').textContent=g.calls_today;$('#g-limit').textContent=g.limit;$('#g-bar').style.width=Math.min(100,100*g.calls_today/(g.limit||80))+'%';
  var p=$('#g-state');p.textContent=(g.state||'').replace(/^./,function(x){return x.toUpperCase()});p.className='pill '+g.state;$('#g-model').textContent=g.model||'';
  if(g.note){$('#g-note-row').hidden=false;$('#g-note').textContent=g.note}
@@ -866,17 +946,31 @@ async function runs(cfg){if(!cfg.runs){$('#runs-card').hidden=true;return}
   $('#runs').innerHTML=(j.workflow_runs||[]).map(function(x){var ok=x.conclusion==='success',live=x.status!=='completed';var when=new Date(x.updated_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
    return '<div class="row"><span>'+(live?'<span class="run">⏳</span>':ok?'<span class="ok">✅</span>':'<span class="bad">❌</span>')+' '+esc(x.name)+'</span><span>'+esc(when)+' · <a href="'+esc(cfg.web+x.id)+'" target="_blank" rel="noopener">log ↗</a></span></div>'}).join('')||'no runs yet';
   $('#runs-note').textContent='· live'}catch(e){$('#runs').innerHTML='<span class="bad">could not reach the run list ('+esc(e.message)+')</span>'}}
-async function moveToken(pin){var b=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode('move:'+pin)));return Array.prototype.map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join('').slice(0,40)}
-async function unlocked(cfg){$('#lock').hidden=true;$('#panel').hidden=false;
- var tok='';try{tok=sessionStorage.getItem('movetoken')||''}catch(e){}$('#m-tok').textContent=tok||'(unlock with the PIN to see the token)';
+async function token(kind,pin){var b=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(kind+':'+pin)));return Array.prototype.map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join('').slice(0,40)}
+function ist(s){try{return new Date(s).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}catch(e){return s}}
+async function visits(cfg){var vt='';try{vt=sessionStorage.getItem('visittoken')||''}catch(e){}var note=$('#va-note'),tiles=$('#va-tiles'),tb=$('#va-table tbody');
+ if(!cfg.visits||!vt){note.textContent='· unlock with the PIN';return}
+ try{var r=await fetch(cfg.visits+'?t='+encodeURIComponent(vt)+'&limit=100',{cache:'no-store'});
+  if(r.status===404){note.innerHTML='· <span class="bad">not set up yet</span> — the functions folder is not deployed in front of the page (see Setup below)';$('#va-setup').open=true;return}
+  if(r.status===403){note.innerHTML='· <span class="bad">token mismatch</span> — VISIT_TOKEN in the host’s variables is not this token';$('#va-setup').open=true;return}
+  if(!r.ok)throw new Error('HTTP '+r.status);var j=await r.json();if(j.error){note.innerHTML='· <span class="bad">'+esc(j.error==='denied'?'token mismatch — VISIT_TOKEN in the feedback script is not this token':j.error)+'</span>';$('#va-setup').open=true;return}
+  var t=j.today||{},w=j.week||{};
+  tiles.innerHTML=[[t.visitors,'visitors today'],[w.visitors,'visitors, 7 days'],[t.views,'page views today'],[w.views,'page views, 7 days'],[w.bots,'crawlers & previews, 7 d'],[w.admin,'this page opened, 7 d']].map(function(x){return '<div class="tile"><b>'+(x[0]==null?'–':x[0])+'</b><span>'+x[1]+'</span></div>'}).join('');
+  var days=j.days||[],mx=Math.max.apply(null,days.map(function(d){return d.views||0}).concat([1]));$('#va-days').hidden=!days.length;
+  $('#va-days').innerHTML=days.map(function(d){return '<div title="'+esc(d.day)+': '+d.views+' views, '+d.visitors+' visitors"><i style="height:'+Math.round(100*(d.views||0)/mx)+'%"></i>'+esc(String(d.day).slice(5))+'</div>'}).join('');
+  tb.innerHTML=(j.recent||[]).map(function(v){return '<tr'+(v.bot||/admin/.test(v.page||'')?' style="opacity:.55"':'')+'><td>'+esc(ist(v.when))+'</td><td class="ip">'+esc(v.ip)+'</td><td>'+esc(v.loc||'–')+'</td><td>'+esc([v.device,v.browser,v.os].filter(Boolean).join(' · '))+(v.bot?' 🤖':'')+'</td><td>'+esc(v.page||'/')+(v.ref?'<br><small class="run">from '+esc(v.ref)+'</small>':'')+'</td></tr>'}).join('')||'<tr><td colspan="5" class="run">no visits logged yet</td></tr>';
+  note.textContent='· live · '+(j.rows||0)+' rows kept'}catch(e){note.innerHTML='· <span class="bad">could not load ('+esc(e.message)+')</span>'}}
+async function unlocked(cfg){CFG=cfg;$('#lock').hidden=true;$('#panel').hidden=false;
+ var tok='',vt='';try{tok=sessionStorage.getItem('movetoken')||'';vt=sessionStorage.getItem('visittoken')||''}catch(e){}$('#m-tok').textContent=tok||'(unlock with the PIN to see the token)';$('#va-tok').textContent=vt||'(unlock with the PIN to see the token)';
  $('#m-copy').onclick=function(){if(!tok)return;navigator.clipboard.writeText(tok).then(function(){$('#m-copy').textContent='Copied'})};
+ $('#va-copy').onclick=function(){if(!vt)return;navigator.clipboard.writeText(vt).then(function(){$('#va-copy').textContent='Copied'})};
  try{var st=await (await fetch(cfg.status,{cache:'no-store'})).json();show(st)}catch(e){$('#gen').textContent='status snapshot not available yet — it is written at each brief'}
- runs(cfg)}
+ visits(cfg);runs(cfg)}
 if(!S){$('#f').hidden=true;$('#err').textContent='Not configured: set the ADMIN_PIN secret and run a brief.'}
 try{var saved=sessionStorage.getItem('admin');if(saved&&S){unlocked(JSON.parse(saved))}}catch(e){}
 $('#f').onsubmit=async function(ev){ev.preventDefault();$('#err').textContent='';var pin=$('#pin').value;if(!pin)return;
  try{var cfg=await open(pin);if(!cfg){$('#err').textContent='Wrong PIN';$('#pin').value='';return}
-  try{sessionStorage.setItem('admin',JSON.stringify(cfg));sessionStorage.setItem('movetoken',await moveToken(pin))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
+  try{sessionStorage.setItem('admin',JSON.stringify(cfg));sessionStorage.setItem('movetoken',await token('move',pin));sessionStorage.setItem('visittoken',await token('visits',pin))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
 })();
 </script></body></html>"""
 

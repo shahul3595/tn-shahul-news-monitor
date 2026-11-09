@@ -18,7 +18,8 @@ The Telegram brief carries only what is new since the last brief. The web page i
 `docs/index.html` is a small app that renders editions from `docs/data/`: `latest.json`
 (everything kept in the last 24 hours, up to 60 stories) and one file per IST day by
 publication date (kept **forever**; the picker offers 7 and the ☰ menu's *Archive* lists every
-day by month, with an "all kept" list per day from `docs/archive/`). Each edition has a 60-second briefing with 2-3
+day by month, with an "all kept" list per day from `docs/archive/`). Sections run Mentions,
+Urgent, Velachery, Thiruvallur, AI / IT, Political, Opportunities, Added by the office. Each edition has a collapsible 60-second briefing (the page remembers whether you keep it folded) with 2-3
 takeaways per section (tap a takeaway to jump to its card, which lights up; tap a section heading for the whole section), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
 matrix (days × sections with sentiment bars and 🟢 ⚪ 🔴 counts, the whole day in the *All* column; tap a count for that day and section, a badge for one sentiment of it, the day for all of it), expandable
 "+N more outlets" links on merged stories, two AI notes on every card (📝 Notes toggle hides them for a compact view), a ☑ Select mode that bundles chosen stories into one numbered WhatsApp message (with or without the notes, also for the per-card 📲 share),
@@ -97,7 +98,8 @@ Every dated edition stays in `docs/data/` for good (10-40 KB a day). `docs/archi
 file per day with everything the rules kept that day -- title, link, outlet, category,
 sentiment, notes, and whether it made the page; no article bodies -- written when the day is
 2 days old and once more at 15 days (Google News re-serves a story for up to 14 days). Four
-months is about 15 MB in all. The database itself still keeps 21 days.
+months is about 15 MB in all. The database itself still keeps 21 days -- except handed-in
+and hidden stories, which it keeps for good (see *Adding news by hand*).
 
 The database travels between runs as an encrypted run artifact (`state`, kept 3
 days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
@@ -115,7 +117,7 @@ days; `state-backup`, once a day, kept 30 days). Instant alerts are switched off
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | yes, for the brief | the bot and the private channel. Without them the brief is only printed on the run page |
 | `MANUAL_LINKS_CSV_URL` | optional | the sheet's *Add links* tab, published as CSV |
 | `SETTINGS_CSV_URL` | optional | the sheet's *Settings* tab (`key, value`), published as CSV |
-| `ADMIN_PIN` | optional | unlocks `docs/admin.html`, the private status page (see below). Use a passphrase of 8+ characters, not a 4-digit PIN: the page can be downloaded and guessed at offline |
+| `ADMIN_PIN` | optional | unlocks `docs/admin.html`, the private status page (see below). Use a passphrase of 8+ characters, not a 4-digit PIN: the page can be downloaded and guessed at offline, and the move and visit tokens derive from it |
 
 Optional *variables* (Settings → Secrets and variables → Actions → Variables): `TELEGRAM_ADMIN_IDS` (user ids allowed to send links to the bot), `BLOCKED_HOSTS` (extra hosts to drop, comma-separated), `MINISTER_NAMES` (the forms of his name the guards accept, `|`-separated; default `R. Kumar|R Kumar|ஆர். குமார்|ஆர்.குமார்|ஆர் குமார்|அமைச்சர் ஆர். குமார்|அமைச்சர் குமார்|Minister Kumar` -- Tamil case endings are understood; the two generic forms count only next to a Tamil Nadu place or his portfolio), `DIGEST_PER_CATEGORY` (default 5), `DIGEST_MAX` (default 30), `GEMINI_MODEL` (default `gemini-flash-lite-latest`); for the web page `DIGEST_WEB_PER_CATEGORY` (10), `DIGEST_WEB_MAX` (60), `DIGEST_WEB_HOURS` (24), `FEEDBACK_URL` (the Apps Script web-app URL from `feedback.gs`). Secret `FEEDBACK_CSV_URL` (the Feedback tab published as CSV) adds a reader-feedback review block to each brief's run page.
 
@@ -163,6 +165,74 @@ treated the same way, so moves can also be made by hand in the sheet.
 
 A link handed in twice is left alone (not re-sent). A page that refuses robots still appears,
 with its address as the headline, so the office can at least share it.
+
+**Dates.** A handed-in link is shown on the day it was handed in, for the 24-hour window,
+whatever the article's own date -- last week's article the office wants seen is today's
+news, once (the intake time is kept in `items.manual_at`; the publication date is never
+rewritten). Handed-in rows are **never pruned** from the database: the row is the only
+memory that a sheet row was dealt with, and the day one was pruned (21 days after 18 Oct)
+the sheet rows came back as new stories on 9 Nov. Hidden stories are kept for good for the
+same reason.
+
+## Taking a story off the page
+
+Unlock `admin.html` once and every card on the brief page also shows **🗑** (next to Move).
+Tap it, confirm, and the card is gone on that device at once, with an **Undo** for a few
+seconds; the hide is written to the *Add links* tab (category `hidden`, note "on-page hide")
+and at the next run the collector marks the story hidden: it leaves the rolling page, the
+dated editions and the archive files already published (they are scrubbed), it is never a
+candidate again, and the other outlets' copies of the same story go with it rather than
+coming back as a card of their own. Nothing is re-sent to Telegram.
+
+Other ways to hide: a row `url | hide` in the *Add links* tab or the run box; a link with
+`#hide` to the bot. The status page lists hidden stories under *📌 Manually added stories*
+with a **Restore** button (a row `url | restore`, or `#restore` to the bot, does the same;
+a row with a section name restores it into that section). Hide is for a story that should
+not be on the page; for a wrong section use Move, for a wrong verdict use 👎 -- those teach
+the keyword list, a hide does not.
+
+## Who reads the page
+
+`admin.html` has a **📊 Visitor analytics** card: visitors and page views today and over 7
+days, a bar per day, and the latest visits with time (IST), address, city, device and page.
+Crawlers and WhatsApp/Telegram link previews are counted apart, and so are opens of the
+status page itself. A "visitor" is one address plus one browser; Jio and Airtel put many
+phones behind one address, so the number is a floor.
+
+It works without any script or cookie on the page. Cloudflare Pages runs
+`functions/_middleware.js` (a folder at the top of the repository, next to `docs/`) in
+front of the two HTML pages; after the page has been served it posts one row -- time,
+`CF-Connecting-IP`, Cloudflare's city/region/country, device and browser from the
+user-agent, page and referrer -- to the feedback script, which appends it to a **Visits**
+tab in the sheet. `functions/api/visits.js` serves the totals back to the status page,
+token-gated at both ends. `docs/_routes.json` keeps the functions off every other file,
+so JSON, images and the like stay plain static assets (and within the free 100 000
+function requests a day). Rows older than 90 days are trimmed by the script. **Never
+publish the Visits tab to the web** -- check File → Share → Publish to web shows the
+individual tabs you published, not *Entire document*.
+
+Setup, once (about ten minutes):
+
+1. Upload the `functions` folder to the repository root (Add file → Upload files → drag the
+   whole `functions` folder in; the two files land as `functions/_middleware.js` and
+   `functions/api/visits.js`). Upload the new `feedback.gs`, `web.py`, `collect.py`,
+   `digest.py`, `alerts.py`.
+2. Apps Script: paste the new `feedback.gs` over the old one, save, Deploy → Manage
+   deployments → pencil → Version: *New version* → Deploy (the URL stays the same).
+3. Open `admin.html`, unlock, open *Setup & token* on the analytics card and copy the
+   **visit token**. In Apps Script: Project Settings (gear) → Script properties → Add
+   property → `VISIT_TOKEN` = that token → Save.
+4. Cloudflare dashboard → Workers & Pages → your Pages project → Settings → Variables and
+   secrets → Add: `FEEDBACK_URL` = the feedback script's `/exec` URL (the same value as the
+   GitHub variable) and `VISIT_TOKEN` = the same token (type *Secret*). Save.
+5. The next deployment (any commit to the repository -- the next brief does one) activates
+   the functions. Open the page once, then the analytics card shows the visit.
+
+If the card says *not set up yet*, the `functions` folder is not at the repository root or
+the site has not redeployed since; *token mismatch* names which of the two places has a
+different token. Visitors' addresses are personal data: keep the status page's PIN long,
+and consider one line in the page footer saying that standard access logs are kept for
+90 days.
 
 ## The Settings tab
 

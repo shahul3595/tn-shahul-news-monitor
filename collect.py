@@ -1086,6 +1086,8 @@ def drain_extractor(con, client, budget_s, tick=None):
 MANUAL_SOURCE = ("manual", "Added by the office", "manual")
 _URL_RE = re.compile(r"https?://[^\s<>\"'|,]+")
 _CATS = ("mention", "constituency", "district", "portfolio", "political", "opportunity")
+_HIDE = ("hidden", "hide", "remove", "delete", "unpublish")   # 'url | hide' takes a story off the page
+_RESTORE = ("restore", "unhide", "show", "added")               # 'url | restore' puts a hidden one back
 
 
 _SENTS = ("positive", "neutral", "critical")
@@ -1102,7 +1104,9 @@ def parse_manual(text):
     for i, m in enumerate(hits):
         url = m.group(0).rstrip(".;)|,")
         rest = text[m.end():hits[i + 1].start() if i + 1 < len(hits) else len(text)].lower()
-        cat = next((c for c in _CATS if re.search(r"\b" + c + r"\b", rest)), None)
+        cat = next((c for c in _CATS if re.search(r"\b" + c + r"\b", rest)), None) \
+            or ("hidden" if re.search(r"\b(?:" + "|".join(_HIDE) + r")\b", rest) else None) \
+            or ("restore" if re.search(r"\b(?:" + "|".join(_RESTORE) + r")\b", rest) else None)
         sent = next((s for s in _SENTS if re.search(r"\b" + s + r"\b", rest)), None) \
             or next((v for k, v in _SENT_ALIAS.items() if re.search(r"\b" + k + r"\b", rest)), None)
         if url not in seen:
@@ -1148,24 +1152,45 @@ def _page_description(html_text):
 def add_links(con, pairs, via="run"):
     """Articles the office hands in by link: fetched now, stored as kept (AUTO_KEEP) and
     marked manual, so the brief and the page carry them whatever the keywords say. An
-    optional section ('url | district') is honoured by the digest. Returns a list of
-    (url, title, outcome) with outcome 'added', 'kept' (collected earlier, now marked) or
-    'already' (handed in before -- nothing changes, so it is not re-sent)."""
+    optional section ('url | district') is honoured by the digest; 'url | hide' takes the
+    story off the page for good. Returns a list of (url, title, outcome) with outcome
+    'added', 'kept' (collected earlier, now marked), 'updated' (re-filed), 'hidden',
+    'restored', or 'already' (handed in before -- nothing changes, so it is not re-sent).
+
+    The row is the memory: a manual row is never pruned, so a sheet row read again next
+    month is 'already', not a new story. Nothing here ever rewrites a date that is set."""
     con.execute("INSERT OR IGNORE INTO sources (source_id, name, kind, enabled) VALUES (?, ?, ?, 1)", MANUAL_SOURCE)
     client = httpx.Client(timeout=25.0, follow_redirects=True)
-    ts, out = now(), []
+    ts, out, call_via = now(), [], via
     keep = getattr(rules, "AUTO_KEEP", 10)
-    for url, cat, sent in [(p[0], p[1], p[2] if len(p) > 2 else None) for p in pairs]:
+    for url, cat, sent, via in [(p[0], p[1], p[2] if len(p) > 2 else None, p[3] if len(p) > 3 and p[3] else via) for p in pairs]:
         key = make_item_key(url)
         ckey = rules.canonical_key(url)
-        row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual, raw_payload FROM items
+        row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual, coalesce(hidden, 0) AS hidden, raw_payload, ai_category,
+                                    coalesce(manual_at, '') AS manual_at FROM items
                              WHERE item_key=? OR (canonical_key IS NOT NULL AND canonical_key=?) OR resolved_url=? OR link=?
                              ORDER BY manual DESC, id LIMIT 1""", (key, ckey, url, url)).fetchone()
-        if row and row["manual"]:
-            # handed in before: a new section or tag is an update (an on-page move lands here);
-            # the same again is nothing, and nothing is re-sent either way
+        hide, restore = cat == "hidden", cat == "restore"
+        cat = None if restore else cat
+        if row and (row["manual"] or row["hidden"]):
+            # handed in (or hidden) before: a new section or tag is an update, a hide hides,
+            # a section on a hidden story restores it; the same again is nothing. Nothing is
+            # re-sent and no date is touched either way.
             cur = alerts._j(row["raw_payload"], {}) or {}
-            if (cat and cat != cur.get("category")) or (sent and sent != cur.get("sentiment")):
+            if hide and not row["hidden"]:
+                cur.update({"hidden_from": cur.get("category") or row["ai_category"] or "", "category": "hidden",
+                            "hidden_at": ts, "moved_via": via})
+                con.execute("UPDATE items SET hidden=1, manual=1, raw_payload=? WHERE id=?", (json.dumps(cur, ensure_ascii=False), row["id"]))
+                out.append((url, row["title"], "hidden"))
+                log.info(f"add-links: hidden: {(row['title'] or url)[:60]}")
+            elif row["hidden"] and (cat or restore) and not hide:
+                back = cat or (cur.get("hidden_from") if cur.get("hidden_from") in _CATS else None)
+                cur.update({"category": back, "sentiment": sent or cur.get("sentiment"), "restored_at": ts, "moved_via": via})
+                cur.pop("hidden_from", None)
+                con.execute("UPDATE items SET hidden=0, raw_payload=? WHERE id=?", (json.dumps(cur, ensure_ascii=False), row["id"]))
+                out.append((url, row["title"], "restored"))
+                log.info(f"add-links: restored to {back or 'its own section'}: {(row['title'] or url)[:60]}")
+            elif not hide and not row["hidden"] and ((cat and cat != cur.get("category")) or (sent and sent != cur.get("sentiment"))):
                 cur.update({"category": cat or cur.get("category"), "sentiment": sent or cur.get("sentiment"),
                             "moved_at": ts, "moved_via": via})
                 con.execute("UPDATE items SET raw_payload=? WHERE id=?", (json.dumps(cur, ensure_ascii=False), row["id"]))
@@ -1173,6 +1198,14 @@ def add_links(con, pairs, via="run"):
                 log.info(f"add-links: re-filed {cat or ''} {sent or ''}: {(row['title'] or url)[:60]}")
             else:
                 out.append((url, row["title"], "already"))
+            continue
+        if row and hide:
+            # a collected story the office wants off the page: marked, kept for good, never a
+            # candidate again (if the outlet re-serves it, the same row absorbs it)
+            payload = {"manual": True, "category": "hidden", "hidden_from": row["ai_category"] or "", "hidden_at": ts, "via": via}
+            con.execute("UPDATE items SET hidden=1, manual=1, raw_payload=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), row["id"]))
+            out.append((url, row["title"], "hidden"))
+            log.info(f"add-links: hidden: {(row['title'] or url)[:60]}")
             continue
         host = (urlparse(url).hostname or "").replace("www.", "")
         title, desc, text_, status, http_status, image, chars, pub, channel = "", "", "", "FAILED", None, None, 0, None, ""
@@ -1198,14 +1231,18 @@ def add_links(con, pairs, via="run"):
             title = (row["title"] if row and row["title"] else "") or \
                 re.sub(r"[-_]+", " ", urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]).strip() or url
         publisher = channel or ({"youtube": "YouTube", "youtu": "YouTube", "facebook": "Facebook", "x": "X", "twitter": "X"}.get(host.split(".")[0], host.split(".")[0].title()) if host else "Link")
-        payload = json.dumps({"manual": True, "category": cat, "sentiment": sent, "added_at": ts, "via": via})
+        payload = json.dumps({"manual": True, "category": cat, "sentiment": sent, "added_at": ts, "via": via}
+                             if not hide else {"manual": True, "category": "hidden", "hidden_at": ts, "via": via}, ensure_ascii=False)
         if row:
+            # collected earlier, handed in now: kept, and -- unless this is an on-page move,
+            # which only re-files -- given today as its day on the page (manual_at), so an
+            # article from last week the office wants shown is shown now, for the window
             con.execute("""UPDATE items SET manual=1, band='AUTO_KEEP', score=max(coalesce(score,0), ?), rules_at=coalesce(rules_at, ?),
                            raw_payload=?, description=CASE WHEN coalesce(description,'')='' THEN ? ELSE description END WHERE id=?""",
                         (keep, ts, payload, desc, row["id"]))
             if not via.startswith("move"):                 # a move re-files a card; it does not re-send it
                 try:
-                    con.execute("UPDATE items SET digested_at=NULL WHERE id=?", (row["id"],))   # back into the next brief
+                    con.execute("UPDATE items SET digested_at=NULL, manual_at=coalesce(nullif(manual_at, ''), ?) WHERE id=?", (ts, row["id"]))   # back into the next brief
                 except sqlite3.OperationalError:
                     pass
             out.append((url, title, "kept"))
@@ -1214,17 +1251,18 @@ def add_links(con, pairs, via="run"):
             con.execute("""INSERT INTO items (item_key, source_id, feed_url, link, title, description, publisher, published_raw,
                                    published_at, discovered_at, language, raw_payload, resolve_status, resolved_url,
                                    extract_status, extract_host, extract_http, extract_chars, extract_text, extract_attempts,
-                                   image_url, canonical_key, score, band, urgent, matched_terms, target_tags, rules_at, manual)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RESOLVED',?,?,?,?,?,?,1,?,?,?,'AUTO_KEEP',0,?,?,?,1)""",
+                                   image_url, canonical_key, score, band, urgent, matched_terms, target_tags, rules_at, manual, manual_at, hidden)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RESOLVED',?,?,?,?,?,?,1,?,?,?,'AUTO_KEEP',0,?,?,?,1,?,?)""",
                         (key, MANUAL_SOURCE[0], "", url, title, desc, publisher, pub or "", ts, ts, "ta" if re.search(r"[\u0B80-\u0BFF]", title) else "en",
                          payload, url, status, host, http_status, chars, text_ or None, image, ckey, keep,
-                         json.dumps(["📌added by the office"], ensure_ascii=False), json.dumps([cat] if cat in ("constituency", "district", "portfolio") else []), ts))
-            out.append((url, title, "added"))
-            log.info(f"add-links: {status:<6} {chars:>6}ch  {title[:70]}")
+                         json.dumps(["📌added by the office"], ensure_ascii=False), json.dumps([cat] if cat in ("constituency", "district", "portfolio") else []), ts,
+                         ts, 1 if hide else 0))
+            out.append((url, title, "hidden" if hide else "added"))
+            log.info(f"add-links: {'hidden' if hide else status:<6} {chars:>6}ch  {title[:70]}")
     con.commit()
     n = sum(1 for _, _, o in out if o != "already")
     if out:
-        log.info(f"add-links ({via}): {n} stored or re-filed, {len(out) - n} unchanged")
+        log.info(f"add-links ({call_via}): {n} stored, re-filed or hidden, {len(out) - n} unchanged")
     _note_added(n)
     return out
 
@@ -1253,47 +1291,79 @@ def cmd_add_urls(text):
     return len(add_links(con, pairs, via="workflow"))
 
 
-def cmd_sheet_links(url):
-    """The sheet's 'Add links' tab, published as CSV: columns url (required), category
-    (optional). Every run takes the rows it has not seen; a row already handed in is left
-    alone, so the sheet can keep growing as a log of what the office added."""
-    if alerts is None or rules is None or not url:
-        return 0
+def parse_links_csv(text):
+    """Rows of the 'Add links' tab, in sheet order: (url, category, sentiment, kind) with
+    kind 'sheet' for a row the office typed and 'move' for one the page wrote itself
+    ("on-page move: ..." / "on-page hide: ..."). Returns None when it is not that tab."""
     import csv
     import io
+    reader = csv.DictReader(io.StringIO(text))
+    fields = {(f or "").strip().lower().replace(" ", "_"): f for f in (reader.fieldnames or [])}
+    if "url" not in fields and "link" not in fields:
+        return None
+    col = fields.get("url") or fields.get("link")
+    rows = []
+    for row in reader:
+        raw = (row.get(col) or "").strip()
+        m = _URL_RE.search(raw)
+        if not m:
+            continue
+        cat = (row.get(fields.get("category", ""), "") or row.get(fields.get("section", ""), "") or "").strip().lower()
+        cat = "hidden" if cat in _HIDE else "restore" if cat in _RESTORE else cat
+        sent = (row.get(fields.get("sentiment", ""), "") or "").strip().lower()
+        sent = sent if sent in _SENTS else _SENT_ALIAS.get(sent)
+        note = (row.get(fields.get("note", ""), "") or "").strip().lower()
+        rows.append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS or cat in ("hidden", "restore") else None, sent,
+                     "move" if note.startswith("on-page") else "sheet"))
+    return rows
+
+
+def apply_sheet_rows(con, rows):
+    """Each row of the tab is acted on ONCE, in sheet order. The tab only ever grows (the
+    page appends its moves and hides below the office's own rows), so per link the number
+    of rows already handled is remembered (runtime 'sheet_seen'); only rows beyond that
+    count are new. That is what lets 'hide' and a later 'restore' for the same link both
+    stand, instead of the oldest row re-applying itself every half hour."""
+    seen = alerts._j(rt_get(con, "sheet_seen"), {}) or {}
+    per = {}
+    for r in rows:
+        per.setdefault(r[0], []).append(r)
+    todo = []
+    for url, lst in per.items():
+        done = int(seen.get(url, 0) or 0)
+        if done > len(lst):                           # rows were deleted by hand: start again from what is there
+            done = 0
+        todo += lst[done:]
+    out = add_links(con, [(u, c, s_, k) for u, c, s_, k in todo], via="sheet") if todo else []
+    rt_set(con, "sheet_seen", json.dumps({u: len(lst) for u, lst in per.items()}))
+    con.commit()
+    return sum(1 for _, _, o in out if o != "already")
+
+
+def cmd_sheet_links(url):
+    """The sheet's 'Add links' tab, published as CSV: columns url (required), category,
+    sentiment, note (optional). New rows are taken in; the tab can keep growing as a log of
+    what the office added, moved and hid."""
+    if alerts is None or rules is None or not url:
+        return 0
     try:
         with httpx.Client(timeout=20.0, follow_redirects=True, headers={"User-Agent": UA}) as c:
             r = c.get(url)
         if r.status_code != 200 or "<html" in r.text[:500].lower():
             log.warning(f"links sheet: HTTP {r.status_code} or not CSV -- is the tab published as CSV?")
             return 0
-        reader = csv.DictReader(io.StringIO(r.content.decode("utf-8-sig", errors="replace")))
-        fields = {(f or "").strip().lower().replace(" ", "_"): f for f in (reader.fieldnames or [])}
-        if "url" not in fields and "link" not in fields:
-            log.warning(f"links sheet: no 'url' column (got {reader.fieldnames})")
+        rows = parse_links_csv(r.content.decode("utf-8-sig", errors="replace"))
+        if rows is None:
+            log.warning("links sheet: no 'url' column -- is this the Add links tab?")
             return 0
-        col = fields.get("url") or fields.get("link")
-        pairs, moves = [], []
-        for row in reader:
-            raw = (row.get(col) or "").strip()
-            m = _URL_RE.search(raw)
-            if not m:
-                continue
-            cat = (row.get(fields.get("category", ""), "") or row.get(fields.get("section", ""), "") or "").strip().lower()
-            sent = (row.get(fields.get("sentiment", ""), "") or "").strip().lower()
-            sent = sent if sent in _SENTS else _SENT_ALIAS.get(sent)
-            note = (row.get(fields.get("note", ""), "") or "").strip().lower()
-            (moves if note.startswith("on-page move") else pairs).append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS else None, sent))
     except Exception as ex:
         log.warning(f"links sheet: {type(ex).__name__}: {str(ex)[:80]}")
         return 0
-    if not pairs and not moves:
+    if not rows:
         return 0
     con = connect()
     alerts.migrate(con)
-    out = add_links(con, pairs, via="sheet") if pairs else []
-    out += add_links(con, moves, via="move") if moves else []
-    return sum(1 for _, _, o in out if o != "already")
+    return apply_sheet_rows(con, rows)
 
 
 def inbox_message(msg, chat_id, allowed):
@@ -1308,9 +1378,10 @@ def inbox_message(msg, chat_id, allowed):
     private = chat.get("type") == "private"
     ok = (str(chat.get("id")) == str(chat_id)) or (private and sender in allowed)
     pairs = parse_manual(text)
-    tag = re.search(r"#(mention|constituency|district|portfolio|political|opportunity|velachery|thiruvallur)\b", text.lower())
+    tag = re.search(r"#(mention|constituency|district|portfolio|political|opportunity|velachery|thiruvallur|hide|hidden|remove|delete|restore|unhide)\b", text.lower())
     stag = re.search(r"#(positive|neutral|critical|negative|good|bad)\b", text.lower())
-    cat = {"velachery": "constituency", "thiruvallur": "district"}.get(tag.group(1), tag.group(1)) if tag else None
+    cat = {"velachery": "constituency", "thiruvallur": "district", "hide": "hidden", "remove": "hidden", "delete": "hidden",
+           "unhide": "restore"}.get(tag.group(1), tag.group(1)) if tag else None
     sent = (_SENT_ALIAS.get(stag.group(1)) or stag.group(1)) if stag else None
     pairs = [(u, c_ or cat, s_ or sent) for u, c_, s_ in pairs]
     return text, private, ok, pairs
@@ -1355,14 +1426,15 @@ def cmd_telegram_inbox(token, chat_id, admin_ids):
                         c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text":
                                "Send me a news or video link. Add #mention, #velachery, #district, #portfolio, #political or "
                                "#opportunity to pick the section, #positive or #critical for the tag. It is on the page within "
-                               "about half an hour and in the next brief."})
+                               "about half an hour and in the next brief. A link with #hide takes that story off the page."})
                     continue
                 if not ok:
                     continue
                 out = add_links(con, pairs, via=f"telegram:{sender or chat.get('id')}")
                 total += sum(1 for _, _, o in out if o != "already")
                 if private:
-                    lines = [("✅ " if o == "added" else "📎 " if o == "kept" else "↩️ ") + (t_[:80] or u) + ("" if o != "already" else " (already in)") for u, t_, o in out]
+                    mark = {"added": "✅ ", "kept": "📎 ", "hidden": "🚫 hidden: ", "restored": "♻️ back on the page: ", "updated": "🏷️ re-filed: "}
+                    lines = [mark.get(o, "↩️ ") + (t_[:80] or u) + ("" if o != "already" else " (already in)") for u, t_, o in out]
                     c.post(f"{api}/sendMessage", json={"chat_id": chat["id"], "text": "\n".join(lines)[:3900], "disable_web_page_preview": True})
             rt_set(con, "tg_inbox_offset", offset)
             con.commit()
@@ -1574,16 +1646,22 @@ def cmd_prune(days):
     con = connect()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     before = DB.stat().st_size / 1e6
-    old = "SELECT id FROM items WHERE discovered_at < ?"
+    # Links the office handed in -- and stories it hid -- are kept for good. Their rows are
+    # the only memory that a sheet row or a re-served story was dealt with before: the day
+    # one was pruned, the sheet row came back as brand-new news (18 Oct links, 9 Nov page).
+    old = "SELECT id FROM items WHERE discovered_at < ? AND coalesce(manual, 0) = 0 AND coalesce(hidden, 0) = 0"
     n = con.execute(f"SELECT count(*) FROM ({old})", (cutoff,)).fetchone()[0]
+    kept = con.execute("SELECT count(*) FROM items WHERE discovered_at < ? AND (coalesce(manual, 0) = 1 OR coalesce(hidden, 0) = 1)",
+                       (cutoff,)).fetchone()[0]
     for table, col in (("attempts", "item_id"), ("failed_html", "item_id"), ("alert_queue", "item_id")):
         try:
             con.execute(f"DELETE FROM {table} WHERE {col} IN ({old})", (cutoff,))
         except sqlite3.OperationalError:
             pass                                    # table not created yet
     try:
-        con.execute("DELETE FROM events WHERE event_id IN (SELECT event_id FROM items WHERE discovered_at < ?)"
-                    " AND event_id NOT IN (SELECT event_id FROM items WHERE discovered_at >= ? AND event_id IS NOT NULL)",
+        con.execute(f"DELETE FROM events WHERE event_id IN (SELECT event_id FROM items WHERE id IN ({old}))"
+                    " AND event_id NOT IN (SELECT event_id FROM items WHERE (discovered_at >= ? OR coalesce(manual, 0) = 1"
+                    " OR coalesce(hidden, 0) = 1) AND event_id IS NOT NULL)",
                     (cutoff, cutoff))
     except sqlite3.OperationalError:
         pass
@@ -1595,7 +1673,8 @@ def cmd_prune(days):
     con.execute("VACUUM")
     con.close()
     after = DB.stat().st_size / 1e6
-    log.info(f"prune: forgot {n} items older than {days} days; db {before:.1f} MB -> {after:.1f} MB")
+    log.info(f"prune: forgot {n} items older than {days} days ({kept} handed-in or hidden items kept for good); "
+             f"db {before:.1f} MB -> {after:.1f} MB")
 
 
 def queue_depth(con):

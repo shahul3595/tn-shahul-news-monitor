@@ -76,7 +76,7 @@ WEB_WINDOW_H = 24             # the web page is a rolling edition of everything 
 RERUN_SIM = 0.8               # a headline or body this close to one covered the day before is a re-run
 WEB_PER_CATEGORY = 10         # web page: 10 per category first, then fill to WEB_MAX (60)
 WINDOW_CAP_H = 48             # never look further back than this, even on the first send
-AI_MAX_CALLS_PER_DAY = 1200     # a normal day uses ~10-15: ranking, one cluster and one summary per edition
+AI_MAX_CALLS_PER_DAY = 80     # a normal day uses ~10-15: ranking, one cluster and one summary per edition
 AI_BATCH = 60                 # items per Gemini call (~25k tokens with Tamil)
 AI_PAUSE_S = 4.0              # free tier is per-minute limited
 AI_TIME_BUDGET_S = 420        # after this, the rest is ranked by the rules
@@ -91,7 +91,8 @@ SCHEMA = [
     "status TEXT, candidates INTEGER, chosen INTEGER, ai_calls INTEGER, message_ids TEXT, body TEXT)",
 ]
 ITEM_COLUMNS = [("digested_at", "TEXT"), ("digest_id", "INTEGER"), ("ai_sentiment", "TEXT"),
-                ("ai_impact", "INTEGER"), ("story_key", "TEXT"), ("ai_takeaways", "TEXT"), ("manual", "INTEGER DEFAULT 0")]
+                ("ai_impact", "INTEGER"), ("story_key", "TEXT"), ("ai_takeaways", "TEXT"), ("manual", "INTEGER DEFAULT 0"),
+                ("manual_at", "TEXT"), ("hidden", "INTEGER DEFAULT 0")]
 SENTIMENTS = ("positive", "neutral", "critical")
 
 
@@ -170,20 +171,26 @@ def slot_for(now):
 # 1. candidates
 # --------------------------------------------------------------------------
 
+# An item's day: when the office handed it in (manual_at) if it did, else when it was
+# published. So a link handed in today for last week's article is today's news, once, and
+# a story's publication date is never rewritten to make that happen.
+WHEN_SQL = "coalesce(nullif(i.manual_at, ''), i.published_at, i.discovered_at)"
+
 CAND_SQL = """
 SELECT i.id, i.title, i.description, i.publisher, i.published_at, i.discovered_at, i.rules_at,
        i.resolve_status, i.resolved_url, i.link, i.extract_host, i.extract_status, i.extract_text,
        i.score, i.band, i.urgent, i.target_tags, i.matched_terms, i.event_id,
        i.ai_category, i.ai_priority, i.ai_reason, i.ai_processed_at, i.image_url,
        i.ai_sentiment, i.ai_impact, i.story_key, i.ai_takeaways, coalesce(i.manual, 0) AS manual,
+       coalesce(i.hidden, 0) AS hidden, nullif(i.manual_at, '') AS manual_at,
        CASE WHEN i.raw_payload LIKE '%youtube_api%' THEN i.raw_payload END AS yt_payload,
        CASE WHEN coalesce(i.manual, 0) = 1 THEN i.raw_payload END AS manual_payload,
        s.name AS source_name
 FROM items i LEFT JOIN sources s ON s.source_id = i.source_id
 WHERE {scope}
-  AND i.rules_at IS NOT NULL AND i.rules_at >= ?
+  AND i.rules_at IS NOT NULL AND coalesce(nullif(i.manual_at, ''), i.rules_at) >= ?
   AND (i.band IN ('AUTO_KEEP', 'AI', 'KEYWORD_KEEP') OR i.urgent = 1)
-  AND coalesce(i.published_at, i.discovered_at) >= ?
+  AND """ + WHEN_SQL + """ >= ?
 ORDER BY i.id
 """
 
@@ -267,6 +274,11 @@ def _load(con, scope, since, pub_since):
     reps = _merge(cands, lambda a, b: (a["event_id"] is not None and a["event_id"] == b["event_id"])
                   or (len(a["ntitle"]) >= 12 and a["ntitle"] == b["ntitle"])
                   or (len(a["ntitle"]) >= 30 and len(b["ntitle"]) >= 30 and (a["ntitle"] in b["ntitle"] or b["ntitle"] in a["ntitle"])))
+    # A story the office hid is gone with every report of it -- the merge above has already
+    # gathered them, so the other outlets' copies cannot come back as a card of their own.
+    hidden = {r["id"] for r in rows if r["hidden"]}
+    if hidden:
+        reps = [r for r in reps if not (set(r.get("merged") or [r["id"]]) & hidden)]
     return reps, [r["id"] for r in rows]
 
 
@@ -980,6 +992,9 @@ def _place_manual(c):
     """A link the office handed in is shown whatever the verdict: in the category it asked
     for ('url | district'), else Gemini's, else the rules', else the 📌 section."""
     asked = alerts._j(c.get("manual_payload"), {}) or {}
+    if c.get("hidden") or asked.get("category") == "hidden":
+        c["category"] = "none"                       # belt and braces: _load has already dropped it
+        return
     if asked.get("category") in AI_CATEGORIES:
         c["category"] = asked["category"]
     elif c.get("category") in (None, "none", "added"):
