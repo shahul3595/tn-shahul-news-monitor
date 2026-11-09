@@ -99,7 +99,9 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .month{margin:10px 0 4px;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim)}.arow{display:flex;align-items:center;gap:8px;min-height:44px;border-top:1px solid var(--line)}.arow b{flex:1;font-weight:500}.arow button{font:inherit;font-size:13px;min-height:36px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);padding:4px 10px;cursor:pointer}
 .architems{max-height:60vh;overflow:auto;font-size:14px}.architems div{padding:6px 0;border-top:1px solid var(--line)}.architems a{color:var(--ink);text-decoration:none}.architems small{color:var(--dim)}.architems .dim{opacity:.6}.drawer label.opt{display:flex;align-items:center;gap:8px;min-height:44px;padding:0 8px;font-size:15px;cursor:pointer}.drawer label.opt input{width:20px;height:20px;accent-color:var(--accent)}
 #top{position:fixed;right:16px;bottom:16px;display:none;z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.2)}#top.on{display:inline-flex}
-.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30}
+.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-size:14px;z-index:30;display:flex;align-items:center;gap:12px;width:max-content;max-width:calc(100vw - 32px);text-align:left}
+.toast button{background:transparent;border:1px solid var(--bg);color:var(--bg);border-radius:999px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;min-height:32px;white-space:nowrap}
+.acts button.hide{color:var(--crit)}
 .empty{color:var(--dim);padding:20px 0}footer{color:var(--dim);font-size:13px;border-top:1px solid var(--line);padding-top:12px}
 @media(max-width:600px){.grid{grid-template-columns:1fr}header h1{font-size:17px}.dash td,.dash th{padding:5px 4px}.mlab{display:none}.matrix{min-width:520px}}
 
@@ -113,6 +115,12 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 .meter{height:8px;background:var(--chip);border-radius:4px;overflow:hidden;margin:8px 0}.meter i{display:block;height:100%;background:var(--accent)}
 .runs .row span:first-child{flex:1}.runs a{color:var(--accent);text-decoration:none}.ok{color:var(--pos)}.bad{color:var(--crit)}.run{color:var(--dim)}
 .refused{font-size:13px;color:var(--dim)}.refused li{margin:4px 0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:4px 0 10px}.tile{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}.tile b{display:block;font-size:24px;line-height:1.1}.tile span{font-size:12px;color:var(--dim)}
+.days{display:flex;gap:6px;align-items:flex-end;height:64px;margin:6px 0 12px}.days div{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;font-size:11px;color:var(--dim);height:100%}.days i{display:block;width:100%;max-width:40px;background:var(--accent);border-radius:4px 4px 0 0;min-height:2px}
+#va-table{min-width:620px}#m-table{min-width:640px}#va-table td:first-child,#va-table td.ip,#va-table td:nth-child(4){white-space:nowrap}
+#va-table td,#va-table th,#m-table td,#m-table th{padding:5px 6px;border-top:1px solid var(--line);text-align:left;vertical-align:top}#va-table th,#m-table th{border-top:0;color:var(--dim);font-weight:500;font-size:12px}#va-table td.ip{font-family:monospace;font-size:12px}
+.kcard details{font-size:13px;color:var(--dim);margin-top:8px}.kcard summary{cursor:pointer;min-height:36px;display:flex;align-items:center}.kcard code{background:var(--chip);padding:1px 5px;border-radius:4px}
+.rowact{font:inherit;font-size:12px;min-height:32px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--ink);padding:2px 10px;cursor:pointer;white-space:nowrap}
 </style></head><body><div class="wrap">
 <header><div style="flex:1"><h1 id="title">System status</h1><div class="sub" id="sub">private page</div></div><a class="btn" href="index.html">← Brief</a></header>
 <div class="lock" id="lock"><h2 style="margin:0 0 4px">Enter the PIN</h2><p class="sub" style="margin:0">Nothing loads until the PIN is right.</p>
@@ -128,10 +136,17 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 <div class="kcard"><h2>Reader feedback</h2><div id="fb"></div></div>
 <div class="kcard" style="grid-column:1/-1"><h2>📌 Manually added stories</h2><div id="m-conn" class="row"></div>
 <div class="row" style="display:block"><b>On-page moves</b> — once the token below is saved in the feedback script (Project Settings → Script properties → <code>MOVE_TOKEN</code>), every card on the brief page shows <b>🏷️ Move</b> for this browser session. <span id="m-tok" style="font-family:monospace;word-break:break-all"></span> <button type="button" class="btn sm" id="m-copy">Copy token</button> <a class="btn sm" href="index.html">Open the brief with Move on ↗</a></div>
-<div class="mwrap"><table id="m-table" style="width:100%;font-size:13px"><thead><tr><th style="text-align:left">Story</th><th>Section</th><th>Tag</th><th>Added</th><th>Via</th></tr></thead><tbody></tbody></table></div></div>
+<div class="mwrap"><table id="m-table" style="width:100%;font-size:13px"><thead><tr><th>Story</th><th>Section</th><th>Tag</th><th>Added / hidden</th><th>Via</th><th></th></tr></thead><tbody></tbody></table></div>
+<p class="hint" id="m-hint">🗑 on any card of the brief page (with Move on) hides that story for every reader after the next run; <b>Restore</b> here brings one back. <span id="m-hidden"></span></p></div>
+<div class="kcard" style="grid-column:1/-1" id="va-card"><h2>📊 Visitor analytics <small id="va-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2>
+<div class="tiles" id="va-tiles"></div><div class="days" id="va-days" hidden></div>
+<div class="mwrap"><table id="va-table" style="width:100%;font-size:13px"><thead><tr><th>When (IST)</th><th>IP</th><th>Location</th><th>Device</th><th>Page</th></tr></thead><tbody></tbody></table></div>
+<details id="va-setup"><summary>Setup &amp; token</summary><p>Visits are logged by a small function in front of the page (<code>functions/</code> in the repository) into a <b>Visits</b> tab of the sheet, through the feedback script. It needs this token in two places: the feedback script's properties as <code>VISIT_TOKEN</code>, and the site host's environment variables as <code>VISIT_TOKEN</code> (with <code>FEEDBACK_URL</code>). The README has the click-by-click steps.</p>
+<p><span id="va-tok" style="font-family:monospace;word-break:break-all"></span> <button type="button" class="btn sm" id="va-copy">Copy token</button></p>
+<p>Counts leave out crawlers, link previews and this page's own opens. A "visitor" is one address + one browser; phone networks share addresses, so that is a floor, not a census. Rows older than 90 days are trimmed.</p></details></div>
 <div class="kcard runs" id="runs-card"><h2>Recent runs <small id="runs-note" style="font-weight:400;text-transform:none;letter-spacing:0"></small></h2><div id="runs">–</div></div>
 </div><p class="hint" id="gen"></p></div>
-<script id="sealed" type="application/json">{"v": 1, "iters": 120000, "salt": "102vhAcnclYoTwyeBMCOiQ==", "nonce": "rCjT98Ahh6jQ5So2gp/VeQ==", "ct": "pVnbMoHDRFGwaBij6VMQC/VqmAIrwCi305ih/KbfrPYnohWm/hOByseqjvK13Lw4pK1FxC2E4uCdRF0MEj64p+w8kQOfE7BB0NUXTxa+aJl3rSNdNwWeZpkfIs7vZfLEAzsZ/HBWuZ6Uti+1VuNOQiYCNOUPnHSLSWKIE1RewdbVaTcOf2y/CmYwB/9rlKtwpufzDf9yCQCXewLANLkPr2K5uMfjt3zv+febhDASnvudr7UEIEKToO+1FMHfLfy9BD3tUH6mDKmTVFMX5sC1BTdlri7la/jyF3XUFqW9LPFyFECX9rL/ICkBQTJgNjZGDq6nbunRCw==", "tag": "vnOBXcZnEuvw16mY/rEEt2xg4iu/y+h3cAnvH50gE1g="}</script>
+<script id="sealed" type="application/json">{"v": 1, "iters": 120000, "salt": "AYhv+PmWEg+o9D+tXenl7w==", "nonce": "nFvpRTBnW/NJxtImpOZpDg==", "ct": "LVnxS0Dk6Xur9uD0abtDOq+h+ShOwcJKnO2BabZFwP6qEp4Z9Spgbk5zzdXqXcM6m+7FvHZZoMkzxqdGWly95VcZtI2PVv+5xjcIb9CwV6yTRi0y8gSTaf5TIpnMLiXxk0co75TzhNNI1Mm15NsgHT4z12rSRUMkM7GZQSg/B6M+lYKisnu8KwTczYZJ3zJKeES/n7dzHHzdFZx6CpTvxqvTifZdRdr7H1iIvtLLwfeVRVVxtvezZ4oVX7SVunl0S14x1vnV7ef+ijHTW9Da3k+9ZUv2cZmVGMBiulLFiVjGRRQ+SGO9VFCRF/UvEtZW5XbpmMxfoPUxuwJQ8ZHnQmRoc/XFg5t3Mb42TtB0DFKvcwCq9ldHcPP6Trio1Je+TithiBMam/6YESi9DTvQqFpUy9W23oI6BqOBHl7v1GjdlD/D9ufaUj+tB7YIGWVV9cZrVA1ge9XkBPZfNL66aIU2Ggbpj+0l6zm6wehi2aSa9b7ju2ilUc1HUhkKNpwcHv2Aco8n3gSpPblS4/AC", "tag": "mrKYA0EZLsA4Fs7Wydrq8Tx+sZtwgFIdZebak3XccVg="}</script>
 <script>
 (function(){
 var S=JSON.parse(document.getElementById('sealed').textContent),$=function(s){return document.querySelector(s)};
@@ -152,9 +167,17 @@ async function open(pin){
  return JSON.parse(new TextDecoder().decode(out))}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 var CAT={mention:'🗣 Mentions',constituency:'📍 Velachery',district:'🏛 Thiruvallur',portfolio:'💻 AI / IT',political:'🏳 Political',opportunity:'🎯 Opportunities',added:'📌 Added'},SENT={positive:'🟢 Positive',neutral:'⚪ Neutral',critical:'🔴 Critical'};
+var CFG=null;
+function post(p){if(!CFG||!CFG.feedback)return false;var tok='';try{tok=sessionStorage.getItem('movetoken')||''}catch(e){}p.token=tok;p.page='admin';fetch(CFG.feedback,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){});return true}
 function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.editions||{},r=st.grouping||{},fb=st.feedback||{},m=st.manual||{};
  $('#m-conn').innerHTML='<span>Links sheet</span><span>'+(m.sheet?'<span class="ok">connected</span>':'not configured (MANUAL_LINKS_CSV_URL)')+' · bot '+(m.bot?'<span class="ok">on</span>':'off (TELEGRAM_ADMIN_IDS)')+'</span>';
- $('#m-table tbody').innerHTML=(m.recent||[]).map(function(x){return '<tr><td style="text-align:left"><a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.title||x.url)+'</a><br><small class="run">'+esc(x.outlet)+'</small></td><td>'+esc(CAT[x.cat]||x.cat)+(x.moved?' ✎':'')+'</td><td>'+esc(SENT[x.sentiment]||x.sentiment)+'</td><td>'+esc(x.added)+'</td><td>'+esc(x.via)+'</td></tr>'}).join('')||'<tr><td colspan="5" class="run">none yet</td></tr>';
+ $('#m-hidden').textContent=m.hidden?m.hidden+' hidden in all.':'';
+ $('#m-table tbody').innerHTML=(m.recent||[]).map(function(x,i){var act=x.hidden?'<button type="button" class="rowact" data-i="'+i+'" data-act="restore">♻️ Restore</button>':'<button type="button" class="rowact" data-i="'+i+'" data-act="hide">🚫 Hide</button>';
+  return '<tr'+(x.hidden?' style="opacity:.7"':'')+'><td><a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.title||x.url)+'</a><br><small class="run">'+esc(x.outlet)+'</small></td><td>'+(x.hidden?'🚫 Hidden'+(x.from&&CAT[x.from]?'<br><small class="run">was '+esc(CAT[x.from])+'</small>':''):esc(CAT[x.cat]||x.cat)+(x.moved?' ✎':''))+'</td><td>'+(x.hidden?'':esc(SENT[x.sentiment]||x.sentiment))+'</td><td>'+esc(x.added)+'</td><td>'+esc(x.via)+'</td><td>'+(CFG&&CFG.feedback?act:'')+'</td></tr>'}).join('')||'<tr><td colspan="6" class="run">none yet</td></tr>';
+ Array.prototype.forEach.call(document.querySelectorAll('#m-table .rowact'),function(bt){bt.onclick=function(){var x=(m.recent||[])[+bt.getAttribute('data-i')],hide=bt.getAttribute('data-act')==='hide';if(!x)return;
+  if(hide&&!confirm('Hide this story from the page for every reader?\n\n'+(x.title||x.url)))return;
+  var back=x.from&&CAT[x.from]&&x.from!=='added'?x.from:'restore';
+  if(post({type:'move',url:x.url,id:x.id,title:x.title,category:hide?'hidden':back,sentiment:''})){bt.disabled=true;bt.textContent=hide?'queued: hidden after the next run':'queued: back after the next run'}}});
  $('#g-calls').textContent=g.calls_today;$('#g-limit').textContent=g.limit;$('#g-bar').style.width=Math.min(100,100*g.calls_today/(g.limit||80))+'%';
  var p=$('#g-state');p.textContent=(g.state||'').replace(/^./,function(x){return x.toUpperCase()});p.className='pill '+g.state;$('#g-model').textContent=g.model||'';
  if(g.note){$('#g-note-row').hidden=false;$('#g-note').textContent=g.note}
@@ -173,16 +196,30 @@ async function runs(cfg){if(!cfg.runs){$('#runs-card').hidden=true;return}
   $('#runs').innerHTML=(j.workflow_runs||[]).map(function(x){var ok=x.conclusion==='success',live=x.status!=='completed';var when=new Date(x.updated_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
    return '<div class="row"><span>'+(live?'<span class="run">⏳</span>':ok?'<span class="ok">✅</span>':'<span class="bad">❌</span>')+' '+esc(x.name)+'</span><span>'+esc(when)+' · <a href="'+esc(cfg.web+x.id)+'" target="_blank" rel="noopener">log ↗</a></span></div>'}).join('')||'no runs yet';
   $('#runs-note').textContent='· live'}catch(e){$('#runs').innerHTML='<span class="bad">could not reach the run list ('+esc(e.message)+')</span>'}}
-async function moveToken(pin){var b=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode('move:'+pin)));return Array.prototype.map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join('').slice(0,40)}
-async function unlocked(cfg){$('#lock').hidden=true;$('#panel').hidden=false;
- var tok='';try{tok=sessionStorage.getItem('movetoken')||''}catch(e){}$('#m-tok').textContent=tok||'(unlock with the PIN to see the token)';
+async function token(kind,pin){var b=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(kind+':'+pin)));return Array.prototype.map.call(b,function(x){return ('0'+x.toString(16)).slice(-2)}).join('').slice(0,40)}
+function ist(s){try{return new Date(s).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}catch(e){return s}}
+async function visits(cfg){var vt='';try{vt=sessionStorage.getItem('visittoken')||''}catch(e){}var note=$('#va-note'),tiles=$('#va-tiles'),tb=$('#va-table tbody');
+ if(!cfg.visits||!vt){note.textContent='· unlock with the PIN';return}
+ try{var r=await fetch(cfg.visits+'?t='+encodeURIComponent(vt)+'&limit=100',{cache:'no-store'});
+  if(r.status===404){note.innerHTML='· <span class="bad">not set up yet</span> — the functions folder is not deployed in front of the page (see Setup below)';$('#va-setup').open=true;return}
+  if(r.status===403){note.innerHTML='· <span class="bad">token mismatch</span> — VISIT_TOKEN in the host’s variables is not this token';$('#va-setup').open=true;return}
+  if(!r.ok)throw new Error('HTTP '+r.status);var j=await r.json();if(j.error){note.innerHTML='· <span class="bad">'+esc(j.error==='denied'?'token mismatch — VISIT_TOKEN in the feedback script is not this token':j.error)+'</span>';$('#va-setup').open=true;return}
+  var t=j.today||{},w=j.week||{};
+  tiles.innerHTML=[[t.visitors,'visitors today'],[w.visitors,'visitors, 7 days'],[t.views,'page views today'],[w.views,'page views, 7 days'],[w.bots,'crawlers & previews, 7 d'],[w.admin,'this page opened, 7 d']].map(function(x){return '<div class="tile"><b>'+(x[0]==null?'–':x[0])+'</b><span>'+x[1]+'</span></div>'}).join('');
+  var days=j.days||[],mx=Math.max.apply(null,days.map(function(d){return d.views||0}).concat([1]));$('#va-days').hidden=!days.length;
+  $('#va-days').innerHTML=days.map(function(d){return '<div title="'+esc(d.day)+': '+d.views+' views, '+d.visitors+' visitors"><i style="height:'+Math.round(100*(d.views||0)/mx)+'%"></i>'+esc(String(d.day).slice(5))+'</div>'}).join('');
+  tb.innerHTML=(j.recent||[]).map(function(v){return '<tr'+(v.bot||/admin/.test(v.page||'')?' style="opacity:.55"':'')+'><td>'+esc(ist(v.when))+'</td><td class="ip">'+esc(v.ip)+'</td><td>'+esc(v.loc||'–')+'</td><td>'+esc([v.device,v.browser,v.os].filter(Boolean).join(' · '))+(v.bot?' 🤖':'')+'</td><td>'+esc(v.page||'/')+(v.ref?'<br><small class="run">from '+esc(v.ref)+'</small>':'')+'</td></tr>'}).join('')||'<tr><td colspan="5" class="run">no visits logged yet</td></tr>';
+  note.textContent='· live · '+(j.rows||0)+' rows kept'}catch(e){note.innerHTML='· <span class="bad">could not load ('+esc(e.message)+')</span>'}}
+async function unlocked(cfg){CFG=cfg;$('#lock').hidden=true;$('#panel').hidden=false;
+ var tok='',vt='';try{tok=sessionStorage.getItem('movetoken')||'';vt=sessionStorage.getItem('visittoken')||''}catch(e){}$('#m-tok').textContent=tok||'(unlock with the PIN to see the token)';$('#va-tok').textContent=vt||'(unlock with the PIN to see the token)';
  $('#m-copy').onclick=function(){if(!tok)return;navigator.clipboard.writeText(tok).then(function(){$('#m-copy').textContent='Copied'})};
+ $('#va-copy').onclick=function(){if(!vt)return;navigator.clipboard.writeText(vt).then(function(){$('#va-copy').textContent='Copied'})};
  try{var st=await (await fetch(cfg.status,{cache:'no-store'})).json();show(st)}catch(e){$('#gen').textContent='status snapshot not available yet — it is written at each brief'}
- runs(cfg)}
+ visits(cfg);runs(cfg)}
 if(!S){$('#f').hidden=true;$('#err').textContent='Not configured: set the ADMIN_PIN secret and run a brief.'}
 try{var saved=sessionStorage.getItem('admin');if(saved&&S){unlocked(JSON.parse(saved))}}catch(e){}
 $('#f').onsubmit=async function(ev){ev.preventDefault();$('#err').textContent='';var pin=$('#pin').value;if(!pin)return;
  try{var cfg=await open(pin);if(!cfg){$('#err').textContent='Wrong PIN';$('#pin').value='';return}
-  try{sessionStorage.setItem('admin',JSON.stringify(cfg));sessionStorage.setItem('movetoken',await moveToken(pin))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
+  try{sessionStorage.setItem('admin',JSON.stringify(cfg));sessionStorage.setItem('movetoken',await token('move',pin));sessionStorage.setItem('visittoken',await token('visits',pin))}catch(e){}unlocked(cfg)}catch(e){$('#err').textContent='This browser cannot unlock the page ('+e.message+')'}};
 })();
 </script></body></html>
