@@ -79,13 +79,18 @@ function doPost(e) {
         return text_("denied");
       }
       var cat = String(d.category || "").slice(0, 20), sent = String(d.sentiment || "").slice(0, 10);
-      if (!d.url || (!cat && !sent)) {
+      var id = String(d.id || "").replace(/\D/g, "").slice(0, 12);
+      var u = String(d.url || "").trim().slice(0, 500);
+      if (!u && id) u = "item:" + id;            // the collector finds the story by its number
+      if (!u || (!cat && !sent)) {
         return text_("ignored");
       }
       var verb = cat === "hidden" ? "hide" : cat === "restore" ? "restore" : "move";
+      var row = [u, cat, sent, "on-page " + verb + (id ? " #" + id : "") + ": " + String(d.title || "").slice(0, 120), new Date()];
+      if (!String(d.url || "").trim()) row.push("page sent no link: " + JSON.stringify(d).slice(0, 300));
       var lk = LockService.getScriptLock();
       lk.waitLock(5000);
-      links_().appendRow([String(d.url).slice(0, 500), cat, sent, "on-page " + verb + ": " + String(d.title || "").slice(0, 120), new Date()]);
+      links_().appendRow(row);
       lk.releaseLock();
       return text_("ok");
     }

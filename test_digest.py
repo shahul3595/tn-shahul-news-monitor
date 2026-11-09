@@ -614,7 +614,7 @@ def archive_status_and_admin_page():
     ed_idx = json.loads((docs / "data" / "index.json").read_text(encoding="utf-8"))
     check(len([e for e in ed_idx["editions"] if e["key"] != "latest"]) == 4 and sum(1 for e in ed_idx["editions"] if e.get("pick")) == 4, "every edition stays and is listed")
     st = json.loads((docs / "data" / "status.json").read_text(encoding="utf-8"))
-    check(st["gemini"]["state"] == "standby" and st["gemini"]["limit"] == 80 and st["feedback"] == {"connected": False}, st["gemini"])
+    check(st["gemini"]["state"] == "standby" and st["gemini"]["limit"] == 450 and st["feedback"] == {"connected": False}, st["gemini"])
     check(st["collector"]["items_24h"] == 1 and st["editions"]["archive_days"] == 1, st["collector"])
     check("github" not in json.dumps(st).lower(), "the snapshot names no host")
     page = (docs / "admin.html").read_text(encoding="utf-8")
@@ -858,6 +858,74 @@ def a_hidden_story_leaves_every_page_and_can_be_restored():
 
 
 @test
+def a_rebuild_that_changes_nothing_a_reader_sees_writes_nothing():
+    """The collector's rebuild commits docs/ and the host builds the site on every commit
+    (500 a month). A rebuild after a sheet read that changed nothing must leave the files
+    untouched; one after a hide, a move or a new link must write."""
+    import collect
+    import web
+    con = make_db("quiet.db")
+    docs = TMP / "docs-quiet"
+    a = add(con, "Con story: Baby Nagar drain work starts")
+    b = add(con, "Dis story: Avadi lake fencing done (+)")
+    g = FakeGemini()
+    env = {"GEMINI_API_KEY": "x", "ADMIN_PIN": "orchid-9981"}
+    web.publish(con, env, T0, g, docs=docs)
+    before = {p.name: p.read_text(encoding="utf-8") for p in (docs / "data").glob("*.json")}
+    before["index.html"] = (docs / "index.html").read_text(encoding="utf-8")
+    before["admin.html"] = (docs / "admin.html").read_text(encoding="utf-8")
+    later = T0 + timedelta(minutes=35)
+    out = web.publish(con, env, later, g, docs=docs, only_if_changed=True)
+    after = {p.name: p.read_text(encoding="utf-8") for p in (docs / "data").glob("*.json")}
+    after["index.html"] = (docs / "index.html").read_text(encoding="utf-8")
+    after["admin.html"] = (docs / "admin.html").read_text(encoding="utf-8")
+    check(out.get("unchanged") and before == after, "same stories 35 minutes later: not one byte written (no timestamp, no re-sealed admin page)")
+    out = web.publish(con, env, later, g, docs=docs)                               # the brief's publish always writes
+    check(not out.get("unchanged") and (docs / "data" / "latest.json").read_text(encoding="utf-8") != before["latest.json"], "the brief itself still refreshes the page")
+    # a move changes what a reader sees -> written
+    url_b = con.execute("SELECT resolved_url FROM items WHERE id=?", (b,)).fetchone()[0]
+    collect.add_links(con, [(url_b, "portfolio", None)], via="move")
+    out = web.publish(con, env, later, g, docs=docs, only_if_changed=True)
+    check(not out.get("unchanged") and any(s["id"] == b and s["cat"] == "portfolio" for s in json.loads((docs / "data" / "latest.json").read_text(encoding="utf-8"))["stories"]), "a move is published")
+    # a hide too, even of a story only in an older file
+    url_a = con.execute("SELECT resolved_url FROM items WHERE id=?", (a,)).fetchone()[0]
+    collect.add_links(con, [(url_a, "hidden", None)], via="move")
+    out = web.publish(con, env, later, g, docs=docs, only_if_changed=True)
+    check(not out.get("unchanged") and not any(s["id"] == a for s in json.loads((docs / "data" / "latest.json").read_text(encoding="utf-8"))["stories"]), "a hide is published")
+    out = web.publish(con, env, later + timedelta(minutes=30), g, docs=docs, only_if_changed=True)
+    check(out.get("unchanged"), "and the run after that writes nothing again")
+    # the digest entry point reports it
+    b2 = digest.cmd_pages(con, env, later + timedelta(minutes=40))
+    check(b2.get("unchanged"), "cmd_pages says the page is unchanged")
+    check(digest.quota_day(datetime(2026, 11, 9, 6, 59, tzinfo=timezone.utc)) == "2026-11-08" and digest.quota_day(datetime(2026, 11, 9, 7, 1, tzinfo=timezone.utc)) == "2026-11-09",
+          "the Gemini counter turns over at 07:00 UTC, Google's midnight Pacific")
+    check(digest.AI_MAX_CALLS_PER_DAY == 450 and digest.settings({"DIGEST_AI_MAX_CALLS": "1200"})["ai_calls"] == 1200 and "DIGEST_AI_MAX_CALLS" in collect.SHEET_SETTINGS,
+          "the cap is 450 by default and settable from the Settings tab")
+    page = (docs / "index.html").read_text(encoding="utf-8")
+    check("localStorage.getItem('sum')==='open'" in page and "sumOpen:false" in page, "the briefing starts folded unless the reader opened it")
+
+
+@test
+def a_hide_without_a_link_still_finds_the_story():
+    """If the page ever posts a hide with no link, the row carries the story's number
+    (item:N in the url cell, #N in the note) and the collector hides by number."""
+    import collect
+    con = make_db("byid.db")
+    a = add(con, "Con story: Baby Nagar drain work starts")
+    b = add(con, "Dis story: Avadi lake fencing done (+)")
+    rows = collect.parse_links_csv("url,category,sentiment,note,added\n" + f"item:{a},hidden,,on-page hide #{a}: Baby Nagar,2026-11-09 09:00:00\n"
+                                   + f",hidden,,on-page hide #{b}: Avadi lake,2026-11-09 09:01:00\n" + ",hidden,,on-page hide: no number at all,\n")
+    check(rows == [(f"item:{a}", "hidden", None, "move"), (f"item:{b}", "hidden", None, "move")], rows)
+    n = collect.apply_sheet_rows(con, rows)
+    check(n == 2 and con.execute("SELECT count(*) FROM items WHERE hidden=1").fetchone()[0] == 2, f"both hidden by number ({n})")
+    out = collect.add_links(con, [("item:999999", "hidden", None)], via="move")
+    check(out == [("item:999999", "", "unknown")], out)
+    check(collect.parse_manual(f"item:{a} restore")[0] == (f"item:{a}", "restore", None), "the run box and the bot take item:N too")
+    out = collect.add_links(con, collect.parse_manual(f"item:{a} restore"), via="run")
+    check(out[0][2] == "restored" and con.execute("SELECT hidden FROM items WHERE id=?", (a,)).fetchone()[0] == 0, out)
+
+
+@test
 def summary_is_cached_until_the_top_stories_change():
     import web
     con = make_db("summary.db")
@@ -1011,7 +1079,7 @@ def slot_and_budget():
     check(digest.slot_for(T0) == "morning" and digest.slot_for(T0 + timedelta(hours=11)) == "evening")
     con = make_db("budget.db")
     g = digest.Gemini("key", "m", con, max_calls=1)
-    con.execute("INSERT INTO ai_budget (day, calls, tokens) VALUES (?, 1, 0)", (digest.utcnow().strftime("%Y-%m-%d"),))
+    con.execute("INSERT INTO ai_budget (day, calls, tokens) VALUES (?, 1, 0)", (digest.quota_day(),))
     con.commit()
     check(g.call("prompt", {}, "x") is None and "budget" in g.dead, "daily cap respected")
 

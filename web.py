@@ -245,6 +245,21 @@ def write_edition(docs, ed, label, now):
     return payload
 
 
+def signature(payload):
+    """What a reader would notice: the stories, their section, tag and headline. Timestamps,
+    notes wording and the sealed admin blob are left out, so a rebuild that changes none
+    of this is no change at all."""
+    return sorted((s.get("url") or "", s.get("cat") or "", s.get("sentiment") or "", bool(s.get("urgent")), s.get("title") or "")
+                  for s in (payload or {}).get("stories") or [])
+
+
+def _published_signature(docs, key):
+    try:
+        return signature(json.loads((Path(docs) / "data" / f"{key}.json").read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return None
+
+
 def scrub_hidden(con, docs):
     """Stories the office hid, taken out of every edition file already published (publish
     rebuilds only the last two days) and out of the archive files. Returns files changed."""
@@ -408,7 +423,7 @@ def _feedback_counts(env, now):
 def status_snapshot(con, env, now, editions, brief=None, gemini=None):
     """What the admin page shows. Counts and times only -- nothing that names the host."""
     cfg = digest.settings(env)
-    day = alerts.utcnow().strftime("%Y-%m-%d")          # the budget table is kept by the real clock
+    day = digest.quota_day()                              # the budget table is kept by the real clock, on Google's day
     r = con.execute("SELECT calls FROM ai_budget WHERE day=?", (day,)).fetchone()
     calls = r[0] if r else 0
     dead = gemini.dead if gemini is not None else None
@@ -540,32 +555,47 @@ def write_admin(docs, env):
 # entry points
 # --------------------------------------------------------------------------
 
-def publish(con, env, now, gemini=None, docs=None, days_back=1, brief=None):
+def publish(con, env, now, gemini=None, docs=None, days_back=1, brief=None, only_if_changed=False):
     """Rebuild the latest edition and the dated editions for today and `days_back` earlier
     days (late-arriving stories land on the right day), then the index, the archive, the
-    status snapshot, the page and the admin page."""
+    status snapshot, the page and the admin page.
+
+    only_if_changed (the collector's rebuild after links came in): when no story, section,
+    tag or headline differs from what is already published and nothing was hidden, nothing
+    is written at all -- the host builds the site on every commit, and a commit that only
+    moves a timestamp would spend one of the month's builds for nothing."""
     global DOCS
     docs = Path(docs or DOCS)
     DOCS = docs
     cfg = digest.settings(env)
     migrate(con)
-    out = {}
+    out, payloads = {}, {}
     latest = build(con, env, now, "latest", now - timedelta(hours=cfg["web_hours"]), now + timedelta(hours=1), gemini)
-    latest_payload = write_edition(docs, latest, f"Last {cfg['web_hours']} hours", now)
+    latest_payload = payloads["latest"] = edition_json(latest, f"Last {cfg['web_hours']} hours", now)
     out["latest"] = latest
     today = now.astimezone(IST).date()
     for k in range(days_back + 1):
         day = today - timedelta(days=k)
         since, until = _day_bounds(day)
         ed = build(con, env, now, f"{day:%Y-%m-%d}", since, until, gemini)
-        write_edition(docs, ed, day.strftime("%A %d %B %Y"), now)
+        payloads[ed["key"]] = edition_json(ed, day.strftime("%A %d %B %Y"), now)
         out[f"{day:%Y-%m-%d}"] = ed
     try:
         scrubbed = scrub_hidden(con, docs)
         if scrubbed:
             log.info(f"hidden: {scrubbed} published file(s) scrubbed")
     except Exception:
+        scrubbed = 0
         log.exception("hidden: could not scrub the published files")
+    if only_if_changed and not scrubbed and (docs / "index.html").exists() \
+            and all(signature(pl) == _published_signature(docs, key) for key, pl in payloads.items()):
+        log.info("pages: nothing a reader would notice has changed -- the published page is left as it is")
+        out["unchanged"] = True
+        return out
+    data_dir = docs / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for key, pl in payloads.items():
+        (data_dir / f"{key}.json").write_text(json.dumps(pl, ensure_ascii=False), encoding="utf-8")
     entries = _index(docs / "data", now)
     write_page(docs, latest_payload, entries, cfg["feedback_url"])
     try:
@@ -720,12 +750,12 @@ var NAME={};CATS.forEach(function(c){NAME[c[0]]=c[2]});var SENT={positive:'🟢 
 var REASONS=[['unrelated','Unrelated to constituency / portfolio'],['category','Wrong category'],['old','Duplicate / old'],['spam','Spam / noise']];
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return [].slice.call((r||document).querySelectorAll(s))};
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{},sumOpen:true};
+var state={view:'cards',q:'',cat:'',sent:'',voted:{},notes:true,withNotes:true,selecting:false,sel:{},sumOpen:false};
 var HID={};try{HID=JSON.parse(localStorage.getItem('hid')||'{}')}catch(e){}
 (function(){var cut=Date.now()-72*3600e3,ch=false;Object.keys(HID).forEach(function(k){if(!(HID[k]>cut)){delete HID[k];ch=true}});if(ch)saveHid()})();
 function saveHid(){try{localStorage.setItem('hid',JSON.stringify(HID))}catch(e){}}
 function visible(list){return (list||[]).filter(function(s){return !HID[s.id]&&!(s.merged||[]).some(function(m){return HID[m]})})}
-try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off';state.sumOpen=localStorage.getItem('sum')!=='closed'}catch(e){}
+try{state.view=localStorage.getItem('view')||'cards';state.voted=JSON.parse(localStorage.getItem('voted')||'{}');state.notes=localStorage.getItem('notes')!=='off';state.withNotes=localStorage.getItem('withnotes')!=='off';state.sumOpen=localStorage.getItem('sum')==='open'}catch(e){}
 function waText(s,withNotes){var t='*'+(s.urgent?'🚨 ':'')+s.title+'*\n';if(withNotes&&s.takeaways&&s.takeaways.length)t+='_AI summary_\n'+s.takeaways.map(function(b){return '• '+b}).join('\n')+'\n';return t+'🔗 '+s.url}
 function waLink(text){return 'https://wa.me/?text='+encodeURIComponent(text)}
 function story(id){return DATA.stories.filter(function(x){return String(x.id)===String(id)})[0]}
@@ -767,13 +797,14 @@ function jump(id){var c=$('#story-'+id);if(!c)return;if(c.hidden){state.cat='';s
  c.scrollIntoView({behavior:'smooth',block:'center'});c.classList.remove('flash');void c.offsetWidth;c.classList.add('flash');setTimeout(function(){c.classList.remove('flash')},2600);try{history.replaceState(null,'',location.search+'#story-'+id)}catch(e){}}
 function send(p){if(!FB)return;p.page=DATA.key;p.ua=navigator.userAgent.slice(0,120);fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){})}
 function moveStory(id,cat,sent){var s=story(id);if(!s)return;if(cat){s.cat=cat;s.urgent=false}if(sent)s.sentiment=sent;
- var p={type:'move',url:s.url,id:s.id,title:s.title,category:cat||'',sentiment:sent||'',token:MOVETOK,page:DATA.key};
+ var p={type:'move',url:ref(s),id:s.id,title:s.title,category:cat||'',sentiment:sent||'',token:MOVETOK,page:DATA.key};
  fetch(FB,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(p)}).catch(function(){});
  render();setTimeout(function(){jump(id)},50);toast((cat?'Moved to '+NAME[cat]:'Tagged '+SENT[sent])+' — permanent after the next run')}
+function ref(s){return s.url||((s.reports||[])[0]||{}).url||('item:'+s.id)}
 function hideStory(id){var s=story(id);if(!s)return;if(!confirm('Hide this story from the page?\n\n'+s.title+'\n\nIt goes now on this device, and for every reader after the next run (about half an hour). You can undo for a few seconds, or restore it later from the status page.'))return;
- HID[id]=Date.now();saveHid();send({type:'move',url:s.url,id:s.id,title:s.title,category:'hidden',sentiment:'',token:MOVETOK});render();
+ HID[id]=Date.now();saveHid();send({type:'move',url:ref(s),id:s.id,title:s.title,category:'hidden',sentiment:'',token:MOVETOK});render();
  toast('Hidden — permanent after the next run',{label:'Undo',fn:function(){delete HID[id];saveHid();var back=MOVE_CATS.some(function(c){return c[0]===s.cat})?s.cat:'restore';
-  send({type:'move',url:s.url,id:s.id,title:s.title,category:back,sentiment:'',token:MOVETOK});render();setTimeout(function(){jump(id)},50)}})}
+  send({type:'move',url:ref(s),id:s.id,title:s.title,category:back,sentiment:'',token:MOVETOK});render();setTimeout(function(){jump(id)},50)}})}
 function wire(){$$('.card .hide').forEach(function(b){b.onclick=function(){hideStory(b.closest('.card').getAttribute('data-id'))}});
  $$('.card .mvb').forEach(function(b){b.onclick=function(ev){ev.stopPropagation();var m=b.nextElementSibling,o=m.hidden;$$('.mvm').forEach(function(x){x.hidden=true});m.hidden=!o;b.setAttribute('aria-expanded',o)}});
  $$('.card .mvm button').forEach(function(b){b.onclick=function(){var id=b.closest('.card').getAttribute('data-id');moveStory(id,b.getAttribute('data-mcat'),b.getAttribute('data-msent'))}});
@@ -927,7 +958,7 @@ function show(st){var g=st.gemini||{},c=st.collector||{},b=st.brief||{},e=st.edi
  Array.prototype.forEach.call(document.querySelectorAll('#m-table .rowact'),function(bt){bt.onclick=function(){var x=(m.recent||[])[+bt.getAttribute('data-i')],hide=bt.getAttribute('data-act')==='hide';if(!x)return;
   if(hide&&!confirm('Hide this story from the page for every reader?\\n\\n'+(x.title||x.url)))return;
   var back=x.from&&CAT[x.from]&&x.from!=='added'?x.from:'restore';
-  if(post({type:'move',url:x.url,id:x.id,title:x.title,category:hide?'hidden':back,sentiment:''})){bt.disabled=true;bt.textContent=hide?'queued: hidden after the next run':'queued: back after the next run'}}});
+  if(post({type:'move',url:x.url||('item:'+x.id),id:x.id,title:x.title,category:hide?'hidden':back,sentiment:''})){bt.disabled=true;bt.textContent=hide?'queued: hidden after the next run':'queued: back after the next run'}}});
  $('#g-calls').textContent=g.calls_today;$('#g-limit').textContent=g.limit;$('#g-bar').style.width=Math.min(100,100*g.calls_today/(g.limit||80))+'%';
  var p=$('#g-state');p.textContent=(g.state||'').replace(/^./,function(x){return x.toUpperCase()});p.className='pill '+g.state;$('#g-model').textContent=g.model||'';
  if(g.note){$('#g-note-row').hidden=false;$('#g-note').textContent=g.note}

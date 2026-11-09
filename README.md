@@ -19,7 +19,7 @@ The Telegram brief carries only what is new since the last brief. The web page i
 (everything kept in the last 24 hours, up to 60 stories) and one file per IST day by
 publication date (kept **forever**; the picker offers 7 and the ☰ menu's *Archive* lists every
 day by month, with an "all kept" list per day from `docs/archive/`). Sections run Mentions,
-Urgent, Velachery, Thiruvallur, AI / IT, Political, Opportunities, Added by the office. Each edition has a collapsible 60-second briefing (the page remembers whether you keep it folded) with 2-3
+Urgent, Velachery, Thiruvallur, AI / IT, Political, Opportunities, Added by the office. Each edition has a collapsible 60-second briefing, folded by default (the page remembers if you open it) with 2-3
 takeaways per section (tap a takeaway to jump to its card, which lights up; tap a section heading for the whole section), a category × sentiment dashboard for the day that filters the cards when tapped, a 7-day
 matrix (days × sections with sentiment bars and 🟢 ⚪ 🔴 counts, the whole day in the *All* column; tap a count for that day and section, a badge for one sentiment of it, the day for all of it), expandable
 "+N more outlets" links on merged stories, two AI notes on every card (📝 Notes toggle hides them for a compact view), a ☑ Select mode that bundles chosen stories into one numbered WhatsApp message (with or without the notes, also for the per-card 📲 share),
@@ -86,7 +86,8 @@ headline and stays.
 and nothing else: the address of the run logs is sealed inside the page with the PIN
 (PBKDF2 + HMAC), so until the right PIN is typed the page makes **no** network request and
 names no host. Unlocked, it reads `data/status.json` (written at each brief: Gemini calls
-used today of the daily cap and whether it is active, throttled or on standby; the
+used today of the daily cap -- "today" being Google's quota day, which turns over at 12:30
+IST -- and whether it is active, throttled or on standby; the
 collector's last poll, items in / kept / dropped over 24 h, work waiting, YouTube channels
 returning nothing; groups kept and refused, re-runs dropped, guard corrections; 👍 👎 and
 missing-news counts from the Feedback tab) and the live list of recent runs with a link to
@@ -154,6 +155,17 @@ Both workflows take the links in: *2 - Collect news* puts them on the page (noth
 Telegram); *3 - Telegram brief* puts them on the page **and** into the brief it sends. So to
 see them now, run 2 with minutes = 0; to send them now, run 3.
 
+**When the page is rebuilt.** The half-hourly run rebuilds the page only when the sheet,
+the bot or the run box changed something, and even then `digest.py --pages` writes nothing
+unless a reader would see a difference (a story added, moved, re-tagged or hidden): the
+host builds the whole site on every commit, and the free plan allows 500 builds a month.
+Each row of the *Add links* tab is acted on once -- the collector remembers how many rows
+per link it has handled -- so an old row never re-applies itself every half hour (that is
+what made the page commit, and the host build, every 30 minutes on 8 November: a link's
+original row and its later on-page move flipped the story back and forth each run). To
+republish after a settings or PIN change with no story changed, run *3 - Telegram brief*
+(it always writes) or `python digest.py --republish`.
+
 **Re-filing from the page.** Unlock `admin.html` once in a browser and every card on the
 brief page shows **🏷️ Move** for that browser session: pick a section or a tag and the card
 moves at once. The move is written to the *Add links* tab through the feedback script and
@@ -185,7 +197,10 @@ candidate again, and the other outlets' copies of the same story go with it rath
 coming back as a card of their own. Nothing is re-sent to Telegram.
 
 Other ways to hide: a row `url | hide` in the *Add links* tab or the run box; a link with
-`#hide` to the bot. The status page lists hidden stories under *📌 Manually added stories*
+`#hide` to the bot. A story can also be named by its number -- `item:123` in place of the
+link (the number is in the card's address, `#story-123`, and in the note the page writes:
+"on-page hide #123: ..."); the page falls back to that itself if it ever has no link for a
+card, so a hide can never arrive blank. The status page lists hidden stories under *📌 Manually added stories*
 with a **Restore** button (a row `url | restore`, or `#restore` to the bot, does the same;
 a row with a section name restores it into that section). Hide is for a story that should
 not be on the page; for a wrong section use Move, for a wrong verdict use 👎 -- those teach
@@ -238,7 +253,9 @@ and consider one line in the page footer saying that standard access logs are ke
 
 One more tab in the same sheet, *Settings*, with two columns `key, value`, lets the office
 change these without touching GitHub: `MINISTER_NAMES`, `BLOCKED_HOSTS`, `TELEGRAM_ADMIN_IDS`,
-`GEMINI_MODEL`, `DIGEST_PER_CATEGORY`, `DIGEST_MAX`, `DIGEST_WEB_PER_CATEGORY`,
+`GEMINI_MODEL`, `DIGEST_AI_MAX_CALLS` (Gemini calls allowed per day; default 450, which is
+90% of the 500 requests a day the free tier gives Flash-Lite as of October 2026 -- raise it
+only if the quota page in AI Studio shows more for your model), `DIGEST_PER_CATEGORY`, `DIGEST_MAX`, `DIGEST_WEB_PER_CATEGORY`,
 `DIGEST_WEB_MAX`, `DIGEST_WEB_HOURS`, `FEEDBACK_URL`. Publish it as CSV like the others and put
 the link in the `SETTINGS_CSV_URL` secret. A value in the sheet wins over the repository
 variable of the same name; a row removed from the sheet falls back to the variable, then the

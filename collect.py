@@ -136,7 +136,7 @@ def env():
 # Settings the office may change from the sheet's 'Settings' tab (key, value). Only these;
 # keys and secrets never come from a sheet. The sheet wins over the repository variable.
 SHEET_SETTINGS = ("MINISTER_NAMES", "BLOCKED_HOSTS", "TELEGRAM_ADMIN_IDS", "GEMINI_MODEL", "DIGEST_PER_CATEGORY",
-                  "DIGEST_MAX", "DIGEST_WEB_PER_CATEGORY", "DIGEST_WEB_MAX", "DIGEST_WEB_HOURS", "FEEDBACK_URL")
+                  "DIGEST_MAX", "DIGEST_WEB_PER_CATEGORY", "DIGEST_WEB_MAX", "DIGEST_WEB_HOURS", "DIGEST_AI_MAX_CALLS", "FEEDBACK_URL")
 
 
 def load_sheet_settings(con, url):
@@ -1088,6 +1088,7 @@ _URL_RE = re.compile(r"https?://[^\s<>\"'|,]+")
 _CATS = ("mention", "constituency", "district", "portfolio", "political", "opportunity")
 _HIDE = ("hidden", "hide", "remove", "delete", "unpublish")   # 'url | hide' takes a story off the page
 _RESTORE = ("restore", "unhide", "show", "added")               # 'url | restore' puts a hidden one back
+_ITEM_RE = re.compile(r"\bitem:(\d{1,12})\b")                    # a story by its number, when the page had no link for it
 
 
 _SENTS = ("positive", "neutral", "critical")
@@ -1100,7 +1101,7 @@ def parse_manual(text):
     -> [(url, category|None, sentiment|None)]"""
     out, seen = [], set()
     text = text or ""
-    hits = list(_URL_RE.finditer(text))
+    hits = sorted(list(_URL_RE.finditer(text)) + list(_ITEM_RE.finditer(text)), key=lambda m: m.start())
     for i, m in enumerate(hits):
         url = m.group(0).rstrip(".;)|,")
         rest = text[m.end():hits[i + 1].start() if i + 1 < len(hits) else len(text)].lower()
@@ -1164,12 +1165,21 @@ def add_links(con, pairs, via="run"):
     ts, out, call_via = now(), [], via
     keep = getattr(rules, "AUTO_KEEP", 10)
     for url, cat, sent, via in [(p[0], p[1], p[2] if len(p) > 2 else None, p[3] if len(p) > 3 and p[3] else via) for p in pairs]:
+        cols = """SELECT id, title, coalesce(manual, 0) AS manual, coalesce(hidden, 0) AS hidden, raw_payload, ai_category,
+                         coalesce(manual_at, '') AS manual_at, resolved_url, link FROM items """
+        by_id = _ITEM_RE.fullmatch(url)
+        if by_id:
+            row = con.execute(cols + "WHERE id=?", (int(by_id.group(1)),)).fetchone()
+            if not row:
+                out.append((url, "", "unknown"))
+                log.warning(f"add-links: no story number {by_id.group(1)} in the database")
+                continue
+            url = row["resolved_url"] or row["link"] or url
         key = make_item_key(url)
         ckey = rules.canonical_key(url)
-        row = con.execute("""SELECT id, title, coalesce(manual, 0) AS manual, coalesce(hidden, 0) AS hidden, raw_payload, ai_category,
-                                    coalesce(manual_at, '') AS manual_at FROM items
-                             WHERE item_key=? OR (canonical_key IS NOT NULL AND canonical_key=?) OR resolved_url=? OR link=?
-                             ORDER BY manual DESC, id LIMIT 1""", (key, ckey, url, url)).fetchone()
+        if not by_id:
+            row = con.execute(cols + """WHERE item_key=? OR (canonical_key IS NOT NULL AND canonical_key=?) OR resolved_url=? OR link=?
+                                        ORDER BY manual DESC, id LIMIT 1""", (key, ckey, url, url)).fetchone()
         hide, restore = cat == "hidden", cat == "restore"
         cat = None if restore else cat
         if row and (row["manual"] or row["hidden"]):
@@ -1260,7 +1270,7 @@ def add_links(con, pairs, via="run"):
             out.append((url, title, "hidden" if hide else "added"))
             log.info(f"add-links: {'hidden' if hide else status:<6} {chars:>6}ch  {title[:70]}")
     con.commit()
-    n = sum(1 for _, _, o in out if o != "already")
+    n = sum(1 for _, _, o in out if o not in ("already", "unknown"))
     if out:
         log.info(f"add-links ({call_via}): {n} stored, re-filed or hidden, {len(out) - n} unchanged")
     _note_added(n)
@@ -1305,16 +1315,20 @@ def parse_links_csv(text):
     rows = []
     for row in reader:
         raw = (row.get(col) or "").strip()
+        note = (row.get(fields.get("note", ""), "") or "").strip()
         m = _URL_RE.search(raw)
-        if not m:
+        ref = m.group(0).rstrip(".;)|,") if m else None
+        if not ref:                                   # no link in the cell: the story's number, from the cell or the note
+            mi = _ITEM_RE.search(raw) or (re.search(r"on-page \w+ #(\d{1,12})", note) if note.lower().startswith("on-page") else None)
+            ref = f"item:{mi.group(1)}" if mi else None
+        if not ref:
             continue
         cat = (row.get(fields.get("category", ""), "") or row.get(fields.get("section", ""), "") or "").strip().lower()
         cat = "hidden" if cat in _HIDE else "restore" if cat in _RESTORE else cat
         sent = (row.get(fields.get("sentiment", ""), "") or "").strip().lower()
         sent = sent if sent in _SENTS else _SENT_ALIAS.get(sent)
-        note = (row.get(fields.get("note", ""), "") or "").strip().lower()
-        rows.append((m.group(0).rstrip(".;)|,"), cat if cat in _CATS or cat in ("hidden", "restore") else None, sent,
-                     "move" if note.startswith("on-page") else "sheet"))
+        rows.append((ref, cat if cat in _CATS or cat in ("hidden", "restore") else None, sent,
+                     "move" if note.lower().startswith("on-page") else "sheet"))
     return rows
 
 

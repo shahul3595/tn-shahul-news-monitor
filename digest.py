@@ -76,7 +76,8 @@ WEB_WINDOW_H = 24             # the web page is a rolling edition of everything 
 RERUN_SIM = 0.8               # a headline or body this close to one covered the day before is a re-run
 WEB_PER_CATEGORY = 10         # web page: 10 per category first, then fill to WEB_MAX (60)
 WINDOW_CAP_H = 48             # never look further back than this, even on the first send
-AI_MAX_CALLS_PER_DAY = 1200     # a normal day uses ~10-15: ranking, one cluster and one summary per edition
+AI_MAX_CALLS_PER_DAY = 450    # free-tier Flash-Lite allows 500 requests a day (as read in AI Studio, Oct 2026);
+                              # this is 90% of it. Override with DIGEST_AI_MAX_CALLS (variable or Settings tab)
 AI_BATCH = 60                 # items per Gemini call (~25k tokens with Tamil)
 AI_PAUSE_S = 4.0              # free tier is per-minute limited
 AI_TIME_BUDGET_S = 420        # after this, the rest is ranked by the rules
@@ -125,6 +126,14 @@ def load_env():
     return env
 
 
+def quota_day(now=None):
+    """Google's free-tier day starts at midnight Pacific time (07:00 UTC, 12:30 IST), not at
+    midnight UTC: the 06:45 IST brief and the previous evening's work share one allowance,
+    the 17:45 IST brief opens the next. The counter is kept on Google's day so the cap means
+    what Google means by it."""
+    return ((now or utcnow()) - timedelta(hours=7)).strftime("%Y-%m-%d")
+
+
 def sheet_settings(con, env):
     """The office's 'Settings' tab, as the collector stored it (cfg:KEY rows in runtime):
     MINISTER_NAMES, DIGEST_* sizes, GEMINI_MODEL, FEEDBACK_URL. The sheet wins over the
@@ -137,7 +146,7 @@ def sheet_settings(con, env):
     for k, v in rows:
         key = k[4:]
         if v and key in ("MINISTER_NAMES", "GEMINI_MODEL", "DIGEST_PER_CATEGORY", "DIGEST_MAX", "DIGEST_WEB_PER_CATEGORY",
-                         "DIGEST_WEB_MAX", "DIGEST_WEB_HOURS", "FEEDBACK_URL", "BLOCKED_HOSTS", "TELEGRAM_ADMIN_IDS"):
+                         "DIGEST_WEB_MAX", "DIGEST_WEB_HOURS", "DIGEST_AI_MAX_CALLS", "FEEDBACK_URL", "BLOCKED_HOSTS", "TELEGRAM_ADMIN_IDS"):
             env[key] = v
             os.environ[key] = v
             out[key] = v
@@ -578,7 +587,7 @@ class Gemini:
         return self._client
 
     def _today_calls(self):
-        day = utcnow().strftime("%Y-%m-%d")
+        day = quota_day()
         r = self.con.execute("SELECT calls FROM ai_budget WHERE day=?", (day,)).fetchone()
         return day, (r[0] if r else 0)
 
@@ -1343,24 +1352,28 @@ def run(con, env, now=None, slot=None, dry_run=False, transport="auto", client=N
     return b
 
 
-def _pages(con, env, slot, now, b):
+def _pages(con, env, slot, now, b, only_if_changed=False):
     try:
         import web
-        eds = web.publish(con, env, now, b.get("gemini"), brief=b.get("stats"))
+        eds = web.publish(con, env, now, b.get("gemini"), brief=b.get("stats"), only_if_changed=only_if_changed)
         b["edition"] = eds["latest"]
+        if eds.get("unchanged"):
+            b["unchanged"] = True
+            return
         log.info(f"digest: web editions written -- latest {len(eds['latest']['chosen'])} stories from "
-                 f"{len(eds['latest']['ids'])} items; " + ", ".join(f"{k} {len(v['chosen'])}" for k, v in eds.items() if k != "latest"))
+                 f"{len(eds['latest']['ids'])} items; " + ", ".join(f"{k} {len(v['chosen'])}" for k, v in eds.items() if isinstance(v, dict) and k != "latest"))
     except Exception:
         log.exception("digest: could not write the web page (the brief itself is unaffected)")
 
 
-def cmd_pages(con, env, now=None):
+def cmd_pages(con, env, now=None, only_if_changed=True):
     """Rebuild the web editions and the page without sending or marking anything -- after
-    the office adds links, or to republish after a settings change."""
+    the office adds links, or to republish after a settings change. Writes nothing when
+    the page would read the same (see web.publish), so the host is not asked to build."""
     now = now or utcnow()
     migrate(con)
     b = build(con, env, now, slot_for(now))
-    _pages(con, env, slot_for(now), now, b)
+    _pages(con, env, slot_for(now), now, b, only_if_changed=only_if_changed)
     log.info(f"pages: rebuilt; next brief would carry {len(b['chosen'])} of {len(b['cands'])} stories"
              + (f"; gemini note: {b['ai_note']}" if b["ai_note"] else ""))
     return b
@@ -1477,7 +1490,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="build and print; send nothing, mark nothing")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--backfill", type=int, metavar="DAYS", help="write web editions for the past DAYS days")
-    ap.add_argument("--pages", action="store_true", help="rebuild the web page only; send nothing, mark nothing")
+    ap.add_argument("--pages", action="store_true", help="rebuild the web page only; send nothing, mark nothing; writes nothing when the page would read the same")
+    ap.add_argument("--republish", action="store_true", help="like --pages, but always writes (after a settings or PIN change)")
     a = ap.parse_args()
     if not DB.exists():
         print("no corpus.db -- run 'python collect.py --init' first")
@@ -1500,12 +1514,13 @@ def main():
                     f.write("### Backfill\n\n" + "\n".join(f"- {k}: {len(v['chosen'])} stories from {len(v['ids'])} items"
                                                             for k, v in eds.items()) + "\n")
             return 0
-        if a.pages:
-            b = cmd_pages(con, env)
+        if a.pages or a.republish:
+            b = cmd_pages(con, env, only_if_changed=not a.republish)
             summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if summary:
                 with open(summary, "a", encoding="utf-8") as f:
-                    f.write("### Web page rebuilt (nothing sent)\n\n" + diagnostics(b) + "\n")
+                    f.write(("### Web page unchanged (nothing to publish)\n\n" if b.get("unchanged")
+                             else "### Web page rebuilt (nothing sent)\n\n") + diagnostics(b) + "\n")
             return 0
         b = run(con, env, slot=None if a.slot == "auto" else a.slot, dry_run=a.dry_run)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
